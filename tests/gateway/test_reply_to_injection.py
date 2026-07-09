@@ -118,7 +118,9 @@ async def test_own_message_reply_prefix_marks_assistant_message():
     )
 
     assert result is not None
-    assert result.startswith('[Replying to your previous message: "Use the direct train."]')
+    assert result.startswith(
+        '[Replying to your previous message id 42: "Use the direct train."]'
+    )
     assert result.endswith("this one")
 
 

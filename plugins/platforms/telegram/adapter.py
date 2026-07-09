@@ -5609,9 +5609,19 @@ class TelegramAdapter(BasePlatformAdapter):
                     )
             return
 
-        # --- Update prompt callbacks ---
+        # --- Plugin callbacks (fallback; built-in prefixes above win) ---
         if not data.startswith("update_prompt:"):
+            await self._handle_plugin_callback(
+                query,
+                data,
+                query_chat_id=query_chat_id,
+                query_chat_type=query_chat_type,
+                query_thread_id=query_thread_id,
+                query_user_name=query_user_name,
+            )
             return
+
+        # --- Update prompt callbacks ---
         answer = data.split(":", 1)[1]  # "y" or "n"
         caller_id = str(getattr(query.from_user, "id", ""))
         if not self._is_callback_user_authorized(
@@ -5646,6 +5656,68 @@ class TelegramAdapter(BasePlatformAdapter):
                         answer, getattr(query.from_user, "id", "unknown"))
         except Exception as exc:
             logger.error("Failed to write update response from callback: %s", exc)
+
+    async def _handle_plugin_callback(
+        self,
+        query,
+        data: str,
+        *,
+        query_chat_id,
+        query_chat_type,
+        query_thread_id,
+        query_user_name,
+    ) -> bool:
+        """Dispatch an authorized, otherwise-unknown callback to a plugin."""
+        try:
+            from hermes_cli.plugins import get_plugin_manager
+
+            handlers = get_plugin_manager().get_telegram_callback_handlers()
+        except Exception as exc:
+            logger.warning(
+                "[%s] Telegram plugin callback lookup failed: %s",
+                self.name,
+                exc,
+            )
+            return False
+
+        matches = [entry for entry in handlers if data.startswith(entry[0])]
+        if not matches:
+            return False
+        prefix, callback, plugin_name = max(
+            matches,
+            key=lambda entry: len(entry[0].encode("utf-8")),
+        )
+
+        caller_id = str(getattr(query.from_user, "id", ""))
+        if not self._is_callback_user_authorized(
+            caller_id,
+            chat_id=query_chat_id,
+            chat_type=str(query_chat_type) if query_chat_type is not None else None,
+            thread_id=str(query_thread_id) if query_thread_id is not None else None,
+            user_name=query_user_name,
+        ):
+            await query.answer(text="⛔ You are not authorized to use this action.")
+            return True
+
+        try:
+            result = callback(query, data)
+            if inspect.isawaitable(result):
+                await result
+        except Exception as exc:
+            logger.error(
+                "[%s] Telegram callback handler failed "
+                "(plugin=%s, prefix=%s): %s",
+                self.name,
+                plugin_name,
+                prefix,
+                exc,
+                exc_info=True,
+            )
+            try:
+                await query.answer(text="Plugin action failed. Please retry.")
+            except Exception:
+                pass
+        return True
 
     # Maps `gt:<verb>` -> (script-name, extra-args, success-label, is_state).
     # Scripts live in ~/.hermes/scripts/gmail-triage/. `arg` from the callback
