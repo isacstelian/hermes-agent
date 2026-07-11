@@ -1282,6 +1282,35 @@ class TestTelegramMenuCommands:
         assert names[0] == "lcm"
         assert "help" in names[1:]
 
+    def test_configured_priority_can_prepend_skill_commands(self, tmp_path, monkeypatch):
+        """User priorities apply to skill-derived Telegram menu commands too."""
+        import hermes_cli.commands as commands_mod
+
+        (tmp_path / "config.yaml").write_text(
+            "platforms:\n"
+            "  telegram:\n"
+            "    extra:\n"
+            "      command_menu:\n"
+            "        priority_mode: prepend\n"
+            "        priority:\n"
+            "          - copy_this_video\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr(
+            commands_mod,
+            "_collect_gateway_skill_entries",
+            lambda **_kwargs: (
+                [("copy_this_video", "Create a Romanian shoot brief", "/copy-this-video")],
+                0,
+            ),
+        )
+
+        menu, _hidden = telegram_menu_commands(max_commands=100)
+        names = [name for name, _desc in menu]
+
+        assert names[0] == "copy_this_video"
+        assert "help" in names[1:]
+
     def test_configured_priority_append_keeps_defaults_before_user_priority(self, tmp_path, monkeypatch):
         """append mode preserves built-in defaults ahead of configured names."""
         from unittest.mock import patch

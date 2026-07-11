@@ -927,6 +927,9 @@ def telegram_menu_commands(max_commands: int = 100) -> tuple[list[tuple[str, str
     )
     # Drop the cmd_key — Telegram only needs (name, desc) pairs.
     all_commands.extend((n, d) for n, d, _k in entries)
+    # Apply user priority after skill commands are merged so configured skills
+    # can be promoted in Telegram's visible picker, not just built-ins/plugins.
+    all_commands = _prioritize_telegram_menu_commands(all_commands)
     return all_commands[:max_commands], hidden_count + hidden_core_count
 
 
