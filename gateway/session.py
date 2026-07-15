@@ -204,6 +204,13 @@ class SessionSource:
     # forge it across the wire or have it restored from persistence.
     delivered_via_upstream_relay: bool = False
 
+    # Original human actor when routing intentionally uses a shared source
+    # with ``user_id=None`` (for example Telegram observed group context).
+    # Internal-only and appended after existing fields to preserve positional
+    # SessionSource compatibility. Session keying must continue to use
+    # ``user_id`` / ``user_id_alt`` so shared conversations do not split.
+    actor_user_id: Optional[str] = None
+
     def __post_init__(self) -> None:
         # D-Q2.5 dual-field reconciliation: `scope_id` is canonical, `guild_id`
         # is the deprecated alias. Mirror whichever was provided onto the other

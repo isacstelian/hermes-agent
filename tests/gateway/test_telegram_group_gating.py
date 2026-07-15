@@ -346,9 +346,8 @@ def test_observed_group_context_preserves_slash_command_text_for_dispatch():
 
     assert attributed.text == "/new@hermes_bot"
     assert attributed.get_command() == "new"
-    # Commands preserve sender identity for slash-access control (#67816).
-    assert attributed.source.user_id == "111"
-    assert attributed.source.user_name == "Alice"
+    assert attributed.source.user_id is None
+    assert attributed.source.actor_user_id == "111"
     assert "observed Telegram group context" in attributed.channel_prompt
 
 

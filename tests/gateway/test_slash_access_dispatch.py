@@ -269,6 +269,31 @@ async def test_group_only_gating_leaves_dm_unrestricted():
     assert "Tier: unrestricted" in result
 
 
+@pytest.mark.asyncio
+async def test_shared_group_source_uses_preserved_actor_for_admin_access():
+    """Observed Telegram groups keep a shared session while preserving the actor."""
+    runner = _make_runner(
+        platform=Platform.TELEGRAM,
+        platform_extra={
+            "group_allow_admin_from": ["222"],
+            "group_user_allowed_commands": [],
+        },
+    )
+    source = _make_source(
+        platform=Platform.TELEGRAM,
+        user_id=None,
+        chat_type="group",
+        chat_id="-100",
+    )
+    source.actor_user_id = "222"
+
+    result = await runner._handle_message(_make_event("/whoami", source))
+
+    assert "⛔" not in result
+    assert "User ID: `222`" in result
+    assert "**admin**" in result
+
+
 # ---------------------------------------------------------------------------
 # Plugin-registered slash commands are gated through the same path
 # ---------------------------------------------------------------------------

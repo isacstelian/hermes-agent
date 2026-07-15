@@ -7788,15 +7788,17 @@ class TelegramAdapter(BasePlatformAdapter):
         observe_prompt = self._telegram_group_observe_channel_prompt()
         channel_prompt = f"{event.channel_prompt}\n\n{observe_prompt}" if event.channel_prompt else observe_prompt
         if event.message_type == MessageType.COMMAND:
-            # Commands must retain the original source (with user_id) so
-            # slash-access control (_check_slash_access) can identify the
-            # sender.  Replacing the source with an anonymised shared source
-            # (user_id=None) causes admin-only commands like /new to be
-            # denied even when the sender is an admin, because
-            # SlashAccessPolicy.is_admin(None) is always False.
-            # Still inject channel_prompt for group context.
+            # Commands must still route to the shared observed-group session,
+            # but slash authorization needs the human sender. Preserve that
+            # identity separately so ``user_id`` can remain None for session
+            # keying without turning every group admin into ``telegram:None``.
+            command_source = dataclasses.replace(
+                shared_source,
+                actor_user_id=event.source.user_id,
+            )
             return dataclasses.replace(
                 event,
+                source=command_source,
                 channel_prompt=channel_prompt,
             )
         return dataclasses.replace(

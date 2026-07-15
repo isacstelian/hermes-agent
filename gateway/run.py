@@ -11445,7 +11445,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             raw_args = event.get_command_args().strip()
             hook_ctx = {
                 "platform": source.platform.value if source.platform else "",
-                "user_id": source.user_id,
+                "user_id": getattr(source, "actor_user_id", None) or source.user_id,
                 "command": canonical,
                 "raw_command": command,
                 "args": raw_args,
@@ -14601,13 +14601,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not canonical_cmd:
             return None
         policy = _policy_for_source(self.config, source)
-        if not policy.enabled or policy.can_run(source.user_id, canonical_cmd):
+        actor_user_id = getattr(source, "actor_user_id", None) or source.user_id
+        if not policy.enabled or policy.can_run(actor_user_id, canonical_cmd):
             return None
         logger.info(
             "Slash command /%s denied for %s:%s (not admin, not in user_allowed_commands)",
             canonical_cmd,
             source.platform.value if source.platform else "?",
-            source.user_id,
+            actor_user_id,
         )
         allowed_preview = sorted(policy.user_allowed_commands)
         if allowed_preview:

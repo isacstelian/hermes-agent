@@ -375,7 +375,10 @@ class GatewaySlashCommandsMixin:
         platform = source.platform.value if source and source.platform else "?"
         chat_type = (source.chat_type if source else "") or "dm"
         scope = "DM" if chat_type.lower() in {"dm", "direct", "private", ""} else "group/channel"
-        user_id = (source.user_id if source else None) or "?"
+        user_id = (
+            (getattr(source, "actor_user_id", None) or source.user_id)
+            if source else None
+        ) or "?"
 
         if not policy.enabled:
             return (
@@ -804,7 +807,10 @@ class GatewaySlashCommandsMixin:
         try:
             from gateway.slash_access import policy_for_source
             policy = policy_for_source(self.config, source)
-            uid = getattr(source, "user_id", None)
+            uid = (
+                getattr(source, "actor_user_id", None)
+                or getattr(source, "user_id", None)
+            )
             return bool(policy.enabled and uid and policy.is_admin(uid))
         except Exception:
             return False
