@@ -1181,6 +1181,27 @@ class TestProcessToolHandler:
         result = json.loads(_handle_process({"action": "unknown_action"}))
         assert "error" in result
 
+    def test_explicit_kill_consumes_queued_completion(self, monkeypatch):
+        import tools.process_registry as process_registry_module
+
+        fake_registry = MagicMock()
+        fake_registry.kill_process.return_value = {
+            "status": "killed",
+            "session_id": "proc_killed",
+            "exit_code": -15,
+            "output": "",
+        }
+        monkeypatch.setattr(process_registry_module, "process_registry", fake_registry)
+
+        result = json.loads(
+            process_registry_module._handle_process(
+                {"action": "kill", "session_id": "proc_killed"}
+            )
+        )
+
+        assert result["status"] == "killed"
+        fake_registry.mark_completion_consumed.assert_called_once_with("proc_killed")
+
 
 # =========================================================================
 # format_process_notification + drain_notifications (shared helpers)

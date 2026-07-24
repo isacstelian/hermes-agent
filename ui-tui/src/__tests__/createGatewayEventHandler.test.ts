@@ -139,6 +139,22 @@ describe('createGatewayEventHandler', () => {
     expect(ctx.system.sys).toHaveBeenCalledWith('compressing 968 messages (~123,400 tok)…')
   })
 
+  it('keeps process completion status ephemeral because an agent turn follows', () => {
+    const ctx = buildCtx([])
+    const onEvent = createGatewayEventHandler(ctx)
+    const pushActivity = vi.spyOn(turnController, 'pushActivity')
+    const text = '[IMPORTANT: Background process proc_done completed normally]'
+
+    try {
+      onEvent({ payload: { kind: 'process', text }, type: 'status.update' } as any)
+
+      expect(getUiState().status).toBe(text)
+      expect(pushActivity).not.toHaveBeenCalled()
+    } finally {
+      pushActivity.mockRestore()
+    }
+  })
+
   it('keeps goal verdict text in transcript but shows a brief idle status (#goal statusbar)', () => {
     const appended: Msg[] = []
     const ctx = buildCtx(appended)

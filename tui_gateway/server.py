@@ -8770,6 +8770,10 @@ def _notification_poller_loop(
             continue
 
         rid = f"__notif__{int(time.time() * 1000)}"
+        if evt.get("type") == "completion":
+            # Claim before the agent turn: _run_prompt_submit drains the queue
+            # post-turn, where a replay could otherwise nest a duplicate turn.
+            process_registry.mark_completion_consumed(_evt_sid)
         try:
             _emit("message.start", sid)
             _run_prompt_submit(rid, sid, session, text)
@@ -8822,6 +8826,8 @@ def _notification_poller_loop(
             session["running"] = True
 
         rid = f"__notif__{int(time.time() * 1000)}"
+        if evt.get("type") == "completion":
+            process_registry.mark_completion_consumed(_evt_sid)
         try:
             _emit("message.start", sid)
             _run_prompt_submit(rid, sid, session, text)

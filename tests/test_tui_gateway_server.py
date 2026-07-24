@@ -7752,6 +7752,58 @@ def test_notification_poller_delivers_completion(monkeypatch):
             process_registry.completion_queue.get_nowait()
 
 
+def test_notification_poller_delivers_replayed_completion_once(monkeypatch):
+    import queue as _queue_mod
+
+    from tools.process_registry import process_registry
+
+    turns = []
+
+    class _Agent:
+        def run_conversation(self, prompt, conversation_history=None, stream_callback=None):
+            turns.append(prompt)
+            return {"final_response": "ok", "messages": []}
+
+    class _ImmediateThread:
+        def __init__(self, target=None, daemon=None):
+            self._target = target
+
+        def start(self):
+            assert self._target is not None
+            self._target()
+
+    sess = _session(agent=_Agent())
+    server._sessions["sid_replayed"] = sess
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(server, "_emit", lambda *a, **kw: None)
+    monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
+    monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
+
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    process_registry._completion_consumed.discard("proc_replayed_tui")
+    event = {
+        "type": "completion",
+        "session_id": "proc_replayed_tui",
+        "command": "echo done",
+        "exit_code": 0,
+        "output": "done",
+    }
+    isolated_queue.put(dict(event))
+    isolated_queue.put(dict(event))
+    stop = threading.Event()
+    stop.set()
+
+    try:
+        server._notification_poller_loop(stop, "sid_replayed", sess)
+        assert len(turns) == 1
+    finally:
+        server._sessions.pop("sid_replayed", None)
+        process_registry._completion_consumed.discard("proc_replayed_tui")
+        while not process_registry.completion_queue.empty():
+            process_registry.completion_queue.get_nowait()
+
+
 def test_notification_poller_skips_consumed(monkeypatch):
     """Already-consumed completions are not dispatched by the poller."""
     import queue as _queue_mod

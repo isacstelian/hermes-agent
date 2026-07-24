@@ -444,6 +444,22 @@ class TestCompletionConsumed:
             assert registry.is_completion_consumed(sid)
         assert registry.drain_notifications() == []
 
+    def test_drain_delivers_duplicate_completion_event_once(self, registry):
+        event = {
+            "type": "completion",
+            "session_id": "proc_replayed",
+            "command": "echo done",
+            "exit_code": 0,
+            "output": "done",
+        }
+        registry.completion_queue.put(dict(event))
+        registry.completion_queue.put(dict(event))
+
+        drained = registry.drain_notifications()
+
+        assert [evt["session_id"] for evt, _ in drained] == ["proc_replayed"]
+        assert registry.is_completion_consumed("proc_replayed")
+
 
 # ---------------------------------------------------------------------------
 # Silent-background-process hint

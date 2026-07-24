@@ -495,6 +495,14 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
           return
         }
 
+        // A full synthetic agent turn follows process completion. Keep this
+        // early signal transient instead of duplicating it in the activity log.
+        if (p.kind === 'process') {
+          restoreStatusAfter(4000)
+
+          return
+        }
+
         if (turnController.lastStatusNote !== p.text) {
           turnController.lastStatusNote = p.text
           turnController.pushActivity(

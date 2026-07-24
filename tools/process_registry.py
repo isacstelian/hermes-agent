@@ -1099,6 +1099,11 @@ class ProcessRegistry:
         """Check if a completion notification was already consumed via wait/log."""
         return session_id in self._completion_consumed
 
+    def mark_completion_consumed(self, session_id: str) -> None:
+        """Record that a completion reached its intended agent/user surface."""
+        if session_id:
+            self._completion_consumed.add(session_id)
+
     def is_session_waiting(self, session_id: str) -> bool:
         """Whether a goal loop parked on this session should still be parked.
 
@@ -1202,6 +1207,8 @@ class ProcessRegistry:
                         continue
             text = format_process_notification(evt)
             if text:
+                if evt.get("type") == "completion":
+                    self.mark_completion_consumed(_evt_sid)
                 results.append((evt, text))
         for evt in requeue:
             self.completion_queue.put(evt)
@@ -2238,7 +2245,11 @@ def _handle_process(args, **kw):
         elif action == "wait":
             return json.dumps(_redact_process_result(process_registry.wait(session_id, timeout=args.get("timeout"))), ensure_ascii=False)
         elif action == "kill":
-            return json.dumps(process_registry.kill_process(session_id), ensure_ascii=False)
+            result = process_registry.kill_process(session_id)
+            if result.get("status") == "killed":
+                # This tool result already surfaces the completed kill.
+                process_registry.mark_completion_consumed(session_id)
+            return json.dumps(result, ensure_ascii=False)
         elif action == "write":
             return json.dumps(process_registry.write_stdin(session_id, str(args.get("data", ""))), ensure_ascii=False)
         elif action == "submit":
