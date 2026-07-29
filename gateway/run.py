@@ -1289,6 +1289,62 @@ def _clear_planned_restart_notification() -> None:
     _planned_restart_notification_path().unlink(missing_ok=True)
 
 
+#: One home-channel shutdown broadcast per window, per machine. Anything faster
+#: is a restart storm, and every extra copy of the same "gateway shutting down"
+#: line is noise piled on top of an outage the user is already living through.
+SHUTDOWN_BROADCAST_COOLDOWN_SECONDS = 300
+
+
+def _shutdown_broadcast_marker_path() -> Path:
+    return _hermes_home / ".shutdown_broadcast.json"
+
+
+def shutdown_broadcast_in_cooldown(
+    now: Optional[float] = None,
+    window: float = SHUTDOWN_BROADCAST_COOLDOWN_SECONDS,
+) -> bool:
+    """True when a home-channel shutdown broadcast went out very recently.
+
+    An external restarter -- launchd, systemd, a deploy script -- produces a
+    SIGTERM that is not a planned restart, not an in-chat ``/restart`` and
+    carries no drain marker, so none of the existing suppressions apply. When
+    such a restarter loops, the broadcast fires on every pass: a one-shot
+    "restart all gateways" job left under launchd's KeepAlive on 2026-07-30 ran
+    55 times and put 144 identical shutdown pings in the owner's Telegram, with
+    19 gateways on the machine each notifying on each pass.
+
+    Rate-limiting bounds the damage whatever the cause, which is the point --
+    the next runaway restarter will not be this one. A corrupt or unreadable
+    marker reads as "not in cooldown": failing toward the louder behaviour
+    matches the drain check below, and losing a real notification is worse than
+    sending one too many.
+    """
+
+    try:
+        payload = json.loads(_shutdown_broadcast_marker_path().read_text())
+        sent_at = float(payload["sent_at"])
+    except (OSError, ValueError, TypeError, KeyError):
+        return False
+    elapsed = (time.time() if now is None else now) - sent_at
+    # A marker dated in the future (clock step, restored backup) would otherwise
+    # silence broadcasts until the wall clock caught up with it.
+    if elapsed < 0:
+        return False
+    return elapsed < window
+
+
+def record_shutdown_broadcast(now: Optional[float] = None) -> None:
+    try:
+        atomic_json_write(
+            _shutdown_broadcast_marker_path(),
+            {"sent_at": time.time() if now is None else now},
+        )
+    except Exception as e:
+        # Never let bookkeeping block a shutdown. The cost of failing here is
+        # one un-suppressed broadcast next time.
+        logger.debug("Failed to record shutdown broadcast marker: %s", e)
+
+
 # Mark this process as a gateway so cli.py's module-level load_cli_config()
 # knows not to clobber TERMINAL_CWD if lazily imported.
 os.environ["_HERMES_GATEWAY"] = "1"
@@ -5854,6 +5910,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # fail toward the louder, more-visible behaviour.
             logger.debug("drain_notification_suppressed check failed: %s", e)
 
+        # Last line of defence, and the only one that holds when the restart
+        # comes from outside Hermes: cap the home-channel broadcast to one per
+        # window. Deliberately placed after every other suppression so it only
+        # ever silences a broadcast that would genuinely have gone out, and
+        # deliberately NOT applied to the per-active-session pings above, which
+        # tell someone their own task was cut off.
+        if shutdown_broadcast_in_cooldown():
+            logger.info(
+                "Home-channel shutdown broadcast suppressed: another went out "
+                "less than %ss ago (restart storm?)",
+                SHUTDOWN_BROADCAST_COOLDOWN_SECONDS,
+            )
+            return
+
         # Snapshot adapters up front: adapter.send() can hit a fatal error
         # path that pops the adapter from self.adapters (see _handle_fatal
         # elsewhere), which would otherwise trigger
@@ -5897,6 +5967,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     continue
 
                 notified.add(dedup_key)
+                record_shutdown_broadcast()
                 logger.info(
                     "Sent shutdown notification to home channel %s:%s",
                     platform.value,

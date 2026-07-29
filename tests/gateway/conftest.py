@@ -48,6 +48,32 @@ def make_async_session_db(sync_mock=None):
     return AsyncSessionDB(sync_mock), sync_mock
 
 
+@pytest.fixture(autouse=True)
+def shutdown_broadcast_marker(tmp_path, monkeypatch):
+    """Keep the shutdown-broadcast rate limit out of the real ``~/.hermes``.
+
+    ``_notify_active_sessions_of_shutdown`` records a marker after it broadcasts
+    to a home channel, and suppresses the next broadcast for a few minutes — the
+    cap that stops a runaway restarter from spamming the owner. Under the real
+    HERMES_HOME that state outlives the test session: running
+    ``test_restart_drain.py`` twice within the window made
+    ``test_drain_without_suppress_flag_still_broadcasts_home_channel`` fail the
+    second time, on a marker left by the first run. The test was correct; the
+    shared state was the bug.
+
+    Autouse on purpose — a test should not have to know the marker exists in
+    order to be safe from it. Tests that do care can request this fixture to get
+    the path.
+    """
+    import gateway.run as run_module
+
+    marker = tmp_path / "shutdown-broadcast.json"
+    monkeypatch.setattr(
+        run_module, "_shutdown_broadcast_marker_path", lambda: marker
+    )
+    return marker
+
+
 def _ensure_telegram_mock() -> None:
     """Install a comprehensive telegram mock in sys.modules.
 
