@@ -1207,16 +1207,19 @@ Reactions are **disabled by default**. Enable them in `config.yaml`:
 ```yaml
 telegram:
   reactions: true
+  # Optional: show only 👀 while processing, then clear it on completion.
+  remove_reaction_after_completion: true
 ```
 
 Or via environment variable:
 
 ```bash
 TELEGRAM_REACTIONS=true
+TELEGRAM_REMOVE_REACTION_AFTER_COMPLETION=true
 ```
 
 :::note
-Unlike Discord (where reactions are additive), Telegram's Bot API replaces all bot reactions in a single call. The transition from 👀 to ✅/❌ happens atomically — you won't see both at once.
+Unlike Discord (where reactions are additive), Telegram's Bot API replaces all bot reactions in a single call. By default the transition from 👀 to 👍/👎 happens atomically — you won't see both at once. Set `remove_reaction_after_completion: true` to clear 👀 after success, failure, or cancellation without adding a final reaction.
 :::
 
 :::tip

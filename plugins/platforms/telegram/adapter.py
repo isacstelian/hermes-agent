@@ -9601,6 +9601,12 @@ class TelegramAdapter(BasePlatformAdapter):
         """Check if message reactions are enabled via config/env."""
         return os.getenv("TELEGRAM_REACTIONS", "false").lower() not in {"false", "0", "no"}
 
+    def _remove_reaction_after_completion(self) -> bool:
+        """Check whether processing reactions should be cleared on completion."""
+        return os.getenv("TELEGRAM_REMOVE_REACTION_AFTER_COMPLETION", "false").lower() not in {
+            "false", "0", "no",
+        }
+
     async def _set_reaction(self, chat_id: str, message_id: str, emoji: str) -> bool:
         """Set a single emoji reaction on a Telegram message."""
         if not self._bot:
@@ -9665,7 +9671,7 @@ class TelegramAdapter(BasePlatformAdapter):
         message_id = getattr(event, "message_id", None)
         if not (chat_id and message_id):
             return
-        if outcome == ProcessingOutcome.CANCELLED:
+        if outcome == ProcessingOutcome.CANCELLED or self._remove_reaction_after_completion():
             await self._clear_reactions(chat_id, message_id)
         else:
             await self._set_reaction(
@@ -9842,6 +9848,13 @@ def _apply_yaml_config(yaml_cfg: dict, telegram_cfg: dict) -> dict | None:
         os.environ["TELEGRAM_IGNORED_THREADS"] = str(ignored_threads)
     if "reactions" in telegram_cfg and not os.getenv("TELEGRAM_REACTIONS"):
         os.environ["TELEGRAM_REACTIONS"] = str(telegram_cfg["reactions"]).lower()
+    if (
+        "remove_reaction_after_completion" in telegram_cfg
+        and not os.getenv("TELEGRAM_REMOVE_REACTION_AFTER_COMPLETION")
+    ):
+        os.environ["TELEGRAM_REMOVE_REACTION_AFTER_COMPLETION"] = str(
+            telegram_cfg["remove_reaction_after_completion"]
+        ).lower()
     if "proxy_url" in telegram_cfg and not os.getenv("TELEGRAM_PROXY"):
         os.environ["TELEGRAM_PROXY"] = str(telegram_cfg["proxy_url"]).strip()
     _telegram_extra = telegram_cfg.get("extra") if isinstance(telegram_cfg.get("extra"), dict) else {}
