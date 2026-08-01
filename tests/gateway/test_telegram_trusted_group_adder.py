@@ -382,6 +382,53 @@ async def test_reconciliation_cannot_resurrect_group_after_concurrent_demotion(
 
 
 @pytest.mark.asyncio
+async def test_failed_durable_revocation_tombstones_against_inflight_reconciliation(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    state_path = state_dir / "telegram-auto-authorized-groups.json"
+    state_path.write_text(
+        json.dumps({"chat_ids": ["-100123"]}),
+        encoding="utf-8",
+    )
+    validation_started = asyncio.Event()
+    finish_validation = asyncio.Event()
+
+    async def get_chat_member(chat_id, bot_id):
+        assert (chat_id, bot_id) == ("-100123", 999)
+        validation_started.set()
+        await finish_validation.wait()
+        return SimpleNamespace(status="administrator")
+
+    adapter = _adapter(trusted=[111])
+    adapter._active_telegram_auto_authorized_groups.add("-100123")
+    adapter._bot = SimpleNamespace(id=999, get_chat_member=get_chat_member)
+    reconciliation = asyncio.create_task(
+        adapter._reconcile_telegram_auto_authorized_groups()
+    )
+    await validation_started.wait()
+
+    monkeypatch.setattr(
+        adapter,
+        "_write_telegram_auto_authorized_groups",
+        Mock(side_effect=OSError("disk full")),
+    )
+    await adapter._handle_my_chat_member(
+        _membership_update(old_status="administrator", new_status="member"),
+        None,
+    )
+    finish_validation.set()
+    await reconciliation
+
+    assert json.loads(state_path.read_text(encoding="utf-8")) == {
+        "chat_ids": ["-100123"]
+    }
+    assert adapter._active_telegram_auto_authorized_group_ids() == set()
+
+
+@pytest.mark.asyncio
 async def test_persistence_failure_never_creates_or_keeps_a_live_grant(
     monkeypatch, tmp_path
 ):
@@ -406,6 +453,70 @@ async def test_persistence_failure_never_creates_or_keeps_a_live_grant(
         None,
     )
     assert adapter._telegram_allowed_chats() == set()
+
+
+def test_strict_profile_allowlists_do_not_inherit_process_environment(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHATS", "-100")
+    monkeypatch.setenv("TELEGRAM_GROUP_ALLOWED_CHATS", "-200")
+
+    profile_a_legacy = _adapter(enabled=False)
+    profile_b_strict = _adapter(enabled=True)
+
+    assert profile_a_legacy._telegram_allowed_chats() == {"-100"}
+    assert profile_a_legacy._telegram_group_allowed_chats() == {"-200"}
+    assert profile_b_strict._telegram_allowed_chats() == set()
+    assert profile_b_strict._telegram_group_allowed_chats() == set()
+
+
+@pytest.mark.asyncio
+async def test_promotion_with_missing_old_status_is_denied(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    adapter = _adapter(trusted=[111])
+
+    await adapter._handle_my_chat_member(
+        _membership_update(old_status=None, new_status="administrator"),
+        None,
+    )
+
+    assert adapter._telegram_auto_authorized_groups() == set()
+    assert adapter._active_telegram_auto_authorized_group_ids() == set()
+
+
+@pytest.mark.asyncio
+async def test_recognized_non_admin_status_revokes_with_missing_old_status(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    adapter = _adapter(trusted=[111])
+    await adapter._handle_my_chat_member(_membership_update(), None)
+
+    await adapter._handle_my_chat_member(
+        _membership_update(
+            actor_id=None,
+            old_status=None,
+            new_status="member",
+            member_user_id=None,
+        ),
+        None,
+    )
+
+    assert adapter._telegram_auto_authorized_groups() == set()
+    assert adapter._active_telegram_auto_authorized_group_ids() == set()
+
+
+@pytest.mark.asyncio
+async def test_unknown_new_status_revokes_known_dynamic_group(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    adapter = _adapter(trusted=[111])
+    await adapter._handle_my_chat_member(_membership_update(), None)
+
+    await adapter._handle_my_chat_member(
+        _membership_update(old_status=None, new_status=None, member_user_id=None),
+        None,
+    )
+
+    assert adapter._telegram_auto_authorized_groups() == set()
+    assert adapter._active_telegram_auto_authorized_group_ids() == set()
 
 
 @pytest.mark.asyncio
@@ -540,6 +651,33 @@ async def test_strict_admission_rejects_group_callback_before_any_state_mutation
     assert adapter._approval_state == {7: "session-key"}
     assert adapter._clarify_state == {"cid": "session-key"}
     assert adapter._model_picker_state == {"-100123": {"page": 1}}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("chat_type", [None, "unknown"])
+async def test_strict_admission_rejects_negative_callback_with_malformed_chat_type(
+    monkeypatch, chat_type
+):
+    adapter = _adapter(trusted=[111])
+    adapter._approval_state = {7: "session-key"}
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "111")
+    query = SimpleNamespace(
+        data="ea:once:7",
+        message=SimpleNamespace(
+            chat_id=-100123,
+            chat=SimpleNamespace(type=chat_type),
+            message_thread_id=None,
+        ),
+        from_user=SimpleNamespace(id=111, first_name="Trusted"),
+        answer=AsyncMock(),
+    )
+
+    await adapter._handle_callback_query(
+        SimpleNamespace(callback_query=query), SimpleNamespace()
+    )
+
+    assert adapter._approval_state == {7: "session-key"}
+    assert "not authorized" in query.answer.call_args.kwargs["text"].lower()
 
 
 @pytest.mark.asyncio

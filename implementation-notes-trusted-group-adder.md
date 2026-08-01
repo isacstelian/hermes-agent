@@ -42,16 +42,23 @@ I chose to stamp `telegram_auto_authorized_group_active=True` only on Telegram g
 I removed both trusted-adder environment-variable paths. The top-level Telegram keys still bridge into each adapter's `PlatformConfig.extra`, so multiplex profiles cannot contaminate one another through process-global environment mutation.
 
 ### Serialize reconciliation with membership changes
-I chose to keep Bot API validation outside the lock, then perform the final durable-state recheck and live activation under the same reentrant lock as promotion, demotion, and migration. This avoids holding a thread lock across an await while ensuring whichever membership operation finishes last determines both durable and active state.
+I chose to keep Bot API validation outside the lock, then perform the final durable-state recheck and live activation under the same reentrant lock as promotion, demotion, and migration. A process-local tombstone set now wins over stale durable state when revocation persistence fails; only a later trusted promotion whose durable-state update succeeds may clear that tombstone. Migration tombstones the old ID before persistence and clears the new ID only after the atomic move succeeds.
+
+### Keep strict profile allowlists profile-local
+I chose to ignore `TELEGRAM_ALLOWED_CHATS` and `TELEGRAM_GROUP_ALLOWED_CHATS` whenever trusted-adder mode is enabled and the corresponding adapter `config.extra` key is omitted. Legacy mode retains the environment fallback, but one multiplex profile can no longer leak its process-global group lists into another strict profile.
+
+### Treat membership metadata as an authorization proof
+I chose to enroll only an explicit transition from Telegram's recognized non-admin statuses (`member`, `restricted`, `left`, or `kicked`) to exactly `administrator`. Recognized non-admin outcomes revoke even when old/actor/target metadata is missing, and missing or unknown outcomes revoke any known dynamic grant conservatively.
 
 ### Gate callbacks at the group boundary first
-I applied strict group admission before callback dispatch so model pickers, choice pickers, approvals, and clarify/session state cannot mutate in unknown or revoked groups. Explicitly admitted and currently active dynamic groups continue into their existing callback authorization paths.
+I applied strict group admission before callback dispatch so model pickers, choice pickers, approvals, and clarify/session state cannot mutate in unknown or revoked groups. Negative chat IDs with missing or unknown chat type are denied as malformed group metadata; positive-ID DM behavior and admitted groups retain their existing paths.
 
 ### Preserve atomic replacement on Windows
 I kept temporary-file fsync and `os.replace` on every platform, but skip POSIX-only chmod/fchmod and directory-fsync operations on Windows. POSIX permission assertions are likewise conditional.
 
 ## Verification
-- `uv run pytest -q tests/gateway/test_telegram_trusted_group_adder.py`: 49 passed.
+- TDD RED gate for the four review blockers: 7 targeted regressions failed for the expected missing behavior before implementation.
+- `uv run pytest -q tests/gateway/test_telegram_trusted_group_adder.py`: 56 passed.
 - `uv run pytest -q tests/gateway/test_telegram_group_gating.py`: 71 passed.
 - `uv run pytest -q tests/gateway/test_telegram_approval_buttons.py tests/gateway/test_telegram_clarify_buttons.py tests/gateway/test_telegram_callback_auth_fail_closed.py`: 45 passed.
 - `uv run pytest -q tests/gateway/test_telegram_model_picker.py tests/gateway/test_choice_picker.py`: 19 passed.

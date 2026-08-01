@@ -695,6 +695,7 @@ class TelegramAdapter(BasePlatformAdapter):
         # Durable grants are only candidates after restart. Bot API
         # reconciliation repopulates this process-local validated set.
         self._active_telegram_auto_authorized_groups: set[str] = set()
+        self._revoked_telegram_auto_authorized_groups: set[str] = set()
         self._webhook_mode: bool = False
         self._mention_patterns = self._compile_mention_patterns()
         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
@@ -6186,8 +6187,19 @@ class TelegramAdapter(BasePlatformAdapter):
         # without passing through message admission. Apply the same strict chat
         # boundary before dispatching any callback-specific behavior.
         normalized_query_chat_type = str(query_chat_type or "").split(".")[-1].lower()
+        normalized_query_chat_id = str(query_chat_id or "").strip()
+        if self._telegram_auto_allow_groups_from_trusted_adders():
+            is_negative_chat_id = bool(
+                re.fullmatch(r"-\d+", normalized_query_chat_id)
+                and int(normalized_query_chat_id) < 0
+            )
+            if is_negative_chat_id and normalized_query_chat_type not in {
+                "group",
+                "supergroup",
+            }:
+                await query.answer(text="⛔ This group is not authorized.")
+                return
         if normalized_query_chat_type in {"group", "supergroup"}:
-            normalized_query_chat_id = str(query_chat_id or "").strip()
             if (
                 self._telegram_auto_allow_groups_from_trusted_adders()
                 and normalized_query_chat_id not in self._telegram_group_admission_chats()
@@ -7800,6 +7812,14 @@ class TelegramAdapter(BasePlatformAdapter):
         active = getattr(self, "_active_telegram_auto_authorized_groups", None)
         return active if isinstance(active, set) else set()
 
+    def _revoked_telegram_auto_authorized_group_ids(self) -> set[str]:
+        """Return process-local revocations that durable state cannot override."""
+        revoked = getattr(self, "_revoked_telegram_auto_authorized_groups", None)
+        if not isinstance(revoked, set):
+            revoked = set()
+            self._revoked_telegram_auto_authorized_groups = revoked
+        return revoked
+
     def _telegram_auto_authorized_group_event_active(self, source: Any) -> bool:
         """Fail-closed signal for plugins consuming a validated dynamic grant."""
         if not self._telegram_auto_allow_groups_from_trusted_adders():
@@ -7906,7 +7926,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 # last operation always determines the live grant.
                 with self._auto_authorized_groups_lock:
                     durable, durable_valid = self._load_telegram_auto_authorized_groups()
-                    if durable_valid and chat_id in durable:
+                    revoked = self._revoked_telegram_auto_authorized_group_ids()
+                    if durable_valid and chat_id in durable and chat_id not in revoked:
                         active.add(chat_id)
 
     async def _handle_my_chat_member(
@@ -7929,22 +7950,32 @@ class TelegramAdapter(BasePlatformAdapter):
         new_member = getattr(membership, "new_chat_member", None)
         old_status = str(getattr(old_member, "status", "")).split(".")[-1].lower()
         new_status = str(getattr(new_member, "status", "")).split(".")[-1].lower()
+        non_admin_statuses = {"member", "restricted", "left", "kicked"}
 
-        if new_status in {"left", "kicked"} or (
-            old_status == "administrator" and new_status != "administrator"
-        ):
-            try:
-                with self._auto_authorized_groups_lock:
-                    self._active_telegram_auto_authorized_group_ids().discard(chat_id)
+        should_revoke = False
+        try:
+            with self._auto_authorized_groups_lock:
+                active = self._active_telegram_auto_authorized_group_ids()
+                if new_status in non_admin_statuses:
+                    should_revoke = True
+                elif new_status != "administrator":
+                    durable, durable_valid = self._load_telegram_auto_authorized_groups()
+                    should_revoke = chat_id in active or (
+                        durable_valid and chat_id in durable
+                    )
+                if should_revoke:
+                    self._revoked_telegram_auto_authorized_group_ids().add(chat_id)
+                    active.discard(chat_id)
                     self._update_telegram_auto_authorized_group(chat_id, allowed=False)
-            except Exception as exc:
-                logger.warning(
-                    "[%s] Could not persist Telegram group revocation: %s",
-                    self.name,
-                    _redact_telegram_error_text(exc),
-                )
+        except Exception as exc:
+            logger.warning(
+                "[%s] Could not persist Telegram group revocation: %s",
+                self.name,
+                _redact_telegram_error_text(exc),
+            )
+        if should_revoke:
             return
-        if old_status == "administrator" or new_status != "administrator":
+        if old_status not in non_admin_statuses or new_status != "administrator":
             return
         bot_id = getattr(self._bot, "id", None)
         target_id = getattr(getattr(new_member, "user", None), "id", None)
@@ -7964,6 +7995,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     chat_id, allowed=True
                 )
                 if persisted:
+                    self._revoked_telegram_auto_authorized_group_ids().discard(chat_id)
                     self._active_telegram_auto_authorized_group_ids().add(chat_id)
         except Exception as exc:
             logger.warning(
@@ -7998,6 +8030,8 @@ class TelegramAdapter(BasePlatformAdapter):
         try:
             with self._auto_authorized_groups_lock:
                 was_active = old_chat_id in active
+                revoked = self._revoked_telegram_auto_authorized_group_ids()
+                revoked.add(old_chat_id)
                 active.discard(old_chat_id)
                 chat_ids, valid = self._load_telegram_auto_authorized_groups()
                 if not valid or old_chat_id not in chat_ids:
@@ -8006,6 +8040,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 migrated.discard(old_chat_id)
                 migrated.add(new_chat_id)
                 self._write_telegram_auto_authorized_groups(migrated)
+                revoked.discard(new_chat_id)
                 if was_active:
                     active.add(new_chat_id)
         except Exception as exc:
@@ -8028,7 +8063,11 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         raw = self.config.extra.get("allowed_chats")
         if raw is None:
-            raw = os.getenv("TELEGRAM_ALLOWED_CHATS", "")
+            raw = (
+                ""
+                if self._telegram_auto_allow_groups_from_trusted_adders()
+                else os.getenv("TELEGRAM_ALLOWED_CHATS", "")
+            )
         if isinstance(raw, list):
             configured = {str(part).strip() for part in raw if str(part).strip()}
         else:
@@ -8041,7 +8080,11 @@ class TelegramAdapter(BasePlatformAdapter):
         """Return Telegram chats authorized at group scope."""
         raw = self.config.extra.get("group_allowed_chats")
         if raw is None:
-            raw = os.getenv("TELEGRAM_GROUP_ALLOWED_CHATS", "")
+            raw = (
+                ""
+                if self._telegram_auto_allow_groups_from_trusted_adders()
+                else os.getenv("TELEGRAM_GROUP_ALLOWED_CHATS", "")
+            )
         if isinstance(raw, list):
             configured = {str(part).strip() for part in raw if str(part).strip()}
         else:
