@@ -129,10 +129,14 @@ def test_adapter_captures_profile_home_for_durable_group_state(monkeypatch, tmp_
     assert first._telegram_auto_authorized_groups() == {"-100"}
     assert second._telegram_auto_authorized_groups() == {"-200"}
     assert json.loads(
-        (first_home / "state" / "telegram-auto-authorized-groups.json").read_text()
+        (first_home / "state" / "telegram-auto-authorized-groups.json").read_text(
+            encoding="utf-8"
+        )
     ) == {"chat_ids": ["-100"]}
     assert json.loads(
-        (second_home / "state" / "telegram-auto-authorized-groups.json").read_text()
+        (second_home / "state" / "telegram-auto-authorized-groups.json").read_text(
+            encoding="utf-8"
+        )
     ) == {"chat_ids": ["-200"]}
     assert not (unrelated_home / "state" / "telegram-auto-authorized-groups.json").exists()
 
@@ -306,6 +310,26 @@ async def test_gateway_authz_uses_only_reconciled_persisted_group_admission(
 
     assert runner._is_user_authorized(source) is True
     assert adapter.config.extra["group_allowed_chats"] == ["-200"]
+
+
+def test_gateway_authz_strict_profile_ignores_legacy_group_environment(monkeypatch):
+    from gateway.run import GatewayRunner
+    from gateway.session import SessionSource
+
+    monkeypatch.setenv("TELEGRAM_GROUP_ALLOWED_CHATS", "-100123")
+    adapter = _adapter(trusted=[111])
+    runner = object.__new__(GatewayRunner)
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-100123",
+        chat_type="group",
+        user_id=None,
+        user_name=None,
+    )
+
+    assert adapter._telegram_group_allowed_chats() == set()
+    assert runner._is_user_authorized(source) is False
 
 
 @pytest.mark.asyncio

@@ -422,11 +422,40 @@ class GatewayAuthorizationMixin:
         # (website/docs/reference/environment-variables.md,
         # website/docs/user-guide/messaging/telegram.md).
         if source.chat_type in {"group", "forum", "channel"} and source.chat_id:
+            adapter = None
+            telegram_trusted_adder_mode = False
+            try:
+                adapter = self._adapter_for_source(source)
+            except Exception:
+                pass
+            if source.platform == Platform.TELEGRAM and adapter is not None:
+                adapter_extra = (
+                    getattr(getattr(adapter, "config", None), "extra", None) or {}
+                )
+                telegram_trusted_adder_mode = (
+                    adapter_extra.get("auto_allow_groups_from_trusted_adders") is True
+                )
+                trusted_adder_mode = getattr(
+                    adapter,
+                    "_telegram_auto_allow_groups_from_trusted_adders",
+                    None,
+                )
+                if callable(trusted_adder_mode):
+                    try:
+                        telegram_trusted_adder_mode = trusted_adder_mode() is True
+                    except Exception:
+                        # A configured strict profile must not fall back to a
+                        # process-global allowlist because its helper failed.
+                        pass
+
             chat_allowlist_env = {
                 Platform.TELEGRAM: "TELEGRAM_GROUP_ALLOWED_CHATS",
                 Platform.QQBOT: "QQ_GROUP_ALLOWED_USERS",
             }.get(source.platform, "")
-            if chat_allowlist_env:
+            # Strict trusted-adder profiles must use their adapter-local effective
+            # allowlist. A process-global legacy env value may belong to another
+            # profile in the same multiplex gateway.
+            if chat_allowlist_env and not telegram_trusted_adder_mode:
                 raw_chat_allowlist = os.getenv(chat_allowlist_env, "").strip()
                 if raw_chat_allowlist:
                     allowed_group_ids = {
@@ -444,7 +473,8 @@ class GatewayAuthorizationMixin:
             # so the env-var-only check above misses config.yaml-configured
             # allowlists.  Read the live adapter's config.extra as a fallback.
             try:
-                adapter = self._adapter_for_source(source)
+                if adapter is None:
+                    adapter = self._adapter_for_source(source)
                 if adapter is not None:
                     extra = getattr(getattr(adapter, "config", None), "extra", None) or {}
                     adapter_group_allowed = None
