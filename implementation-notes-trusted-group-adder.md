@@ -67,6 +67,7 @@ I kept temporary-file fsync and `os.replace` on every platform, but skip POSIX-o
 - `uv run pytest -q tests/gateway/test_config_driven_access_policy.py`: 71 passed.
 - `uv run pytest -q tests/gateway/test_multiplex_profile_authz.py`: 13 passed.
 - `uv run pytest -q tests/gateway/test_auth_fallback.py`: 3 passed.
+- `uv run pytest -q tests/gateway/test_telegram_thread_fallback.py`: 51 passed (fake PTB fixture updated for the new membership handler import).
 - Production Python `/Users/magic/.hermes/hermes-agent/venv/bin/python3.11` (3.11.15) `-m py_compile` on all changed production Python files: passed.
 - `uv run ruff check` on all changed Python files: passed.
 - `python3 scripts/check-windows-footguns.py --diff isacstelian/main`: passed.
