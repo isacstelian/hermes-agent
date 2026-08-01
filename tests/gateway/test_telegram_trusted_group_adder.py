@@ -317,6 +317,7 @@ def test_gateway_authz_strict_profile_ignores_legacy_group_environment(monkeypat
     from gateway.session import SessionSource
 
     monkeypatch.setenv("TELEGRAM_GROUP_ALLOWED_CHATS", "-100123")
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "42")
     adapter = _adapter(trusted=[111])
     runner = object.__new__(GatewayRunner)
     runner.adapters = {Platform.TELEGRAM: adapter}
@@ -324,7 +325,7 @@ def test_gateway_authz_strict_profile_ignores_legacy_group_environment(monkeypat
         platform=Platform.TELEGRAM,
         chat_id="-100123",
         chat_type="group",
-        user_id=None,
+        user_id="42",
         user_name=None,
     )
 

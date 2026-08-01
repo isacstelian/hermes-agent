@@ -421,9 +421,9 @@ class GatewayAuthorizationMixin:
         # documented behavior matches reality
         # (website/docs/reference/environment-variables.md,
         # website/docs/user-guide/messaging/telegram.md).
+        telegram_trusted_adder_mode = False
         if source.chat_type in {"group", "forum", "channel"} and source.chat_id:
             adapter = None
-            telegram_trusted_adder_mode = False
             try:
                 adapter = self._adapter_for_source(source)
             except Exception:
@@ -447,6 +447,23 @@ class GatewayAuthorizationMixin:
                         # A configured strict profile must not fall back to a
                         # process-global allowlist because its helper failed.
                         pass
+
+                if telegram_trusted_adder_mode:
+                    effective_admission = getattr(
+                        adapter,
+                        "_telegram_group_admission_chats",
+                        None,
+                    )
+                    try:
+                        admitted_chats = (
+                            effective_admission()
+                            if callable(effective_admission)
+                            else set()
+                        )
+                    except Exception:
+                        admitted_chats = set()
+                    if source.chat_id not in admitted_chats:
+                        return False
 
             chat_allowlist_env = {
                 Platform.TELEGRAM: "TELEGRAM_GROUP_ALLOWED_CHATS",
@@ -618,7 +635,10 @@ class GatewayAuthorizationMixin:
         group_chat_allowlist = ""
         if source.chat_type in {"group", "forum"}:
             group_user_allowlist = _auth_env(platform_group_user_env_map.get(source.platform, ""))
-            group_chat_allowlist = _auth_env(platform_group_chat_env_map.get(source.platform, ""))
+            if not telegram_trusted_adder_mode:
+                group_chat_allowlist = _auth_env(
+                    platform_group_chat_env_map.get(source.platform, "")
+                )
         global_allowlist = _auth_env("GATEWAY_ALLOWED_USERS")
 
         if not platform_allowlist and not group_user_allowlist and not group_chat_allowlist and not global_allowlist:
@@ -703,6 +723,7 @@ class GatewayAuthorizationMixin:
         # TELEGRAM_GROUP_ALLOWED_CHATS.
         if (
             source.platform == Platform.TELEGRAM
+            and not telegram_trusted_adder_mode
             and group_user_allowlist
             and source.chat_type in {"group", "forum"}
             and source.chat_id
