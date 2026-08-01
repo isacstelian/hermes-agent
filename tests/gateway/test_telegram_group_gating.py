@@ -73,6 +73,7 @@ def _make_adapter(
     adapter.platform = Platform.TELEGRAM
     adapter.config = PlatformConfig(enabled=True, token="***", extra=extra)
     adapter._bot = SimpleNamespace(id=999, username=bot_username)
+    adapter._active_telegram_auto_authorized_groups = set()
     adapter._message_handler = AsyncMock()
     adapter._pending_text_batches = {}
     adapter._pending_text_batch_tasks = {}
@@ -523,7 +524,9 @@ def test_explicit_group_admission_still_applies_mention_and_reply_gating():
         assert adapter._should_process_message(_group_message("reply", reply_to_bot=True)) is True
 
 
-def test_persisted_group_admission_still_applies_mention_gating(monkeypatch, tmp_path):
+def test_validated_dynamic_group_admission_still_applies_mention_gating(
+    monkeypatch, tmp_path
+):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     state_dir = tmp_path / "state"
     state_dir.mkdir()
@@ -535,6 +538,7 @@ def test_persisted_group_admission_still_applies_mention_gating(monkeypatch, tmp
         require_mention=True,
         auto_allow_groups_from_trusted_adders=True,
     )
+    adapter._active_telegram_auto_authorized_groups.add("-100")
     text = "hello @hermes_bot"
 
     assert adapter._should_process_message(_group_message("hello")) is False

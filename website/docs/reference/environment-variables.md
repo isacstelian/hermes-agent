@@ -277,7 +277,7 @@ These are set automatically by the Docker terminal backend when `proxy.enabled: 
 | `TELEGRAM_ALLOW_ALL_USERS` | Allow any Telegram user to trigger the bot (dev only). |
 | `TELEGRAM_GROUP_ALLOWED_USERS` | Comma-separated sender user IDs authorized in groups/forums only (does NOT grant DM access). Chat-ID-shaped values (starting with `-`) are still honored as chat IDs for backward compat with pre-#17686 configs, with a deprecation warning. |
 | `TELEGRAM_GROUP_ALLOWED_CHATS` | Comma-separated group/forum chat IDs; any member is authorized |
-| `TELEGRAM_AUTO_ALLOW_GROUPS_FROM_TRUSTED_ADDERS` | When `true`, strictly admit only explicitly allowlisted groups or groups persistently enrolled by a trusted actor promoting the bot to administrator. Sender allowlists and `guest_mode` cannot admit an unknown group. Default: `false`. |
+| `TELEGRAM_AUTO_ALLOW_GROUPS_FROM_TRUSTED_ADDERS` | When `true`, strictly admit only explicitly allowlisted groups or dynamically enrolled groups whose persisted grants were revalidated against current bot-administrator status after restart. Sender allowlists and `guest_mode` cannot admit an unknown group. Default: `false`. |
 | `TELEGRAM_TRUSTED_GROUP_ADDERS` | Comma-separated Telegram user IDs allowed to enroll a group by promoting the bot to administrator. Invalid lists fail closed. Equivalent to `telegram.trusted_group_adders`. |
 | `TELEGRAM_HOME_CHANNEL` | Default Telegram chat/channel for cron delivery |
 | `TELEGRAM_HOME_CHANNEL_NAME` | Display name for the Telegram home channel |

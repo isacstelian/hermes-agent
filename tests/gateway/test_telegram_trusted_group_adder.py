@@ -1,11 +1,12 @@
 import json
 import stat
 from types import SimpleNamespace
-from unittest.mock import MagicMock, Mock
+from unittest.mock import AsyncMock, MagicMock, Mock, call
 
 import pytest
 
 from gateway.config import Platform, PlatformConfig, load_gateway_config
+from gateway.platforms.base import MessageType
 
 
 def _adapter(*, enabled: object = True, trusted=None, extra=None):
@@ -21,6 +22,7 @@ def _adapter(*, enabled: object = True, trusted=None, extra=None):
     adapter.platform = Platform.TELEGRAM
     adapter.config = PlatformConfig(enabled=True, token="not-written", extra=settings)
     adapter._bot = SimpleNamespace(id=999, token="not-written")
+    adapter._active_telegram_auto_authorized_groups = set()
     return adapter
 
 
@@ -48,6 +50,30 @@ def _membership_update(
     return SimpleNamespace(my_chat_member=member)
 
 
+def _message(*, chat_id=-100123, chat_type="group", is_forum=False):
+    return SimpleNamespace(
+        chat=SimpleNamespace(
+            id=chat_id,
+            type=chat_type,
+            title="Private team content",
+            full_name=None,
+            is_forum=is_forum,
+        ),
+        from_user=SimpleNamespace(
+            id=111,
+            full_name="Trusted stakeholder",
+            is_bot=False,
+        ),
+        text="hello",
+        message_id=42,
+        message_thread_id=7 if is_forum else None,
+        is_topic_message=is_forum,
+        reply_to_message=None,
+        date=None,
+        forum_topic_created=None,
+    )
+
+
 @pytest.mark.asyncio
 async def test_trusted_admin_promotion_persists_and_extends_effective_allowlists(
     monkeypatch, tmp_path
@@ -73,6 +99,100 @@ async def test_trusted_admin_promotion_persists_and_extends_effective_allowlists
     assert "not-written" not in raw
     assert "Private team content" not in raw
     assert "secret-operator" not in raw
+
+
+def test_adapter_captures_profile_home_for_durable_group_state(monkeypatch, tmp_path):
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+
+    first_home = tmp_path / "first-profile"
+    second_home = tmp_path / "second-profile"
+    unrelated_home = tmp_path / "later-runtime-scope"
+    config = PlatformConfig(
+        enabled=True,
+        token="not-written",
+        extra={"auto_allow_groups_from_trusted_adders": True},
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(first_home))
+    first = TelegramAdapter(config)
+    monkeypatch.setenv("HERMES_HOME", str(second_home))
+    second = TelegramAdapter(config)
+
+    # Multiplex dispatch runs after the construction-time profile scope exits.
+    monkeypatch.setenv("HERMES_HOME", str(unrelated_home))
+    first._write_telegram_auto_authorized_groups({"-100"})
+    second._write_telegram_auto_authorized_groups({"-200"})
+
+    assert first._telegram_auto_authorized_groups() == {"-100"}
+    assert second._telegram_auto_authorized_groups() == {"-200"}
+    assert json.loads(
+        (first_home / "state" / "telegram-auto-authorized-groups.json").read_text()
+    ) == {"chat_ids": ["-100"]}
+    assert json.loads(
+        (second_home / "state" / "telegram-auto-authorized-groups.json").read_text()
+    ) == {"chat_ids": ["-200"]}
+    assert not (unrelated_home / "state" / "telegram-auto-authorized-groups.json").exists()
+
+
+@pytest.mark.parametrize(
+    ("chat_type", "is_forum"),
+    [("group", False), ("supergroup", True)],
+)
+def test_message_event_marks_only_active_dynamic_groups(chat_type, is_forum):
+    adapter = _adapter(trusted=[111])
+    adapter._active_telegram_auto_authorized_groups.add("-100123")
+
+    event = adapter._build_message_event(
+        _message(chat_type=chat_type, is_forum=is_forum),
+        MessageType.TEXT,
+    )
+
+    assert event.metadata == {"telegram_auto_authorized_group_active": True}
+
+
+def test_message_event_does_not_mark_unreconciled_persisted_candidate(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    (state_dir / "telegram-auto-authorized-groups.json").write_text(
+        json.dumps({"chat_ids": ["-100123"]}),
+        encoding="utf-8",
+    )
+    adapter = _adapter(trusted=[111])
+
+    assert adapter._telegram_auto_authorized_groups() == {"-100123"}
+    event = adapter._build_message_event(_message(), MessageType.TEXT)
+
+    assert "telegram_auto_authorized_group_active" not in event.metadata
+
+
+@pytest.mark.parametrize(
+    ("message", "active", "enabled", "explicit"),
+    [
+        (_message(), set(), True, ["-100123"]),
+        (_message(), {"-100123"}, False, []),
+        (_message(chat_id=111, chat_type="private"), {"111"}, True, []),
+        (_message(chat_type="channel"), {"-100123"}, True, []),
+        (_message(), None, True, []),
+        (_message(), ["-100123"], True, []),
+        (_message(chat_id="malformed"), {"malformed"}, True, []),
+    ],
+)
+def test_message_event_dynamic_group_signal_fails_closed(
+    message, active, enabled, explicit
+):
+    adapter = _adapter(
+        enabled=enabled,
+        trusted=[111],
+        extra={"group_allowed_chats": explicit},
+    )
+    adapter._active_telegram_auto_authorized_groups = active
+
+    event = adapter._build_message_event(message, MessageType.TEXT)
+
+    assert "telegram_auto_authorized_group_active" not in event.metadata
 
 
 @pytest.mark.asyncio
@@ -124,7 +244,10 @@ async def test_transition_away_from_administrator_revokes_regardless_of_actor(
     assert adapter._telegram_group_allowed_chats() == set()
 
 
-def test_gateway_authz_sees_persisted_group_admission(monkeypatch, tmp_path):
+@pytest.mark.asyncio
+async def test_gateway_authz_uses_only_reconciled_persisted_group_admission(
+    monkeypatch, tmp_path
+):
     from gateway.run import GatewayRunner
     from gateway.session import SessionSource
 
@@ -146,8 +269,76 @@ def test_gateway_authz_sees_persisted_group_admission(monkeypatch, tmp_path):
         user_name=None,
     )
 
+    assert runner._is_user_authorized(source) is False
+
+    adapter._bot = SimpleNamespace(
+        id=999,
+        get_chat_member=AsyncMock(
+            return_value=SimpleNamespace(status="administrator")
+        ),
+    )
+    await adapter._reconcile_telegram_auto_authorized_groups()
+
     assert runner._is_user_authorized(source) is True
     assert adapter.config.extra["group_allowed_chats"] == ["-200"]
+
+
+@pytest.mark.asyncio
+async def test_restart_reconciliation_activates_only_current_administrators(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    (state_dir / "telegram-auto-authorized-groups.json").write_text(
+        json.dumps({"chat_ids": ["-100", "-200", "-300"]}),
+        encoding="utf-8",
+    )
+    adapter = _adapter(trusted=[111])
+
+    async def get_chat_member(chat_id, bot_id):
+        assert bot_id == 999
+        if chat_id == "-100":
+            return SimpleNamespace(status="administrator")
+        if chat_id == "-200":
+            return SimpleNamespace(status="member")
+        raise RuntimeError("Bot API unavailable")
+
+    adapter._bot = SimpleNamespace(id=999, get_chat_member=get_chat_member)
+
+    assert adapter._telegram_allowed_chats() == set()
+    await adapter._reconcile_telegram_auto_authorized_groups()
+
+    assert adapter._telegram_allowed_chats() == {"-100"}
+    assert adapter._telegram_group_allowed_chats() == {"-100"}
+    assert adapter._telegram_auto_authorized_groups() == {"-100", "-200", "-300"}
+
+
+@pytest.mark.asyncio
+async def test_persistence_failure_never_creates_or_keeps_a_live_grant(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    adapter = _adapter(trusted=[111])
+
+    def fail_write(_chat_ids):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(adapter, "_write_telegram_auto_authorized_groups", fail_write)
+
+    await adapter._handle_my_chat_member(_membership_update(), None)
+    assert adapter._telegram_allowed_chats() == set()
+
+    adapter._active_telegram_auto_authorized_groups.add("-100123")
+    await adapter._handle_my_chat_member(
+        _membership_update(
+            actor_id=222,
+            old_status="administrator",
+            new_status="member",
+        ),
+        None,
+    )
+    assert adapter._telegram_allowed_chats() == set()
 
 
 @pytest.mark.asyncio
@@ -167,6 +358,36 @@ async def test_malformed_state_fails_closed_without_being_overwritten(
     assert state_path.read_text(encoding="utf-8") == '{"chat_ids": "-100123"}'
 
 
+@pytest.mark.asyncio
+async def test_symlinked_or_non_regular_state_is_rejected(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    external = tmp_path / "external.json"
+    external.write_text(json.dumps({"chat_ids": ["-100123"]}), encoding="utf-8")
+    state_path = state_dir / "telegram-auto-authorized-groups.json"
+    state_path.symlink_to(external)
+    adapter = _adapter(trusted=[111])
+
+    assert adapter._telegram_auto_authorized_groups() == set()
+    await adapter._handle_my_chat_member(_membership_update(), None)
+    assert state_path.is_symlink()
+    assert json.loads(external.read_text(encoding="utf-8")) == {
+        "chat_ids": ["-100123"]
+    }
+
+    state_path.unlink()
+    state_path.mkdir()
+    assert adapter._telegram_auto_authorized_groups() == set()
+
+
+@pytest.mark.parametrize("chat_id", ["0", "-0", "100", 100, True, "group"])
+def test_persisted_schema_accepts_only_negative_numeric_chat_id_strings(chat_id):
+    adapter = _adapter(trusted=[111])
+
+    assert adapter._validated_auto_authorized_chat_ids({"chat_ids": [chat_id]}) is None
+
+
 def test_config_and_env_conventions_are_strict_and_profile_safe(monkeypatch, tmp_path):
     hermes_home = tmp_path / "profile-home"
     hermes_home.mkdir()
@@ -179,8 +400,11 @@ def test_config_and_env_conventions_are_strict_and_profile_safe(monkeypatch, tmp
         encoding="utf-8",
     )
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-    monkeypatch.delenv("TELEGRAM_AUTO_ALLOW_GROUPS_FROM_TRUSTED_ADDERS", raising=False)
-    monkeypatch.delenv("TELEGRAM_TRUSTED_GROUP_ADDERS", raising=False)
+    # Seed non-empty values so _apply_yaml_config does not write directly into
+    # os.environ behind monkeypatch's restoration tracking. The adapter must
+    # still prefer the profile config values bridged into config.extra.
+    monkeypatch.setenv("TELEGRAM_AUTO_ALLOW_GROUPS_FROM_TRUSTED_ADDERS", "false")
+    monkeypatch.setenv("TELEGRAM_TRUSTED_GROUP_ADDERS", "999")
 
     config = load_gateway_config()
     telegram_config = config.platforms[Platform.TELEGRAM]
@@ -226,6 +450,7 @@ def test_my_chat_member_handler_is_registered_on_each_application(monkeypatch):
             VOICE=MagicMock(),
             Document=SimpleNamespace(ALL=MagicMock()),
             Sticker=SimpleNamespace(ALL=MagicMock()),
+            StatusUpdate=SimpleNamespace(MIGRATE=MagicMock()),
         ),
     )
     adapter = _adapter(trusted=[111])
@@ -239,5 +464,98 @@ def test_my_chat_member_handler_is_registered_on_each_application(monkeypatch):
         (adapter._handle_my_chat_member, FakeChatMemberHandler.MY_CHAT_MEMBER),
         (adapter._handle_my_chat_member, FakeChatMemberHandler.MY_CHAT_MEMBER),
     ]
-    assert first_app.add_handler.call_count == 6
-    assert rebuilt_app.add_handler.call_count == 6
+    assert telegram_module.TelegramMessageHandler.call_args_list.count(
+        call(telegram_module.filters.StatusUpdate.MIGRATE, adapter._handle_chat_migration)
+    ) == 2
+    assert first_app.add_handler.call_count == 7
+    assert rebuilt_app.add_handler.call_count == 7
+
+
+@pytest.mark.asyncio
+async def test_basic_group_migration_atomically_moves_active_dynamic_grant(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    adapter = _adapter(
+        trusted=[111],
+        extra={"allowed_chats": ["-999"], "group_allowed_chats": ["-998"]},
+    )
+    await adapter._handle_my_chat_member(
+        _membership_update(chat_id=-100, chat_type="group"), None
+    )
+    update = SimpleNamespace(
+        effective_message=SimpleNamespace(
+            chat=SimpleNamespace(id=-100, type="group"),
+            migrate_to_chat_id=-1000000000100,
+        )
+    )
+
+    await adapter._handle_chat_migration(update, None)
+
+    assert adapter._telegram_auto_authorized_groups() == {"-1000000000100"}
+    assert "-100" not in adapter._telegram_allowed_chats()
+    assert "-1000000000100" in adapter._telegram_allowed_chats()
+    assert adapter.config.extra["allowed_chats"] == ["-999"]
+    assert adapter.config.extra["group_allowed_chats"] == ["-998"]
+
+
+@pytest.mark.asyncio
+async def test_migration_does_not_copy_explicit_or_unvalidated_persisted_grants(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    state_path = state_dir / "telegram-auto-authorized-groups.json"
+    state_path.write_text(json.dumps({"chat_ids": ["-200"]}), encoding="utf-8")
+    adapter = _adapter(extra={"allowed_chats": ["-100"]})
+
+    explicit_update = SimpleNamespace(
+        effective_message=SimpleNamespace(
+            chat=SimpleNamespace(id=-100, type="group"),
+            migrate_to_chat_id=-1000000000100,
+        )
+    )
+    await adapter._handle_chat_migration(explicit_update, None)
+    assert adapter._telegram_auto_authorized_groups() == {"-200"}
+    assert "-1000000000100" not in adapter._telegram_allowed_chats()
+
+    persisted_update = SimpleNamespace(
+        effective_message=SimpleNamespace(
+            chat=SimpleNamespace(id=-200, type="group"),
+            migrate_to_chat_id=-1000000000200,
+        )
+    )
+    await adapter._handle_chat_migration(persisted_update, None)
+    assert adapter._telegram_auto_authorized_groups() == {"-1000000000200"}
+    assert "-1000000000200" not in adapter._telegram_allowed_chats()
+
+
+@pytest.mark.asyncio
+async def test_migration_persistence_failure_revokes_old_without_activating_new(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    adapter = _adapter(trusted=[111])
+    await adapter._handle_my_chat_member(
+        _membership_update(chat_id=-100, chat_type="group"), None
+    )
+    state_path = tmp_path / "state" / "telegram-auto-authorized-groups.json"
+
+    def fail_write(_chat_ids):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(adapter, "_write_telegram_auto_authorized_groups", fail_write)
+    update = SimpleNamespace(
+        effective_message=SimpleNamespace(
+            chat=SimpleNamespace(id=-100, type="group"),
+            migrate_to_chat_id=-1000000000100,
+        )
+    )
+
+    await adapter._handle_chat_migration(update, None)
+
+    assert adapter._telegram_allowed_chats() == set()
+    assert json.loads(state_path.read_text(encoding="utf-8")) == {
+        "chat_ids": ["-100"]
+    }
