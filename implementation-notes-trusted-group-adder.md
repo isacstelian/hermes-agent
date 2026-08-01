@@ -38,18 +38,34 @@ I chose to capture `get_hermes_home()` in each real adapter during construction 
 ### Emit only a validated per-event dynamic-group signal
 I chose to stamp `telegram_auto_authorized_group_active=True` only on Telegram group/forum events whose negative chat ID is in this adapter's active reconciled set while trusted-adder mode is enabled. Persisted-only candidates, explicit allowlists, DMs/channels, disabled mode, and malformed state never receive the key.
 
+### Keep trusted-adder behavior in config.yaml only
+I removed both trusted-adder environment-variable paths. The top-level Telegram keys still bridge into each adapter's `PlatformConfig.extra`, so multiplex profiles cannot contaminate one another through process-global environment mutation.
+
+### Serialize reconciliation with membership changes
+I chose to keep Bot API validation outside the lock, then perform the final durable-state recheck and live activation under the same reentrant lock as promotion, demotion, and migration. This avoids holding a thread lock across an await while ensuring whichever membership operation finishes last determines both durable and active state.
+
+### Gate callbacks at the group boundary first
+I applied strict group admission before callback dispatch so model pickers, choice pickers, approvals, and clarify/session state cannot mutate in unknown or revoked groups. Explicitly admitted and currently active dynamic groups continue into their existing callback authorization paths.
+
+### Preserve atomic replacement on Windows
+I kept temporary-file fsync and `os.replace` on every platform, but skip POSIX-only chmod/fchmod and directory-fsync operations on Windows. POSIX permission assertions are likewise conditional.
+
 ## Verification
-- `uv run pytest -q tests/gateway/test_telegram_trusted_group_adder.py`: 41 passed.
+- `uv run pytest -q tests/gateway/test_telegram_trusted_group_adder.py`: 49 passed.
 - `uv run pytest -q tests/gateway/test_telegram_group_gating.py`: 71 passed.
+- `uv run pytest -q tests/gateway/test_telegram_approval_buttons.py tests/gateway/test_telegram_clarify_buttons.py tests/gateway/test_telegram_callback_auth_fail_closed.py`: 45 passed.
+- `uv run pytest -q tests/gateway/test_telegram_model_picker.py tests/gateway/test_choice_picker.py`: 19 passed.
+- `uv run pytest -q tests/gateway/test_telegram_slash_confirm.py`: 3 passed.
 - `uv run pytest -q tests/gateway/test_telegram_auth_check.py`: 18 passed.
 - `uv run pytest -q tests/gateway/test_config_driven_access_policy.py`: 71 passed.
 - `uv run pytest -q tests/gateway/test_multiplex_profile_authz.py`: 13 passed.
 - `uv run pytest -q tests/gateway/test_auth_fallback.py`: 3 passed.
-- `uv run python -m py_compile` on all changed Python files: passed.
+- Production Python `/Users/magic/.hermes/hermes-agent/venv/bin/python3.11` (3.11.15) `-m py_compile` on all changed production Python files: passed.
 - `uv run ruff check` on all changed Python files: passed.
 - `git diff --check`: passed.
 
 ## Follow-ups / Open Questions
+- `test_telegram_thread_fallback.py -k callback` still has its two pre-existing standalone fixture failures because that test imports the adapter with `ParseMode=None`; the same failures reproduce at the untouched `8d94c7ef0` baseline. This blocker-only change does not alter that unrelated harness.
 - After merge, enable the feature only on Telegram profiles with Isac's current Telegram user ID and restart those gateways.
 - Smoke-test first on one non-production bot/group before fleet rollout.
 - The active `scoped-telegram-access` plugins can consume the new internal per-event signal so validated Isac-enrolled groups follow their normal stakeholder-group path. Profile plugins were not edited in this branch.

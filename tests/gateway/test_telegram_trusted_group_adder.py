@@ -1,4 +1,6 @@
+import asyncio
 import json
+import os
 import stat
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, Mock, call
@@ -93,8 +95,9 @@ async def test_trusted_admin_promotion_persists_and_extends_effective_allowlists
     assert json.loads(state_path.read_text(encoding="utf-8")) == {
         "chat_ids": ["-100123"]
     }
-    assert stat.S_IMODE(state_path.parent.stat().st_mode) == 0o700
-    assert stat.S_IMODE(state_path.stat().st_mode) == 0o600
+    if os.name != "nt":
+        assert stat.S_IMODE(state_path.parent.stat().st_mode) == 0o700
+        assert stat.S_IMODE(state_path.stat().st_mode) == 0o600
     raw = state_path.read_text(encoding="utf-8")
     assert "not-written" not in raw
     assert "Private team content" not in raw
@@ -245,6 +248,28 @@ async def test_transition_away_from_administrator_revokes_regardless_of_actor(
 
 
 @pytest.mark.asyncio
+async def test_malformed_demotion_without_target_user_still_revokes_known_chat(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    adapter = _adapter(trusted=[111])
+    await adapter._handle_my_chat_member(_membership_update(), None)
+
+    await adapter._handle_my_chat_member(
+        _membership_update(
+            actor_id=222,
+            old_status="administrator",
+            new_status="member",
+            member_user_id=None,
+        ),
+        None,
+    )
+
+    assert adapter._telegram_auto_authorized_groups() == set()
+    assert adapter._active_telegram_auto_authorized_group_ids() == set()
+
+
+@pytest.mark.asyncio
 async def test_gateway_authz_uses_only_reconciled_persisted_group_admission(
     monkeypatch, tmp_path
 ):
@@ -312,6 +337,48 @@ async def test_restart_reconciliation_activates_only_current_administrators(
     assert adapter._telegram_allowed_chats() == {"-100"}
     assert adapter._telegram_group_allowed_chats() == {"-100"}
     assert adapter._telegram_auto_authorized_groups() == {"-100", "-200", "-300"}
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_cannot_resurrect_group_after_concurrent_demotion(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    (state_dir / "telegram-auto-authorized-groups.json").write_text(
+        json.dumps({"chat_ids": ["-100123"]}),
+        encoding="utf-8",
+    )
+    validation_started = asyncio.Event()
+    finish_validation = asyncio.Event()
+
+    async def get_chat_member(chat_id, bot_id):
+        assert (chat_id, bot_id) == ("-100123", 999)
+        validation_started.set()
+        await finish_validation.wait()
+        return SimpleNamespace(status="administrator")
+
+    adapter = _adapter(trusted=[111])
+    adapter._bot = SimpleNamespace(id=999, get_chat_member=get_chat_member)
+
+    reconciliation = asyncio.create_task(
+        adapter._reconcile_telegram_auto_authorized_groups()
+    )
+    await validation_started.wait()
+    await adapter._handle_my_chat_member(
+        _membership_update(
+            actor_id=222,
+            old_status="administrator",
+            new_status="member",
+        ),
+        None,
+    )
+    finish_validation.set()
+    await reconciliation
+
+    assert adapter._telegram_auto_authorized_groups() == set()
+    assert adapter._active_telegram_auto_authorized_group_ids() == set()
 
 
 @pytest.mark.asyncio
@@ -388,7 +455,7 @@ def test_persisted_schema_accepts_only_negative_numeric_chat_id_strings(chat_id)
     assert adapter._validated_auto_authorized_chat_ids({"chat_ids": [chat_id]}) is None
 
 
-def test_config_and_env_conventions_are_strict_and_profile_safe(monkeypatch, tmp_path):
+def test_trusted_adder_settings_bridge_from_profile_config(monkeypatch, tmp_path):
     hermes_home = tmp_path / "profile-home"
     hermes_home.mkdir()
     (hermes_home / "config.yaml").write_text(
@@ -400,11 +467,6 @@ def test_config_and_env_conventions_are_strict_and_profile_safe(monkeypatch, tmp
         encoding="utf-8",
     )
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-    # Seed non-empty values so _apply_yaml_config does not write directly into
-    # os.environ behind monkeypatch's restoration tracking. The adapter must
-    # still prefer the profile config values bridged into config.extra.
-    monkeypatch.setenv("TELEGRAM_AUTO_ALLOW_GROUPS_FROM_TRUSTED_ADDERS", "false")
-    monkeypatch.setenv("TELEGRAM_TRUSTED_GROUP_ADDERS", "999")
 
     config = load_gateway_config()
     telegram_config = config.platforms[Platform.TELEGRAM]
@@ -415,11 +477,134 @@ def test_config_and_env_conventions_are_strict_and_profile_safe(monkeypatch, tmp
     assert adapter._telegram_auto_allow_groups_from_trusted_adders() is True
     assert adapter._telegram_trusted_group_adders() == {111, 222}
 
-    env_adapter = _adapter(enabled=None, extra={})
-    monkeypatch.setenv("TELEGRAM_AUTO_ALLOW_GROUPS_FROM_TRUSTED_ADDERS", "true")
-    monkeypatch.setenv("TELEGRAM_TRUSTED_GROUP_ADDERS", "333, 444")
-    assert env_adapter._telegram_auto_allow_groups_from_trusted_adders() is True
-    assert env_adapter._telegram_trusted_group_adders() == {333, 444}
+
+def test_windows_state_write_keeps_atomic_replace_without_posix_operations(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    adapter = _adapter(trusted=[111])
+    monkeypatch.setattr(adapter, "_supports_posix_group_state_security", lambda: False)
+    monkeypatch.setattr(os, "chmod", Mock(side_effect=AssertionError("POSIX chmod")))
+    monkeypatch.setattr(os, "fchmod", Mock(side_effect=AssertionError("POSIX fchmod")))
+    real_fsync = os.fsync
+    fsync_calls = []
+
+    def track_file_fsync(fd):
+        fsync_calls.append(fd)
+        return real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", track_file_fsync)
+
+    adapter._write_telegram_auto_authorized_groups({"-100123"})
+
+    state_path = tmp_path / "state" / "telegram-auto-authorized-groups.json"
+    assert json.loads(state_path.read_text(encoding="utf-8")) == {
+        "chat_ids": ["-100123"]
+    }
+    assert len(fsync_calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("chat_type", ["group", "supergroup"])
+async def test_strict_admission_rejects_group_callback_before_any_state_mutation(
+    monkeypatch, chat_type
+):
+    adapter = _adapter(trusted=[111])
+    adapter._approval_state = {7: "session-key"}
+    adapter._clarify_state = {"cid": "session-key"}
+    adapter._model_picker_state = {"-100123": {"page": 1}}
+    model_handler = AsyncMock()
+    choice_handler = AsyncMock()
+    monkeypatch.setattr(adapter, "_handle_model_picker_callback", model_handler)
+    monkeypatch.setattr(adapter, "_handle_choice_picker_callback", choice_handler)
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "111")
+
+    for data in ("mp:provider", "cp:reasoning", "ea:once:7", "cl:cid:0"):
+        query = SimpleNamespace(
+            data=data,
+            message=SimpleNamespace(
+                chat_id=-100123,
+                chat=SimpleNamespace(type=chat_type),
+                message_thread_id=8 if chat_type == "supergroup" else None,
+            ),
+            from_user=SimpleNamespace(id=111, first_name="Trusted"),
+            answer=AsyncMock(),
+        )
+        await adapter._handle_callback_query(
+            SimpleNamespace(callback_query=query), SimpleNamespace()
+        )
+        assert "not authorized" in query.answer.call_args.kwargs["text"].lower()
+
+    model_handler.assert_not_awaited()
+    choice_handler.assert_not_awaited()
+    assert adapter._approval_state == {7: "session-key"}
+    assert adapter._clarify_state == {"cid": "session-key"}
+    assert adapter._model_picker_state == {"-100123": {"page": 1}}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("admission", ["explicit", "active"])
+async def test_admitted_group_callback_retains_existing_callback_auth(
+    monkeypatch, admission
+):
+    from tools import approval
+
+    extra = {"allowed_chats": ["-100123"]} if admission == "explicit" else {}
+    adapter = _adapter(trusted=[111], extra=extra)
+    if admission == "active":
+        adapter._active_telegram_auto_authorized_groups.add("-100123")
+    adapter._approval_state = {7: "session-key"}
+    resolved = Mock(return_value=0)
+    monkeypatch.setattr(approval, "resolve_gateway_approval", resolved)
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "111")
+    query = SimpleNamespace(
+        data="ea:once:7",
+        message=SimpleNamespace(
+            chat_id=-100123,
+            chat=SimpleNamespace(type="supergroup"),
+            message_thread_id=8,
+        ),
+        from_user=SimpleNamespace(id=111, first_name="Trusted"),
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+    )
+
+    await adapter._handle_callback_query(
+        SimpleNamespace(callback_query=query), SimpleNamespace()
+    )
+
+    resolved.assert_called_once_with("session-key", "once")
+    assert adapter._approval_state == {}
+
+
+@pytest.mark.asyncio
+async def test_revoked_group_callback_is_denied_before_dispatch(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "111")
+    adapter = _adapter(trusted=[111])
+    await adapter._handle_my_chat_member(_membership_update(), None)
+    await adapter._handle_my_chat_member(
+        _membership_update(old_status="administrator", new_status="member"),
+        None,
+    )
+    adapter._handle_choice_picker_callback = AsyncMock()
+    query = SimpleNamespace(
+        data="cp:reasoning",
+        message=SimpleNamespace(
+            chat_id=-100123,
+            chat=SimpleNamespace(type="supergroup"),
+            message_thread_id=8,
+        ),
+        from_user=SimpleNamespace(id=111, first_name="Trusted"),
+        answer=AsyncMock(),
+    )
+
+    await adapter._handle_callback_query(
+        SimpleNamespace(callback_query=query), SimpleNamespace()
+    )
+
+    adapter._handle_choice_picker_callback.assert_not_awaited()
+    assert "not authorized" in query.answer.call_args.kwargs["text"].lower()
 
 
 def test_my_chat_member_handler_is_registered_on_each_application(monkeypatch):
