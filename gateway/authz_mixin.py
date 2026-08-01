@@ -447,9 +447,23 @@ class GatewayAuthorizationMixin:
                 adapter = self._adapter_for_source(source)
                 if adapter is not None:
                     extra = getattr(getattr(adapter, "config", None), "extra", None) or {}
-                    adapter_group_allowed = extra.get("group_allowed_chats")
+                    adapter_group_allowed = None
+                    if source.platform == Platform.TELEGRAM:
+                        effective_group_allowed = getattr(
+                            adapter,
+                            "_telegram_group_allowed_chats",
+                            None,
+                        )
+                        if callable(effective_group_allowed):
+                            adapter_group_allowed = effective_group_allowed()
+                    if adapter_group_allowed is None:
+                        adapter_group_allowed = extra.get("group_allowed_chats")
                     if adapter_group_allowed:
-                        allowed = _coerce_allow_set(adapter_group_allowed)
+                        allowed = (
+                            adapter_group_allowed
+                            if isinstance(adapter_group_allowed, set)
+                            else _coerce_allow_set(adapter_group_allowed)
+                        )
                         if "*" in allowed or source.chat_id in allowed:
                             return True
             except Exception:

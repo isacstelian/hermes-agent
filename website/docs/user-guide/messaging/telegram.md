@@ -1030,6 +1030,35 @@ Behavior:
 - Use `*` in any of these to allow any sender/chat.
 - This layers on top of existing mention/pattern triggers and on top of `group_topics` + `ignored_threads`.
 
+### Trusted administrator group enrollment
+
+Hermes can persistently admit a Telegram group when a trusted Telegram user promotes the bot to **administrator**:
+
+```yaml
+telegram:
+  auto_allow_groups_from_trusted_adders: true
+  trusted_group_adders:
+    - "123456789"
+  require_mention: true
+```
+
+Equivalent environment variables:
+
+```bash
+TELEGRAM_AUTO_ALLOW_GROUPS_FROM_TRUSTED_ADDERS=true
+TELEGRAM_TRUSTED_GROUP_ADDERS=123456789,987654321
+```
+
+This mode is intentionally strict:
+
+- Enrollment occurs only on a transition to Telegram `administrator`, only when the actor who performed the promotion is in `trusted_group_adders`. Merely adding the bot as a member does not enroll the group.
+- While the mode is enabled, a group must be present in `allowed_chats`, `group_allowed_chats`, or the persisted enrollment state. An empty set no longer means “all groups.” Sender allowlists and `guest_mode` mentions cannot bypass this admission gate.
+- Once a group is admitted, normal mention, reply, topic, sender, and command gates still apply. Enrollment does not make the bot answer every message.
+- Any transition away from `administrator` revokes persisted enrollment, regardless of who changed the bot's role. Leaving or being kicked also revokes it.
+- State is stored under the active Hermes profile at `$HERMES_HOME/state/telegram-auto-authorized-groups.json` (normally `~/.hermes/state/telegram-auto-authorized-groups.json`). Hermes stores only numeric chat IDs, writes atomically, and restricts the state directory/file to owner-only permissions (`0700`/`0600`). Treat the profile state directory as security-sensitive and do not share or hand-edit this file while the gateway is running.
+
+Both settings default to disabled/empty. Invalid booleans or malformed trusted-user lists fail closed and do not enroll a group.
+
 ### Migration from before PR #17686
 
 Prior to this split, `TELEGRAM_GROUP_ALLOWED_USERS` was the only knob and users put **chat IDs** in it. For backward compatibility, chat-ID-shaped values (starting with `-`) in `TELEGRAM_GROUP_ALLOWED_USERS` are still honored as chat IDs and a deprecation warning is logged once. Migration:
