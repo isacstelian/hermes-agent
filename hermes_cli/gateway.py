@@ -4034,6 +4034,16 @@ def generate_launchd_plist() -> str:
     <key>KeepAlive</key>
     <true/>
 
+    <!-- macOS defaults long-running launchd jobs to only 256 descriptors. A busy
+         gateway can legitimately exceed that during concurrent agent, cron,
+         HTTP, Telegram, and SQLite activity. Keep ample headroom below the
+         system per-process ceiling instead of failing unrelated file writes. -->
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>8192</integer>
+    </dict>
+
     <!-- ThrottleInterval raises launchd's default 10s minimum respawn interval
          to 30s so a crash-looping gateway can't hammer launchd into a rapid
          respawn storm; ExitTimeOut gives the gateway 25s of graceful-drain

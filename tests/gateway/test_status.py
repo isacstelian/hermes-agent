@@ -2,6 +2,7 @@
 
 import json
 import os
+import plistlib
 import sys
 import time
 from pathlib import Path
@@ -1996,6 +1997,14 @@ class TestLaunchdPlistRespawnGovernance:
         assert "<key>ThrottleInterval</key>" in plist
         assert "<key>ExitTimeOut</key>" in plist
         assert "<key>KeepAlive</key>" in plist
+
+    def test_plist_raises_open_file_limit_for_long_running_gateway(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        from hermes_cli.gateway import generate_launchd_plist
+
+        plist = plistlib.loads(generate_launchd_plist().encode("utf-8"))
+
+        assert plist["SoftResourceLimits"]["NumberOfFiles"] == 8192
 
 
 class TestPermissionErrorOnLockFile:
