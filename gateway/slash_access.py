@@ -41,7 +41,9 @@ from typing import Any, FrozenSet, Iterable, Optional, Tuple
 # Slash commands that MUST stay reachable for any allowed user, even when
 # slash gating is enabled and the user has no commands listed. Without this
 # carve-out, a non-admin user has no way to discover what they can or
-# can't do (``/help``, ``/whoami``). Operators can still narrow this further by writing
+# can't do (``/help``, ``/whoami``) and no way to see what state the agent
+# is in (``/status``). These mirror the smallest set of read-only commands
+# we'd hand to a guest. Operators can still narrow this further by writing
 # their own ``user_allowed_commands`` (this set is only the implicit
 # fallback floor — anything in ``user_allowed_commands`` overrides it
 # additively, never restrictively).
