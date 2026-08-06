@@ -4316,6 +4316,47 @@ class GatewaySlashCommandsMixin:
             else:
                 return t("gateway.title.current_no_title", session_id=session_id)
 
+    async def _handle_rename_command(self, event: MessageEvent) -> str:
+        """Rename only the Telegram topic bound to the authorized event."""
+        source = event.source
+        if source.platform != Platform.TELEGRAM:
+            return "/rename is available only in Telegram."
+
+        raw_name = event.get_command_args()
+        topic_name = re.sub(r"[\x00-\x1f\x7f]", " ", str(raw_name or ""))
+        topic_name = re.sub(r"\s+", " ", topic_name).strip()
+        if not topic_name:
+            return "Usage: /rename <name>"
+        if len(topic_name) > 128:
+            return (
+                "Telegram topic names can contain at most 128 characters; "
+                "this topic was not renamed."
+            )
+        if not source.chat_id or not source.thread_id:
+            return "This conversation has no Telegram topic to rename."
+
+        adapter_for_source: Any = getattr(self, "_adapter_for_source", None)
+        adapter = adapter_for_source(source) if callable(adapter_for_source) else None
+        rename_topic: Any = (
+            getattr(adapter, "rename_dm_topic", None) if adapter else None
+        )
+        if not callable(rename_topic):
+            return "Telegram topic rename is unavailable for this profile."
+
+        try:
+            await rename_topic(
+                chat_id=source.chat_id,
+                thread_id=source.thread_id,
+                name=topic_name,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Telegram /rename failed for the current topic (error=%s)",
+                type(exc).__name__,
+            )
+            return "Telegram did not rename the topic. Its name is unchanged."
+        return f"Renamed this Telegram topic to “{topic_name}”."
+
     async def _handle_resume_command(self, event: MessageEvent) -> str:
         """Handle /resume command — list or switch to a previous session."""
         if not self._session_db:
