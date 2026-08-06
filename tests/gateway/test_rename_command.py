@@ -117,6 +117,40 @@ async def test_rename_rejects_sources_without_a_topic():
 
 
 @pytest.mark.asyncio
+async def test_rename_fails_closed_while_telegram_bot_is_disconnected():
+    runner, adapter = _runner()
+    adapter._bot = None
+
+    result = await runner._handle_rename_command(_event())
+
+    assert result == "Telegram topic rename is unavailable while the bot is disconnected."
+    adapter.rename_dm_topic.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_rename_refuses_operator_managed_dm_topic():
+    class ManagedAdapter:
+        _bot = object()
+
+        def __init__(self):
+            self.rename_dm_topic = AsyncMock()
+
+        def _get_dm_topic_info(self, _chat_id, _thread_id):
+            return {"name": "Managed"}
+
+    runner, _adapter = _runner()
+    managed = ManagedAdapter()
+    runner.adapters = {Platform.TELEGRAM: managed}  # type: ignore[dict-item]
+
+    result = await runner._handle_rename_command(_event())
+
+    assert result == (
+        "This Telegram topic has an operator-managed name and cannot be renamed."
+    )
+    managed.rename_dm_topic.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_rename_fails_closed_without_logging_telegram_secrets(caplog):
     runner, adapter = _runner()
     adapter.rename_dm_topic.side_effect = RuntimeError(

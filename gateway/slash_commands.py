@@ -4343,12 +4343,31 @@ class GatewaySlashCommandsMixin:
         if not callable(rename_topic):
             return "Telegram topic rename is unavailable for this profile."
 
+        if getattr(adapter, "_bot", object()) is None:
+            return "Telegram topic rename is unavailable while the bot is disconnected."
+
+        get_topic_info = getattr(type(adapter), "_get_dm_topic_info", None)
+        if callable(get_topic_info):
+            try:
+                managed_topic = get_topic_info(
+                    adapter, str(source.chat_id), str(source.thread_id)
+                )
+            except Exception:
+                managed_topic = None
+            if isinstance(managed_topic, dict):
+                return (
+                    "This Telegram topic has an operator-managed name and "
+                    "cannot be renamed."
+                )
+
         try:
             await rename_topic(
                 chat_id=source.chat_id,
                 thread_id=source.thread_id,
                 name=topic_name,
             )
+        # Telegram clients expose several network/API exception classes.
+        # Log only the class: messages may include a Bot API URL and token.
         except Exception as exc:
             logger.warning(
                 "Telegram /rename failed for the current topic (error=%s)",

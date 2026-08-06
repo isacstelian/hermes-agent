@@ -41,16 +41,12 @@ from typing import Any, FrozenSet, Iterable, Optional, Tuple
 # Slash commands that MUST stay reachable for any allowed user, even when
 # slash gating is enabled and the user has no commands listed. Without this
 # carve-out, a non-admin user has no way to discover what they can or
-# can't do (``/help``, ``/whoami``). ``/rename`` is also safe for an allowed
-# user because it can only mutate the Telegram topic carried by that user's
-# already-authorized event; command arguments cannot select another topic.
-# Operators can still narrow this further by writing
+# can't do (``/help``, ``/whoami``). Operators can still narrow this further by writing
 # their own ``user_allowed_commands`` (this set is only the implicit
 # fallback floor — anything in ``user_allowed_commands`` overrides it
 # additively, never restrictively).
 _ALWAYS_ALLOWED_FOR_USERS: FrozenSet[str] = frozenset({
     "help",
-    "rename",
     "whoami",
 })
 

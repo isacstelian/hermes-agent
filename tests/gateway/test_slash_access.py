@@ -62,13 +62,13 @@ class TestPolicyFromExtra:
         assert p.can_run("999", "kanban") is False
 
     def test_always_allowed_floor_for_non_admin(self):
-        # Discovery commands and topic-local /rename stay reachable.
+        # Only discovery commands stay reachable without explicit configuration.
         p = policy_from_extra(
             {"allow_admin_from": ["111"], "user_allowed_commands": []},
             "dm",
         )
         assert p.can_run("999", "help") is True
-        assert p.can_run("999", "rename") is True
+        assert p.can_run("999", "rename") is False
         assert p.can_run("999", "whoami") is True
         assert p.can_run("999", "stop") is False
 

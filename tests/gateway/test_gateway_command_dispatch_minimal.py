@@ -150,8 +150,15 @@ async def test_idle_queue_without_payload_returns_usage():
 
 @pytest.mark.asyncio
 async def test_rename_resolves_through_real_gateway_dispatch():
+    from gateway.run import GatewayRunner
+
     runner, adapter = _make_runner()
     adapter.rename_dm_topic = AsyncMock()
+    runner.config.platforms[Platform.TELEGRAM].extra = {
+        "allow_admin_from": ["admin"],
+        "user_allowed_commands": ["rename"],
+    }
+    runner._check_slash_access = GatewayRunner._check_slash_access.__get__(runner)
     event = _make_event("/rename Fleet topic")
     event.source.thread_id = "thread-9"
 
@@ -163,3 +170,24 @@ async def test_rename_resolves_through_real_gateway_dispatch():
         thread_id="thread-9",
         name="Fleet topic",
     )
+
+
+@pytest.mark.asyncio
+async def test_rename_is_denied_by_real_slash_gate_when_not_explicitly_allowed():
+    from gateway.run import GatewayRunner
+
+    runner, adapter = _make_runner()
+    adapter.rename_dm_topic = AsyncMock()
+    runner.config.platforms[Platform.TELEGRAM].extra = {
+        "allow_admin_from": ["admin"],
+        "user_allowed_commands": [],
+    }
+    runner._check_slash_access = GatewayRunner._check_slash_access.__get__(runner)
+    event = _make_event("/rename Blocked")
+    event.source.thread_id = "thread-9"
+
+    result = await runner._handle_message(event)
+
+    assert isinstance(result, str)
+    assert "/rename is admin-only here" in result
+    adapter.rename_dm_topic.assert_not_awaited()

@@ -3314,8 +3314,8 @@ class TelegramAdapter(BasePlatformAdapter):
             name=name,
         )
         logger.info(
-            "[%s] Renamed DM topic in chat %s thread_id=%s -> '%s'",
-            self.name, chat_id, thread_id, name,
+            "[%s] Renamed DM topic in chat %s thread_id=%s",
+            self.name, chat_id, thread_id,
         )
 
     def _persist_dm_topic_thread_id(
