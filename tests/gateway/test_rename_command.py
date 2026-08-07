@@ -57,7 +57,7 @@ def test_rename_is_a_gateway_command_not_a_title_alias():
 
     assert command is not None
     assert command.name == "rename"
-    assert command.cli_only is True
+    assert command.cli_only is False
     assert command.gateway_only is True
     assert command.gateway_config_gate == "platforms.telegram.extra.rename_enabled"
     assert command.args_hint == "<name>"

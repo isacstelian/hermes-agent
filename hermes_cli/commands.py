@@ -85,7 +85,7 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("title", "Set a title for the current session", "Session",
                args_hint="[name]"),
     CommandDef("rename", "Rename the current Telegram topic", "Session",
-               cli_only=True, gateway_only=True, args_hint="<name>",
+               gateway_only=True, args_hint="<name>",
                gateway_config_gate="platforms.telegram.extra.rename_enabled"),
     CommandDef("handoff", "Hand off this session to a messaging platform (Telegram, Discord, etc.)", "Session",
                args_hint="<platform>", cli_only=True),
@@ -462,17 +462,15 @@ def _resolve_config_gates() -> set[str]:
 def _is_gateway_available(cmd: CommandDef, config_overrides: set[str] | None = None) -> bool:
     """Check if *cmd* should appear in gateway surfaces (help, menus, mappings).
 
-    Unconditionally available when ``cli_only`` is False.  When ``cli_only``
-    is True but ``gateway_config_gate`` is set, the command is available only
-    when the config value is truthy.  Pass *config_overrides* (from
-    ``_resolve_config_gates()``) to avoid re-reading config for every command.
+    Config-gated commands are available only when their value is truthy.
+    Other commands are unconditionally available unless ``cli_only`` is set.
+    Pass *config_overrides* (from ``_resolve_config_gates()``) to avoid
+    re-reading config for every command.
     """
-    if not cmd.cli_only:
-        return True
     if cmd.gateway_config_gate:
         overrides = config_overrides if config_overrides is not None else _resolve_config_gates()
         return cmd.name in overrides
-    return False
+    return not cmd.cli_only
 
 
 def _requires_argument(args_hint: str) -> bool:
