@@ -4343,18 +4343,24 @@ class GatewaySlashCommandsMixin:
         if not callable(rename_topic):
             return "Telegram topic rename is unavailable for this profile."
 
+        adapter_extra = getattr(getattr(adapter, "config", None), "extra", {})
+        if not isinstance(adapter_extra, dict) or adapter_extra.get("rename_enabled") is not True:
+            return "Telegram topic rename is not enabled for this profile."
+
         if getattr(adapter, "_bot", object()) is None:
             return "Telegram topic rename is unavailable while the bot is disconnected."
 
-        get_topic_info = getattr(type(adapter), "_get_dm_topic_info", None)
-        if callable(get_topic_info):
+        is_operator_managed = getattr(
+            adapter, "is_operator_managed_dm_topic", None
+        )
+        if callable(is_operator_managed):
             try:
-                managed_topic = get_topic_info(
-                    adapter, str(source.chat_id), str(source.thread_id)
+                managed_topic = is_operator_managed(
+                    str(source.chat_id), str(source.thread_id)
                 )
             except Exception:
-                managed_topic = None
-            if isinstance(managed_topic, dict):
+                managed_topic = False
+            if managed_topic is True:
                 return (
                     "This Telegram topic has an operator-managed name and "
                     "cannot be renamed."

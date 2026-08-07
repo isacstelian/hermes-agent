@@ -37,9 +37,14 @@ def _runner():
 
     runner = object.__new__(GatewayRunner)
     runner.config = GatewayConfig(
-        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")}
+        platforms={
+            Platform.TELEGRAM: PlatformConfig(
+                enabled=True, token="***", extra={"rename_enabled": True}
+            )
+        }
     )
     adapter = MagicMock()
+    adapter.config = runner.config.platforms[Platform.TELEGRAM]
     adapter.rename_dm_topic = AsyncMock()
     runner.adapters = {Platform.TELEGRAM: adapter}
     return runner, adapter
@@ -52,8 +57,44 @@ def test_rename_is_a_gateway_command_not_a_title_alias():
 
     assert command is not None
     assert command.name == "rename"
+    assert command.cli_only is True
     assert command.gateway_only is True
+    assert command.gateway_config_gate == "platforms.telegram.extra.rename_enabled"
     assert command.args_hint == "<name>"
+
+
+def test_rename_is_hidden_from_gateway_surfaces_unless_profile_flag_is_true(
+    monkeypatch,
+):
+    import hermes_cli.config
+    from hermes_cli.commands import gateway_help_lines, telegram_bot_commands
+
+    monkeypatch.setattr(hermes_cli.config, "read_raw_config", lambda: {})
+    assert not any(line.startswith("`/rename ") for line in gateway_help_lines())
+    assert "rename" not in {name for name, _desc in telegram_bot_commands()}
+
+    monkeypatch.setattr(
+        hermes_cli.config,
+        "read_raw_config",
+        lambda: {
+            "platforms": {
+                "telegram": {"extra": {"rename_enabled": True}}
+            }
+        },
+    )
+    assert any(line.startswith("`/rename ") for line in gateway_help_lines())
+    assert "rename" in {name for name, _desc in telegram_bot_commands()}
+
+
+@pytest.mark.asyncio
+async def test_rename_is_disabled_by_default_for_a_profile():
+    runner, adapter = _runner()
+    adapter.config.extra = {}
+
+    result = await runner._handle_rename_command(_event())
+
+    assert result == "Telegram topic rename is not enabled for this profile."
+    adapter.rename_dm_topic.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -133,10 +174,11 @@ async def test_rename_refuses_operator_managed_dm_topic():
         _bot = object()
 
         def __init__(self):
+            self.config = PlatformConfig(extra={"rename_enabled": True})
             self.rename_dm_topic = AsyncMock()
 
-        def _get_dm_topic_info(self, _chat_id, _thread_id):
-            return {"name": "Managed"}
+        def is_operator_managed_dm_topic(self, _chat_id, _thread_id):
+            return True
 
     runner, _adapter = _runner()
     managed = ManagedAdapter()
@@ -148,6 +190,21 @@ async def test_rename_refuses_operator_managed_dm_topic():
         "This Telegram topic has an operator-managed name and cannot be renamed."
     )
     managed.rename_dm_topic.assert_not_awaited()
+
+
+def test_operator_managed_detection_ignores_runtime_discovered_topic_cache():
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+
+    adapter = object.__new__(TelegramAdapter)
+    adapter._dm_topics_config = [
+        {
+            "chat_id": "12345",
+            "topics": [{"thread_id": 111, "name": "Configured"}],
+        }
+    ]
+
+    assert TelegramAdapter.is_operator_managed_dm_topic(adapter, "12345", "111")
+    assert not TelegramAdapter.is_operator_managed_dm_topic(adapter, "12345", "67890")
 
 
 @pytest.mark.asyncio

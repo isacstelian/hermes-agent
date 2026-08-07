@@ -46,9 +46,14 @@ def _make_runner():
 
     runner = object.__new__(GatewayRunner)
     runner.config = GatewayConfig(
-        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")}
+        platforms={
+            Platform.TELEGRAM: PlatformConfig(
+                enabled=True, token="***", extra={"rename_enabled": True}
+            )
+        }
     )
     adapter = MagicMock()
+    adapter.config = runner.config.platforms[Platform.TELEGRAM]
     adapter.send = AsyncMock()
     adapter._pending_messages = {}
     runner.adapters = {Platform.TELEGRAM: adapter}
@@ -156,6 +161,7 @@ async def test_rename_resolves_through_real_gateway_dispatch():
     adapter.rename_dm_topic = AsyncMock()
     runner.config.platforms[Platform.TELEGRAM].extra = {
         "allow_admin_from": ["admin"],
+        "rename_enabled": True,
         "user_allowed_commands": ["rename"],
     }
     runner._check_slash_access = GatewayRunner._check_slash_access.__get__(runner)
@@ -180,6 +186,7 @@ async def test_rename_is_denied_by_real_slash_gate_when_not_explicitly_allowed()
     adapter.rename_dm_topic = AsyncMock()
     runner.config.platforms[Platform.TELEGRAM].extra = {
         "allow_admin_from": ["admin"],
+        "rename_enabled": True,
         "user_allowed_commands": [],
     }
     runner._check_slash_access = GatewayRunner._check_slash_access.__get__(runner)

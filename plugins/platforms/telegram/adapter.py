@@ -9766,6 +9766,16 @@ class TelegramAdapter(BasePlatformAdapter):
 
         return None
 
+    def is_operator_managed_dm_topic(self, chat_id: str, thread_id: str) -> bool:
+        """Return whether a topic is explicitly declared in ``dm_topics`` config."""
+        for chat_entry in self._dm_topics_config:
+            if str(chat_entry.get("chat_id")) != str(chat_id):
+                continue
+            for topic in chat_entry.get("topics", []):
+                if str(topic.get("thread_id")) == str(thread_id):
+                    return True
+        return False
+
     def _cache_dm_topic_from_message(self, chat_id: str, thread_id: str, topic_name: str) -> None:
         """Cache a thread_id -> topic_name mapping discovered from an incoming message."""
         cache_key = f"{chat_id}:{topic_name}"
