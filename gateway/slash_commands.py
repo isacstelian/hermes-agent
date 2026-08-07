@@ -4358,8 +4358,13 @@ class GatewaySlashCommandsMixin:
                 managed_topic = is_operator_managed(
                     str(source.chat_id), str(source.thread_id)
                 )
-            except Exception:
-                managed_topic = False
+            except Exception as exc:
+                logger.warning(
+                    "Telegram /rename could not verify topic ownership "
+                    "(error=%s)",
+                    type(exc).__name__,
+                )
+                return "Telegram could not verify whether this topic can be renamed."
             if managed_topic is True:
                 return (
                     "This Telegram topic has an operator-managed name and "

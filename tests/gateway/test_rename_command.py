@@ -192,6 +192,17 @@ async def test_rename_refuses_operator_managed_dm_topic():
     managed.rename_dm_topic.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_rename_fails_closed_when_topic_ownership_check_fails():
+    runner, adapter = _runner()
+    adapter.is_operator_managed_dm_topic.side_effect = ValueError("bad config")
+
+    result = await runner._handle_rename_command(_event())
+
+    assert result == "Telegram could not verify whether this topic can be renamed."
+    adapter.rename_dm_topic.assert_not_awaited()
+
+
 def test_operator_managed_detection_ignores_runtime_discovered_topic_cache():
     from plugins.platforms.telegram.adapter import TelegramAdapter
 
