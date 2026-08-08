@@ -41,7 +41,6 @@ state, so give each agent/purpose its own Context.
 from __future__ import annotations
 
 import logging
-import os
 import uuid
 from typing import Any, Dict, Optional
 
@@ -81,7 +80,7 @@ class BrowserbaseBrowserProvider(BrowserProvider):
             return {
                 "api_key": api_key,
                 "project_id": project_id,
-                "base_url": os.environ.get(
+                "base_url": get_secret(
                     "BROWSERBASE_BASE_URL", "https://api.browserbase.com"
                 ).rstrip("/"),
             }
@@ -103,18 +102,20 @@ class BrowserbaseBrowserProvider(BrowserProvider):
     def create_session(self, task_id: str) -> Dict[str, object]:
         config = self._get_config()
 
-        # Optional env-var knobs
-        enable_proxies = os.environ.get("BROWSERBASE_PROXIES", "true").lower() != "false"
+        # Optional knobs. All read through get_secret rather than os.environ: a
+        # profile's .env is installed as a contextvar scope under the
+        # multiplexing gateway, so an os.environ read would miss the profile's
+        # setting (or pick up a sibling profile's). With multiplexing off,
+        # get_secret falls through to os.environ, so single-profile installs
+        # behave exactly as before.
+        enable_proxies = get_secret("BROWSERBASE_PROXIES", "true").lower() != "false"
         enable_advanced_stealth = (
-            os.environ.get("BROWSERBASE_ADVANCED_STEALTH", "false").lower() == "true"
+            get_secret("BROWSERBASE_ADVANCED_STEALTH", "false").lower() == "true"
         )
         enable_keep_alive = (
-            os.environ.get("BROWSERBASE_KEEP_ALIVE", "true").lower() != "false"
+            get_secret("BROWSERBASE_KEEP_ALIVE", "true").lower() != "false"
         )
-        custom_timeout_ms = os.environ.get("BROWSERBASE_SESSION_TIMEOUT")
-        # Read through get_secret, not os.environ: a profile's .env is installed
-        # as a contextvar scope under the multiplexing gateway, so os.environ
-        # would miss the profile's Context (or see a sibling profile's).
+        custom_timeout_ms = get_secret("BROWSERBASE_SESSION_TIMEOUT")
         context_id = (get_secret("BROWSERBASE_CONTEXT_ID") or "").strip()
 
         features_enabled = {

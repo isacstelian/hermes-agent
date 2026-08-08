@@ -41,10 +41,15 @@ class TestExplicitAllowlist:
         "HONCHO_API_KEY",
         "FIRECRAWL_API_KEY",
         "BROWSERBASE_API_KEY",
-        # Non-secret Browserbase identifiers still belong in .env — nothing
-        # reads them from config.yaml, so misrouting them fails silently.
+        # Every Browserbase knob is read from the environment, none from
+        # config.yaml — so misrouting any of them is a silent no-op.
         "BROWSERBASE_PROJECT_ID",
         "BROWSERBASE_CONTEXT_ID",
+        "BROWSERBASE_BASE_URL",
+        "BROWSERBASE_PROXIES",
+        "BROWSERBASE_ADVANCED_STEALTH",
+        "BROWSERBASE_KEEP_ALIVE",
+        "BROWSERBASE_SESSION_TIMEOUT",
         "FAL_KEY",
         "SUDO_PASSWORD",
         "GITHUB_TOKEN",

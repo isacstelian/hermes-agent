@@ -607,3 +607,74 @@ class TestBrowserbaseSessionPayload:
         body = bb_posts[-1]["json"]
         assert body["projectId"] == "scoped-proj"
         assert body["browserSettings"]["context"]["id"] == "scoped-context"
+
+    def test_every_knob_resolves_from_the_profile_secret_scope(
+        self, monkeypatch: pytest.MonkeyPatch, bb_posts: _PostLog
+    ) -> None:
+        """All Browserbase knobs are per-profile, not process-global.
+
+        Configuring a profile's ``.env`` must actually configure *that*
+        profile. Reading any one of these from ``os.environ`` would silently
+        ignore the profile's value under a multiplexed gateway — the operator
+        sets ``BROWSERBASE_KEEP_ALIVE=false`` and keep-alive stays on.
+        """
+        from agent import secret_scope
+
+        for key, decoy in (
+            ("BROWSERBASE_PROXIES", "true"),
+            ("BROWSERBASE_ADVANCED_STEALTH", "false"),
+            ("BROWSERBASE_KEEP_ALIVE", "true"),
+            ("BROWSERBASE_SESSION_TIMEOUT", "60"),
+        ):
+            monkeypatch.setenv(key, decoy)
+
+        token = secret_scope.set_secret_scope(
+            {
+                "BROWSERBASE_API_KEY": "scoped-key",
+                "BROWSERBASE_PROJECT_ID": "scoped-proj",
+                # Every value here is the opposite of the os.environ decoy.
+                "BROWSERBASE_PROXIES": "false",
+                "BROWSERBASE_ADVANCED_STEALTH": "true",
+                "BROWSERBASE_KEEP_ALIVE": "false",
+                "BROWSERBASE_SESSION_TIMEOUT": "1800",
+            }
+        )
+        secret_scope.set_multiplex_active(True)
+        try:
+            features = _create_session()["features"]
+        finally:
+            secret_scope.set_multiplex_active(False)
+            secret_scope.reset_secret_scope(token)
+
+        body = bb_posts[-1]["json"]
+        assert "proxies" not in body
+        assert "keepAlive" not in body
+        assert body["timeout"] == 1800
+        assert body["browserSettings"] == {"advancedStealth": True}
+        assert features["proxies"] is False
+        assert features["keep_alive"] is False
+        assert features["advanced_stealth"] is True
+        assert features["custom_timeout"] is True
+
+    def test_base_url_override_resolves_from_the_profile_secret_scope(
+        self, monkeypatch: pytest.MonkeyPatch, bb_posts: _PostLog
+    ) -> None:
+        from agent import secret_scope
+
+        monkeypatch.setenv("BROWSERBASE_BASE_URL", "https://decoy.example")
+
+        token = secret_scope.set_secret_scope(
+            {
+                "BROWSERBASE_API_KEY": "scoped-key",
+                "BROWSERBASE_PROJECT_ID": "scoped-proj",
+                "BROWSERBASE_BASE_URL": "https://scoped.example/",
+            }
+        )
+        secret_scope.set_multiplex_active(True)
+        try:
+            _create_session()
+        finally:
+            secret_scope.set_multiplex_active(False)
+            secret_scope.reset_secret_scope(token)
+
+        assert bb_posts[-1]["url"] == "https://scoped.example/v1/sessions"
