@@ -468,6 +468,9 @@ class TestBrowserbaseSessionPayload:
         body = bb_posts[-1]["json"]
         assert "browserSettings" not in body
         assert body == {"projectId": "bb-proj", "keepAlive": True, "proxies": True}
+        # Pin the default endpoint too: a typo here would silently point every
+        # user without a BROWSERBASE_BASE_URL override at the wrong host.
+        assert bb_posts[-1]["url"] == "https://api.browserbase.com/v1/sessions"
 
     def test_context_id_attaches_persistent_context(
         self, monkeypatch: pytest.MonkeyPatch, bb_posts: _PostLog
@@ -672,10 +675,13 @@ class TestBrowserbaseSessionPayload:
         """
         from agent import secret_scope
 
-        # Process-level values that must NOT win under multiplexing.
+        # Process-level values that must NOT win under multiplexing — every
+        # knob, so none of them can regress to a fallthrough independently.
         monkeypatch.setenv("BROWSERBASE_KEEP_ALIVE", "false")
         monkeypatch.setenv("BROWSERBASE_PROXIES", "false")
         monkeypatch.setenv("BROWSERBASE_ADVANCED_STEALTH", "true")
+        monkeypatch.setenv("BROWSERBASE_SESSION_TIMEOUT", "60")
+        monkeypatch.setenv("BROWSERBASE_BASE_URL", "https://decoy.example")
 
         token = secret_scope.set_secret_scope(
             {"BROWSERBASE_API_KEY": "scoped-key", "BROWSERBASE_PROJECT_ID": "scoped-proj"}
@@ -691,6 +697,8 @@ class TestBrowserbaseSessionPayload:
         assert body["keepAlive"] is True  # default, not the os.environ "false"
         assert body["proxies"] is True  # default, not the os.environ "false"
         assert "browserSettings" not in body  # default, not the os.environ "true"
+        assert "timeout" not in body  # default (none), not the os.environ "60"
+        assert bb_posts[-1]["url"] == "https://api.browserbase.com/v1/sessions"
 
     def test_base_url_override_resolves_from_the_profile_secret_scope(
         self, monkeypatch: pytest.MonkeyPatch, bb_posts: _PostLog
