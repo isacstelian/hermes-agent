@@ -656,6 +656,42 @@ class TestBrowserbaseSessionPayload:
         assert features["advanced_stealth"] is True
         assert features["custom_timeout"] is True
 
+    def test_multiplexed_scope_miss_takes_the_default_not_os_environ(
+        self, monkeypatch: pytest.MonkeyPatch, bb_posts: _PostLog
+    ) -> None:
+        """Under an ACTIVE multiplexer the scope is authoritative, not an overlay.
+
+        This pins a deliberate behaviour change: a knob set only in the
+        process environment (systemd ``Environment=``, a shell export) and
+        absent from the profile's scope resolves to its DEFAULT here, where a
+        plain ``os.environ`` read would have returned the process value.
+        Falling through would hand one profile another profile's setting,
+        which is the isolation boundary ``get_secret`` exists to enforce —
+        the API key already behaves this way. Multiplexed operators must
+        configure these per profile.
+        """
+        from agent import secret_scope
+
+        # Process-level values that must NOT win under multiplexing.
+        monkeypatch.setenv("BROWSERBASE_KEEP_ALIVE", "false")
+        monkeypatch.setenv("BROWSERBASE_PROXIES", "false")
+        monkeypatch.setenv("BROWSERBASE_ADVANCED_STEALTH", "true")
+
+        token = secret_scope.set_secret_scope(
+            {"BROWSERBASE_API_KEY": "scoped-key", "BROWSERBASE_PROJECT_ID": "scoped-proj"}
+        )
+        secret_scope.set_multiplex_active(True)
+        try:
+            _create_session()
+        finally:
+            secret_scope.set_multiplex_active(False)
+            secret_scope.reset_secret_scope(token)
+
+        body = bb_posts[-1]["json"]
+        assert body["keepAlive"] is True  # default, not the os.environ "false"
+        assert body["proxies"] is True  # default, not the os.environ "false"
+        assert "browserSettings" not in body  # default, not the os.environ "true"
+
     def test_base_url_override_resolves_from_the_profile_secret_scope(
         self, monkeypatch: pytest.MonkeyPatch, bb_posts: _PostLog
     ) -> None:
