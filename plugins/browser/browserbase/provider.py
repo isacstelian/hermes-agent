@@ -47,6 +47,7 @@ from typing import Any, Dict, Optional
 import requests
 
 from agent.browser_provider import BrowserProvider
+from agent.browser_context import get_browser_context
 from agent.secret_scope import get_secret
 
 logger = logging.getLogger(__name__)
@@ -117,7 +118,18 @@ class BrowserbaseBrowserProvider(BrowserProvider):
             get_secret("BROWSERBASE_KEEP_ALIVE", "true").lower() != "false"
         )
         custom_timeout_ms = get_secret("BROWSERBASE_SESSION_TIMEOUT")
-        context_id = (get_secret("BROWSERBASE_CONTEXT_ID") or "").strip()
+        bound_context_id = (get_browser_context(task_id) or "").strip()
+        require_bound_context = (
+            (get_secret("BROWSERBASE_REQUIRE_CONTEXT_BINDING", "false") or "false").lower()
+            == "true"
+        )
+        if require_bound_context and not bound_context_id:
+            raise RuntimeError(
+                "Browserbase session requires a server-verified context binding"
+            )
+        context_id = bound_context_id or (
+            get_secret("BROWSERBASE_CONTEXT_ID") or ""
+        ).strip()
 
         features_enabled = {
             "basic_stealth": True,
@@ -240,6 +252,61 @@ class BrowserbaseBrowserProvider(BrowserProvider):
             "cdp_url": session_data["connectUrl"],
             "features": features_enabled,
         }
+
+    def create_context(self) -> str:
+        """Create a new persistent Context and return its opaque identifier."""
+
+        config = self._get_config()
+        try:
+            response = requests.post(
+                f"{config['base_url']}/v1/contexts",
+                headers={
+                    "Content-Type": "application/json",
+                    "X-BB-API-Key": config["api_key"],
+                },
+                data=b"",
+                timeout=30,
+            )
+        except requests.RequestException as exc:
+            raise RuntimeError(
+                f"Browserbase Context API connection failed: {exc}"
+            ) from exc
+        if not response.ok:
+            raise RuntimeError(
+                "Failed to create Browserbase Context: "
+                f"{response.status_code} {response.text}"
+            )
+        context_id = str(response.json().get("id") or "").strip()
+        if not context_id:
+            raise RuntimeError("Browserbase did not return a Context id")
+        return context_id
+
+    def get_live_view_url(self, session_id: str) -> str:
+        """Return the temporary fullscreen Live View URL for a running session."""
+
+        session = str(session_id or "").strip()
+        if not session:
+            raise ValueError("session_id is required")
+        config = self._get_config()
+        try:
+            response = requests.get(
+                f"{config['base_url']}/v1/sessions/{session}/debug",
+                headers={"X-BB-API-Key": config["api_key"]},
+                timeout=30,
+            )
+        except requests.RequestException as exc:
+            raise RuntimeError(
+                f"Browserbase Live View API connection failed: {exc}"
+            ) from exc
+        if not response.ok:
+            raise RuntimeError(
+                "Failed to retrieve Browserbase Live View: "
+                f"{response.status_code} {response.text}"
+            )
+        live_url = str(response.json().get("debuggerFullscreenUrl") or "").strip()
+        if not live_url:
+            raise RuntimeError("Browserbase did not return a Live View URL")
+        return live_url
 
     def close_session(self, session_id: str) -> bool:
         try:

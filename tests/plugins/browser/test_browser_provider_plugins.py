@@ -483,6 +483,84 @@ class TestBrowserbaseSessionPayload:
             "context": {"id": "context-123", "persist": True}
         }
 
+    def test_server_verified_task_binding_overrides_profile_default(
+        self, monkeypatch: pytest.MonkeyPatch, bb_posts: _PostLog
+    ) -> None:
+        from agent.browser_context import bind_browser_context, clear_browser_context
+
+        monkeypatch.setenv("BROWSERBASE_CONTEXT_ID", "shared-context")
+        bind_browser_context("task-1", "user-context")
+        try:
+            _create_session("task-1")
+        finally:
+            clear_browser_context("task-1")
+
+        assert bb_posts[-1]["json"]["browserSettings"] == {
+            "context": {"id": "user-context", "persist": True}
+        }
+
+    def test_required_binding_fails_closed_instead_of_using_profile_default(
+        self, monkeypatch: pytest.MonkeyPatch, bb_posts: _PostLog
+    ) -> None:
+        monkeypatch.setenv("BROWSERBASE_CONTEXT_ID", "shared-context")
+        monkeypatch.setenv("BROWSERBASE_REQUIRE_CONTEXT_BINDING", "true")
+
+        with pytest.raises(RuntimeError, match="server-verified context binding"):
+            _create_session("task-unbound")
+
+        assert bb_posts == []
+
+    def test_create_context_uses_browserbase_context_api(self, monkeypatch) -> None:
+        from plugins.browser.browserbase import provider as module
+
+        monkeypatch.setenv("BROWSERBASE_API_KEY", "bb-secret")
+        calls = []
+
+        class Response:
+            ok = True
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"id": "ctx-created"}
+
+        def fake_post(url, *, headers, data, timeout):
+            assert data == b""
+            calls.append((url, headers, timeout))
+            return Response()
+
+        monkeypatch.setattr(module.requests, "post", fake_post)
+
+        assert module.BrowserbaseBrowserProvider().create_context() == "ctx-created"
+        assert calls[0][0] == "https://api.browserbase.com/v1/contexts"
+        assert calls[0][1]["X-BB-API-Key"] == "bb-secret"
+
+    def test_live_view_url_uses_session_debug_endpoint(self, monkeypatch) -> None:
+        from plugins.browser.browserbase import provider as module
+
+        monkeypatch.setenv("BROWSERBASE_API_KEY", "bb-secret")
+
+        class Response:
+            ok = True
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"debuggerFullscreenUrl": "https://live.example/session"}
+
+        monkeypatch.setattr(
+            module.requests,
+            "get",
+            lambda url, *, headers, timeout: Response(),
+        )
+
+        assert (
+            module.BrowserbaseBrowserProvider().get_live_view_url("session-123")
+            == "https://live.example/session"
+        )
+
     def test_context_and_advanced_stealth_coexist(
         self, monkeypatch: pytest.MonkeyPatch, bb_posts: _PostLog
     ) -> None:
