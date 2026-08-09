@@ -3,6 +3,7 @@
 Covers the fallback logic in _get_session_info() when a cloud provider
 is configured but fails at runtime (issue #10883).
 """
+import json
 import logging
 from unittest.mock import Mock
 
@@ -18,6 +19,26 @@ def _reset_session_state(monkeypatch):
     monkeypatch.setattr(browser_tool, "_cloud_provider_resolved", False)
     monkeypatch.setattr(browser_tool, "_start_browser_cleanup_thread", lambda: None)
     monkeypatch.setattr(browser_tool, "_update_session_activity", lambda t: None)
+
+
+def test_browser_current_url_reads_active_session(monkeypatch):
+    calls = []
+    monkeypatch.setattr(browser_tool, "_last_session_key", lambda task_id: f"active:{task_id}")
+
+    def run(task_id, command, args, **kwargs):
+        calls.append((task_id, command, args, kwargs))
+        return {"success": True, "data": {"result": '"https://www.linkedin.com/jobs/"'}}
+
+    monkeypatch.setattr(browser_tool, "_run_browser_command", run)
+
+    payload = json.loads(browser_tool.browser_current_url("task-a"))
+
+    assert payload == {"success": True, "url": "https://www.linkedin.com/jobs/"}
+    assert calls[0][:3] == (
+        "active:task-a",
+        "eval",
+        ["window.location.href"],
+    )
 
 
 class TestCloudProviderRuntimeFallback:
@@ -39,6 +60,21 @@ class TestCloudProviderRuntimeFallback:
         assert session["fallback_provider"] == "Mock"
         assert session["features"]["local"] is True
         assert session["cdp_url"] is None
+
+    def test_provider_can_forbid_local_fallback(self, monkeypatch):
+        _reset_session_state(monkeypatch)
+        provider = Mock()
+        provider.allow_local_fallback = False
+        provider.create_session.side_effect = RuntimeError("cloud unavailable")
+        local = Mock()
+        monkeypatch.setattr(browser_tool, "_get_cloud_provider", lambda: provider)
+        monkeypatch.setattr(browser_tool, "_get_cdp_override", lambda: None)
+        monkeypatch.setattr(browser_tool, "_create_local_session", local)
+
+        with pytest.raises(RuntimeError, match="cloud unavailable"):
+            browser_tool._get_session_info("strict-task")
+
+        local.assert_not_called()
 
     def test_cloud_success_no_fallback(self, monkeypatch):
         """When cloud succeeds, no fallback markers are present."""

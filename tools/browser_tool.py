@@ -2104,6 +2104,10 @@ def _get_session_info(task_id: Optional[str] = None) -> Dict[str, Any]:
                     session_info["cdp_url"] = _resolve_cdp_override(str(session_info["cdp_url"]))
             except Exception as e:
                 provider_name = type(provider).__name__
+                if not getattr(provider, "allow_local_fallback", True):
+                    raise RuntimeError(
+                        f"Cloud provider {provider_name} failed and local fallback is disabled: {e}"
+                    ) from e
                 logger.warning(
                     "Cloud provider %s failed (%s); attempting fallback to local "
                     "Chromium for task %s",
@@ -3029,6 +3033,33 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
             "success": False,
             "error": result.get("error", "Navigation failed")
         }, ensure_ascii=False)
+
+
+def browser_current_url(task_id: Optional[str] = None) -> str:
+    """Return the current page URL without exposing a general eval tool."""
+
+    effective_task_id = _last_session_key(task_id or "default")
+    result = _run_browser_command(
+        effective_task_id,
+        "eval",
+        ["window.location.href"],
+        timeout=5,
+        _engine_override="auto",
+    )
+    if not result.get("success"):
+        return json.dumps(
+            {"success": False, "error": result.get("error", "Current URL unavailable")},
+            ensure_ascii=False,
+        )
+    current_url = (
+        result.get("data", {}).get("result", "").strip().strip('"').strip("'")
+    )
+    if not current_url:
+        return json.dumps(
+            {"success": False, "error": "Current URL unavailable"},
+            ensure_ascii=False,
+        )
+    return json.dumps({"success": True, "url": current_url}, ensure_ascii=False)
 
 
 def browser_snapshot(

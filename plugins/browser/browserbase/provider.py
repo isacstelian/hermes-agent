@@ -71,6 +71,14 @@ class BrowserbaseBrowserProvider(BrowserProvider):
     def is_available(self) -> bool:
         return self._get_config_or_none() is not None
 
+    @property
+    def allow_local_fallback(self) -> bool:
+        """Never leave Browserbase when verified context binding is mandatory."""
+
+        return (
+            get_secret("BROWSERBASE_REQUIRE_CONTEXT_BINDING", "false") or "false"
+        ).strip().lower() != "true"
+
     # ------------------------------------------------------------------
     # Config resolution
     # ------------------------------------------------------------------
