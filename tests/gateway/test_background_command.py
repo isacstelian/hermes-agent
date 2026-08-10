@@ -274,6 +274,11 @@ class TestRunBackgroundTask:
         assert "Background task complete" in content
         assert "Hello from background!" in content
         agent_kwargs = MockAgent.call_args.kwargs
+        # Background work may share the session DB, but it must use its own
+        # task-scoped session id so it cannot append to or mutate the caller's
+        # foreground conversation.
+        assert agent_kwargs["session_id"] == "bg_test"
+        assert agent_kwargs["session_id"] != runner._session_key_for_source(source)
         assert agent_kwargs["checkpoints_enabled"] is True
         assert agent_kwargs["checkpoint_max_snapshots"] == 8
         assert agent_kwargs["checkpoint_max_total_size_mb"] == 222
