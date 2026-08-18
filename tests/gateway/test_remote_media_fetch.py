@@ -129,7 +129,7 @@ class TestFetchRemoteMedia:
         local, reason = fetch_remote_media("/root/gone.xlsx", "session-1")
 
         assert local is None
-        assert "not found" in reason
+        assert "not in the agent sandbox" in reason
 
     def test_credential_path_is_never_fetched(self, remote_backend):
         env = remote_backend(_FakeRemoteEnv({"/root/.ssh/id_rsa": b"KEY"}))
@@ -212,7 +212,11 @@ class TestFilterUsesTheFetch:
         )
 
         assert safe == []
-        assert dropped == [("raport_iulie_2026.xlsx", MEDIA_DROP_MISSING)]
+        name, reason, detail = dropped[0]
+        assert (name, reason) == ("raport_iulie_2026.xlsx", MEDIA_DROP_MISSING)
+        # The drop carries the backend's own explanation, so the user is told
+        # the file was never in the sandbox rather than a generic path error.
+        assert "not in the agent sandbox" in detail
 
     def test_denied_local_path_is_not_laundered_through_the_backend(
         self, remote_backend, tmp_path, monkeypatch

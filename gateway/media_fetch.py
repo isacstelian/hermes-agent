@@ -195,7 +195,10 @@ def fetch_remote_media(
 
         size = env.fetch_file_size(resolved or candidate)
         if size is None:
-            return None, f"the file was not found in the {backend} backend"
+            return None, (
+                "the file is not in the agent sandbox (it was never created, "
+                "or it was written to a different path)"
+            )
         limit = media_fetch_max_bytes()
         if size > limit:
             return None, (

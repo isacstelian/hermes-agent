@@ -1863,18 +1863,28 @@ def _maybe_fetch_remote_media(path: str, task_id: Optional[str] = None) -> Tuple
 _MEDIA_DROP_NOTICE_MAX_LINES = 5
 
 
-def format_media_drop_notice(dropped: Sequence[Tuple[str, str]]) -> str:
+def format_media_drop_notice(dropped: Sequence[Tuple[str, ...]]) -> str:
     """Render a user-visible notice for attachments that were NOT delivered.
 
     Empty string when nothing was dropped, so callers can append
     unconditionally. Wording mirrors the ``send_document`` fallback notice so
     a user sees one consistent failure shape.
+
+    Each entry is ``(display_name, reason)`` or ``(display_name, reason,
+    detail)``. The detail is the backend fetch's own short explanation and
+    wins when present: "not found in the docker backend" and "the sandbox is
+    gone" are different problems for the reader, and collapsing both into
+    "the gateway can't see that path" sends people hunting the wrong bug.
     """
     if not dropped:
         return ""
     lines = []
-    for name, reason in dropped[:_MEDIA_DROP_NOTICE_MAX_LINES]:
-        if reason == MEDIA_DROP_DENIED:
+    for entry in dropped[:_MEDIA_DROP_NOTICE_MAX_LINES]:
+        name, reason = entry[0], entry[1]
+        detail = entry[2] if len(entry) > 2 else ""
+        if detail:
+            why = detail
+        elif reason == MEDIA_DROP_DENIED:
             why = "blocked by the media delivery policy"
         else:
             why = (
@@ -4879,7 +4889,7 @@ class BasePlatformAdapter(ABC):
         media_files,
         task_id: Optional[str] = None,
         task_id_factory: Optional[Callable[[], Optional[str]]] = None,
-    ) -> Tuple[List[Tuple[str, bool]], List[Tuple[str, str]]]:
+    ) -> Tuple[List[Tuple[str, bool]], List[Tuple[str, str, str]]]:
         """Filter MEDIA paths, returning the accepted ones and the drops.
 
         A path that is merely *missing* on the gateway host is retried
@@ -4894,10 +4904,11 @@ class BasePlatformAdapter(ABC):
         reply with no undeliverable path never pays for the session lookup
         (#73771 pins that invariant).
 
-        The second element is a list of ``(display_name, reason)`` pairs for
-        the paths that will NOT be delivered, so the caller can tell the user
-        instead of failing silently (#75065). Only the basename is reported —
-        the full path is a host filesystem layout leak.
+        The second element is a list of ``(display_name, reason, detail)``
+        triples for the paths that will NOT be delivered, so the caller can
+        tell the user instead of failing silently (#75065); *detail* is the
+        backend fetch's own explanation when one was attempted. Only the
+        basename is reported — the full path is a host filesystem layout leak.
         """
         safe_media: List[Tuple[str, bool]] = []
         dropped: List[Tuple[str, str]] = []
@@ -4918,7 +4929,7 @@ class BasePlatformAdapter(ABC):
                 safe_media.append((safe_path, bool(is_voice)))
             else:
                 _log_media_delivery_drop("MEDIA directive", raw, reason, fetch_reason)
-                dropped.append((_notice_safe_name(raw), reason))
+                dropped.append((_notice_safe_name(raw), reason, fetch_reason))
         return safe_media, dropped
 
     @staticmethod

@@ -978,9 +978,10 @@ class TestMediaDeliveryDropReasons:
         )
 
         assert safe == [(str(good.resolve()), False)]
-        assert dropped == [("raport_iulie.xlsx", base.MEDIA_DROP_MISSING)]
+        name, reason, _detail = dropped[0]
+        assert (name, reason) == ("raport_iulie.xlsx", base.MEDIA_DROP_MISSING)
         # The directory half is host filesystem layout — never echoed.
-        assert "host-layout-secret" not in dropped[0][0]
+        assert "host-layout-secret" not in name
 
     def test_local_filter_drops_quietly(self, tmp_path, caplog):
         """Bare auto-detected paths are a heuristic: log, but do not notify."""
@@ -1057,6 +1058,21 @@ class TestMediaDropNotice:
         assert "raport.xlsx" in lines[0] and "terminal sandbox" in lines[0]
         assert "id_rsa" in lines[1] and "policy" in lines[1]
         assert all(line.startswith("⚠️ Couldn't deliver") for line in lines)
+
+    def test_fetch_detail_replaces_the_generic_wording(self):
+        """A fetch that reached the sandbox must not read as "can't see it"."""
+        import gateway.platforms.base as base
+
+        notice = base.format_media_drop_notice([
+            (
+                "raport.xlsx",
+                base.MEDIA_DROP_MISSING,
+                "the file is not in the agent sandbox (it was never created)",
+            ),
+        ])
+
+        assert "not in the agent sandbox" in notice
+        assert "gateway host cannot see" not in notice
 
     def test_long_drop_list_is_capped_and_counted(self):
         import gateway.platforms.base as base
