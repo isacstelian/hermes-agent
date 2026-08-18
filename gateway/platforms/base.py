@@ -4845,17 +4845,40 @@ class BasePlatformAdapter(ABC):
         """Return a resolved path if it is safe for native attachment upload."""
         return validate_media_delivery_path(path)
 
+    def agent_task_id_for_session(self, session_key: str) -> Optional[str]:
+        """Map a gateway session_key to the task id the agent ran under.
+
+        The agent is invoked with ``task_id=session_id`` and the terminal
+        sandbox is keyed by that id, so a delivery-time sandbox lookup has to
+        translate the gateway's session_key through the store's key→session_id
+        index first. Falls back to the raw key for stores that accept either.
+        """
+        store = getattr(self, "_session_store", None)
+        if store is not None:
+            peek = getattr(store, "peek_session_id", None)
+            if callable(peek):
+                try:
+                    return peek(session_key) or session_key
+                except Exception:  # noqa: BLE001 — never break delivery
+                    return session_key
+        return session_key
+
     @staticmethod
-    def filter_media_delivery_paths(media_files, task_id=None) -> List[Tuple[str, bool]]:
+    def filter_media_delivery_paths(
+        media_files,
+        task_id: Optional[str] = None,
+        task_id_factory: Optional[Callable[[], Optional[str]]] = None,
+    ) -> List[Tuple[str, bool]]:
         """Drop unsafe MEDIA paths and normalize accepted paths."""
         return BasePlatformAdapter.filter_media_delivery_paths_with_drops(
-            media_files, task_id
+            media_files, task_id, task_id_factory
         )[0]
 
     @staticmethod
     def filter_media_delivery_paths_with_drops(
         media_files,
         task_id: Optional[str] = None,
+        task_id_factory: Optional[Callable[[], Optional[str]]] = None,
     ) -> Tuple[List[Tuple[str, bool]], List[Tuple[str, str]]]:
         """Filter MEDIA paths, returning the accepted ones and the drops.
 
@@ -4866,6 +4889,11 @@ class BasePlatformAdapter(ABC):
         container (#466). *Denied* paths are never fetched — re-reading a
         credential from the backend would launder the rejection.
 
+        ``task_id_factory`` is the lazy form of ``task_id``: it is called at
+        most once, and ONLY when a fetch is actually attempted, so an ordinary
+        reply with no undeliverable path never pays for the session lookup
+        (#73771 pins that invariant).
+
         The second element is a list of ``(display_name, reason)`` pairs for
         the paths that will NOT be delivered, so the caller can tell the user
         instead of failing silently (#75065). Only the basename is reported —
@@ -4873,11 +4901,18 @@ class BasePlatformAdapter(ABC):
         """
         safe_media: List[Tuple[str, bool]] = []
         dropped: List[Tuple[str, str]] = []
+        task_id_resolved = task_id is not None or task_id_factory is None
         for media_path, is_voice in media_files or []:
             raw = str(media_path)
             safe_path, reason = classify_media_delivery_path(raw)
             fetch_reason = ""
             if not safe_path and reason == MEDIA_DROP_MISSING:
+                if not task_id_resolved:
+                    task_id_resolved = True
+                    try:
+                        task_id = task_id_factory()
+                    except Exception:  # noqa: BLE001 — never break delivery
+                        task_id = None
                 safe_path, fetch_reason = _maybe_fetch_remote_media(raw, task_id)
             if safe_path:
                 safe_media.append((safe_path, bool(is_voice)))
@@ -6439,7 +6474,8 @@ class BasePlatformAdapter(ABC):
                 # Extract MEDIA:<path> tags (from TTS tool) before other processing
                 media_files, response = self.extract_media(response)
                 media_files, _media_drops = self.filter_media_delivery_paths_with_drops(
-                    media_files, session_key
+                    media_files,
+                    task_id_factory=lambda: self.agent_task_id_for_session(session_key),
                 )
 
                 # Extract image URLs and send them as native platform attachments

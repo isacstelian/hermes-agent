@@ -20262,6 +20262,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if _media_adapter:
                         await self._deliver_media_from_response(
                             response, event, _media_adapter,
+                            task_id=session_entry.session_id,
                         )
                 # Streaming already delivered the body text, but the footer was
                 # intentionally held back (see the `not already_sent` gate above).
@@ -21675,12 +21676,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except OSError:
                     pass
 
+    def _agent_task_id_for_source(self, source: SessionSource) -> Optional[str]:
+        """Return the task id the agent ran under for *source*'s session.
+
+        Mirrors ``BasePlatformAdapter.agent_task_id_for_session``: the terminal
+        sandbox is keyed by session_id, not by the gateway session_key.
+        """
+        try:
+            session_key = build_session_key(source)
+        except Exception:  # noqa: BLE001 — never break delivery
+            return None
+        store = getattr(self, "session_store", None)
+        peek = getattr(store, "peek_session_id", None) if store is not None else None
+        if callable(peek):
+            try:
+                return peek(session_key) or session_key
+            except Exception:  # noqa: BLE001
+                return session_key
+        return session_key
+
     async def _deliver_media_from_response(
         self,
         response: str,
         event: MessageEvent,
         adapter,
         thread_metadata: Optional[Dict[str, Any]] = None,
+        task_id: Optional[str] = None,
     ) -> None:
         """Extract explicit MEDIA: tags from a response and deliver them.
 
@@ -21715,12 +21736,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
 
             media_files, cleaned = adapter.extract_media(response)
-            # Session-scoped task id: it keys the agent's terminal sandbox, so
-            # a MEDIA path that only exists inside that container can be
-            # fetched out of it for delivery (#466).
+            # The agent runs with task_id=session_id and its terminal sandbox
+            # is keyed by that id, so a MEDIA path that exists only inside the
+            # container can be fetched out of it for delivery (#466). The
+            # gateway session_key is NOT that id — callers pass the session id
+            # explicitly, and we resolve it from the store when they can't.
+            # Lazy + best-effort: the session lookup only runs if a path
+            # actually needs fetching, and a missing/failing resolver degrades
+            # to "fetch not attempted" rather than aborting the delivery.
+            def _resolve_fetch_task_id():
+                resolver = getattr(self, "_agent_task_id_for_source", None)
+                return resolver(event.source) if callable(resolver) else None
+
             media_files, _media_drops = (
                 BasePlatformAdapter.filter_media_delivery_paths_with_drops(
-                    media_files, build_session_key(event.source)
+                    media_files, task_id, _resolve_fetch_task_id
                 )
             )
             # Do NOT deduplicate explicit MEDIA tags against prior turns here
