@@ -9,6 +9,7 @@ import hashlib
 import json
 import logging
 import os
+import posixpath
 import re
 import shlex
 import shutil
@@ -19,8 +20,10 @@ from pathlib import Path
 from typing import Optional
 
 from tools.environments.base import (
+    _FETCH_TIMEOUT_SECONDS,
     BaseEnvironment,
     EnvironmentConnectionError,
+    FileFetchError,
     _popen_bash,
 )
 from tools.environments.local import (
@@ -1301,6 +1304,12 @@ class DockerEnvironment(BaseEnvironment):
         # /usr/local/bin is not in PATH (common on macOS gateway/service).
         self._docker_exe = find_docker() or "docker"
 
+        # Best-effort home for delivery-path security checks (remote_home):
+        # containers run as root unless run_as_host_user remaps the uid, in
+        # which case the in-container home is unknown.
+        if not (run_as_host_user and user_args):
+            self._remote_home = "/root"
+
         # s6-overlay images (e.g. hermes-agent:latest) already use /init as PID 1
         # and exec /run/s6/basedir/bin/init during startup. For those images we
         # must (a) skip Docker's --init (two competing PID-1 inits) and (b) mount
@@ -1630,6 +1639,70 @@ class DockerEnvironment(BaseEnvironment):
             cmd.extend(["bash", "-c", cmd_string])
 
         return _popen_bash(cmd, stdin_data)
+
+    # ------------------------------------------------------------------
+    # File extraction (container -> host)
+    # ------------------------------------------------------------------
+
+    def _host_path_for(self, container_path: str) -> Optional[str]:
+        """Map a container path onto its persistent bind-mount host path.
+
+        Only covers the sandbox-managed /root and /workspace mounts; paths
+        outside them (tmpfs, explicit docker_volumes) return None and go
+        through ``docker cp`` instead. The path is normalized first so
+        ``/root/../etc/passwd`` can't escape the mapped root.
+
+        Note this is a HOST-side view, which only exists when the Docker
+        daemon runs on the same machine as Hermes. With a remote daemon
+        (``DOCKER_HOST=ssh://...``) the bind mounts materialize on the daemon
+        host, so ``os.path.isfile`` below fails and the caller falls through
+        to ``docker cp`` — which streams over the daemon connection and works
+        either way.
+        """
+        normalized = posixpath.normpath(container_path)
+        for prefix, host_root in (("/root", self._home_dir),
+                                  ("/workspace", self._workspace_dir)):
+            if not host_root:
+                continue
+            if normalized == prefix or normalized.startswith(prefix + "/"):
+                return os.path.join(host_root, normalized[len(prefix):].lstrip("/"))
+        return None
+
+    def fetch_file(self, container_path: str, local_dest: str) -> None:
+        """Copy a file out of the container to *local_dest* on the host.
+
+        Persistent /root and /workspace are bind mounts, so those paths copy
+        straight from the host-side view when it exists. Everything else
+        streams through ``docker cp`` (the Archive API). ``-L`` dereferences
+        symlinks inside the container so the copy can never land as a
+        host-side symlink.
+        """
+        host_path = self._host_path_for(container_path)
+        if host_path and os.path.isfile(host_path):
+            shutil.copy2(host_path, local_dest)
+            return
+
+        if not self._container_id:
+            raise FileFetchError("Docker container not started")
+        try:
+            result = subprocess.run(
+                [self._docker_exe, "cp", "-L",
+                 f"{self._container_id}:{container_path}", local_dest],
+                capture_output=True,
+                text=True,
+                timeout=_FETCH_TIMEOUT_SECONDS,
+                stdin=subprocess.DEVNULL,
+            )
+        except subprocess.TimeoutExpired:
+            raise FileFetchError(f"docker cp of {container_path!r} timed out")
+        if result.returncode != 0:
+            raise FileFetchError(
+                f"docker cp of {container_path!r} failed: {result.stderr.strip()}"
+            )
+        if not os.path.isfile(local_dest):
+            # docker cp of a directory materializes a directory — reject it.
+            shutil.rmtree(local_dest, ignore_errors=True)
+            raise FileFetchError(f"{container_path!r} is not a regular file")
 
     # ------------------------------------------------------------------
     # "No such container" recovery (issue #36266)

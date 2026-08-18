@@ -1359,58 +1359,63 @@ def _media_delivery_strict_mode() -> bool:
     return raw in ("1", "true", "yes", "on")
 
 
+# Module-level (not local to _media_delivery_denied_paths) so the remote-path
+# check in gateway/media_fetch.py can apply the same set to a backend
+# filesystem, which cannot be stat'd from here.
+# The active Hermes profile and shared Hermes root both contain control
+# files and credentials. Only cache subdirectories under them are
+# explicitly allowlisted above (matched BEFORE this denylist in
+# validate_media_delivery_path, so generated media still delivers).
+#
+# These are the per-file credential / secret stores that live at the
+# HERMES_HOME root. The set mirrors the canonical read guard in
+# agent/file_safety.py (get_read_block_error / build_write_denied_*) so the
+# delivery (read/exfil) side can't trail the write side: a credential the
+# agent is forbidden to write or read must also never be auto-attached to a
+# chat reply. Enumerated explicitly per-file rather than denying the whole
+# tree, so skills/, logs/, and ad-hoc agent-written files under ~/.hermes
+# stay deliverable (see #32090, #34425).
+_ROOT_CREDENTIAL_FILES = (
+    ".env",
+    "auth.json",
+    "auth.lock",
+    "credentials",
+    "config.yaml",
+    # Anthropic PKCE / OAuth refresh credential store.
+    ".anthropic_oauth.json",
+    # Google Workspace skill: auto-refreshing OAuth token (mtime bumps
+    # every turn, which defeated the strict-mode recency window) plus the
+    # pending-exchange session/verifier file.
+    "google_token.json",
+    "google_oauth_pending.json",
+    os.path.join("auth", "google_oauth.json"),
+    # Webhook subscription HMAC secrets.
+    "webhook_subscriptions.json",
+    # Bitwarden Secrets Manager plaintext and encrypted disk caches.
+    os.path.join("cache", "bws_cache.json"),
+    os.path.join("cache", "bws_cache.enc.json"),
+)
+# Directory trees whose every child is credential material.
+#
+# mcp-tokens/ holds live MCP OAuth access tokens (<server>.json) and
+# dynamically-registered client credentials (<server>.client.json); see
+# tools/mcp_oauth.py. Same credential class as auth.json/credentials/.
+# The write side already denies it (file_tools _check_sensitive_path);
+# this pairs the media-delivery (exfil) side so a prompt-injection MEDIA
+# tag can't deliver a live bearer token as a native attachment.
+# (session/kanban SQLite stores are handled by #41071 — kept out here.)
+_ROOT_CREDENTIAL_DIRS = (
+    "pairing",
+    "mcp-tokens",
+)
+
+
 def _media_delivery_denied_paths() -> List[Path]:
     """Return absolute denylist paths under which delivery is never allowed."""
     denied = [Path(p) for p in _MEDIA_DELIVERY_DENIED_PREFIXES]
     home = Path(os.path.expanduser("~"))
     for sub in _MEDIA_DELIVERY_DENIED_HOME_SUBPATHS:
         denied.append(home / sub)
-    # The active Hermes profile and shared Hermes root both contain control
-    # files and credentials. Only cache subdirectories under them are
-    # explicitly allowlisted above (matched BEFORE this denylist in
-    # validate_media_delivery_path, so generated media still delivers).
-    #
-    # These are the per-file credential / secret stores that live at the
-    # HERMES_HOME root. The set mirrors the canonical read guard in
-    # agent/file_safety.py (get_read_block_error / build_write_denied_*) so the
-    # delivery (read/exfil) side can't trail the write side: a credential the
-    # agent is forbidden to write or read must also never be auto-attached to a
-    # chat reply. Enumerated explicitly per-file rather than denying the whole
-    # tree, so skills/, logs/, and ad-hoc agent-written files under ~/.hermes
-    # stay deliverable (see #32090, #34425).
-    _ROOT_CREDENTIAL_FILES = (
-        ".env",
-        "auth.json",
-        "auth.lock",
-        "credentials",
-        "config.yaml",
-        # Anthropic PKCE / OAuth refresh credential store.
-        ".anthropic_oauth.json",
-        # Google Workspace skill: auto-refreshing OAuth token (mtime bumps
-        # every turn, which defeated the strict-mode recency window) plus the
-        # pending-exchange session/verifier file.
-        "google_token.json",
-        "google_oauth_pending.json",
-        os.path.join("auth", "google_oauth.json"),
-        # Webhook subscription HMAC secrets.
-        "webhook_subscriptions.json",
-        # Bitwarden Secrets Manager plaintext and encrypted disk caches.
-        os.path.join("cache", "bws_cache.json"),
-        os.path.join("cache", "bws_cache.enc.json"),
-    )
-    # Directory trees whose every child is credential material.
-    #
-    # mcp-tokens/ holds live MCP OAuth access tokens (<server>.json) and
-    # dynamically-registered client credentials (<server>.client.json); see
-    # tools/mcp_oauth.py. Same credential class as auth.json/credentials/.
-    # The write side already denies it (file_tools _check_sensitive_path);
-    # this pairs the media-delivery (exfil) side so a prompt-injection MEDIA
-    # tag can't deliver a live bearer token as a native attachment.
-    # (session/kanban SQLite stores are handled by #41071 — kept out here.)
-    _ROOT_CREDENTIAL_DIRS = (
-        "pairing",
-        "mcp-tokens",
-    )
     for hermes_root in (_HERMES_HOME, _HERMES_ROOT):
         for rel in _ROOT_CREDENTIAL_FILES:
             denied.append(hermes_root / rel)
@@ -1818,23 +1823,39 @@ def _notice_safe_name(path: str) -> str:
     return _LOG_UNSAFE_CHARS.sub("?", name)[:80]
 
 
-def _log_media_delivery_drop(kind: str, raw: str, reason: str) -> None:
+def _log_media_delivery_drop(
+    kind: str, raw: str, reason: str, fetch_reason: str = "",
+) -> None:
     """Log a dropped delivery path, distinguishing *why* it was dropped.
 
     The ``denied`` wording is unchanged from before the reason codes existed
     so log searches for the security rejection keep working; ``missing`` gets
-    its own line because the two have completely different fixes (tighten the
-    agent vs. bridge the sandbox filesystem).
+    its own line, carrying why the backend fetch could not rescue it either.
     """
     if reason == MEDIA_DROP_DENIED:
         logger.warning("Skipping unsafe %s path: %s", kind, _log_safe_path(raw))
     else:
         logger.warning(
-            "Skipping missing %s path (not on the gateway host — a sandboxed "
-            "terminal backend's files are unreachable unless a docker mount "
-            "maps them): %s",
-            kind, _log_safe_path(raw),
+            "Skipping missing %s path (not on the gateway host and not "
+            "fetchable from the terminal backend: %s): %s",
+            kind, fetch_reason or "no backend fetch attempted", _log_safe_path(raw),
         )
+
+
+def _maybe_fetch_remote_media(path: str, task_id: Optional[str] = None) -> Tuple[Optional[str], str]:
+    """Try to fetch a locally-missing MEDIA path out of the terminal backend.
+
+    Returns ``(local_path, "")`` on success or ``(None, reason)``. Never
+    raises: a fetch bug must not take down the delivery of the message.
+    """
+    try:
+        from gateway.media_fetch import fetch_remote_media
+
+        local_path, reason = fetch_remote_media(path, task_id)
+        return local_path, reason or ""
+    except Exception as exc:  # noqa: BLE001 — delivery must survive a fetch bug
+        logger.warning("Remote media fetch errored: %s", exc, exc_info=True)
+        return None, "remote fetch errored"
 
 
 # Cap the per-message notice so a response with dozens of bad paths cannot
@@ -4825,15 +4846,25 @@ class BasePlatformAdapter(ABC):
         return validate_media_delivery_path(path)
 
     @staticmethod
-    def filter_media_delivery_paths(media_files) -> List[Tuple[str, bool]]:
+    def filter_media_delivery_paths(media_files, task_id=None) -> List[Tuple[str, bool]]:
         """Drop unsafe MEDIA paths and normalize accepted paths."""
-        return BasePlatformAdapter.filter_media_delivery_paths_with_drops(media_files)[0]
+        return BasePlatformAdapter.filter_media_delivery_paths_with_drops(
+            media_files, task_id
+        )[0]
 
     @staticmethod
     def filter_media_delivery_paths_with_drops(
         media_files,
+        task_id: Optional[str] = None,
     ) -> Tuple[List[Tuple[str, bool]], List[Tuple[str, str]]]:
         """Filter MEDIA paths, returning the accepted ones and the drops.
+
+        A path that is merely *missing* on the gateway host is retried
+        against the active terminal backend: the file is fetched out of the
+        sandbox into the document cache and delivered from there, so a
+        MEDIA: directive works for artifacts the agent created inside its
+        container (#466). *Denied* paths are never fetched — re-reading a
+        credential from the backend would launder the rejection.
 
         The second element is a list of ``(display_name, reason)`` pairs for
         the paths that will NOT be delivered, so the caller can tell the user
@@ -4845,10 +4876,13 @@ class BasePlatformAdapter(ABC):
         for media_path, is_voice in media_files or []:
             raw = str(media_path)
             safe_path, reason = classify_media_delivery_path(raw)
+            fetch_reason = ""
+            if not safe_path and reason == MEDIA_DROP_MISSING:
+                safe_path, fetch_reason = _maybe_fetch_remote_media(raw, task_id)
             if safe_path:
                 safe_media.append((safe_path, bool(is_voice)))
             else:
-                _log_media_delivery_drop("MEDIA directive", raw, reason)
+                _log_media_delivery_drop("MEDIA directive", raw, reason, fetch_reason)
                 dropped.append((_notice_safe_name(raw), reason))
         return safe_media, dropped
 
@@ -6405,7 +6439,7 @@ class BasePlatformAdapter(ABC):
                 # Extract MEDIA:<path> tags (from TTS tool) before other processing
                 media_files, response = self.extract_media(response)
                 media_files, _media_drops = self.filter_media_delivery_paths_with_drops(
-                    media_files
+                    media_files, session_key
                 )
 
                 # Extract image URLs and send them as native platform attachments

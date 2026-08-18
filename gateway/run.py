@@ -21715,8 +21715,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
 
             media_files, cleaned = adapter.extract_media(response)
+            # Session-scoped task id: it keys the agent's terminal sandbox, so
+            # a MEDIA path that only exists inside that container can be
+            # fetched out of it for delivery (#466).
             media_files, _media_drops = (
-                BasePlatformAdapter.filter_media_delivery_paths_with_drops(media_files)
+                BasePlatformAdapter.filter_media_delivery_paths_with_drops(
+                    media_files, build_session_key(event.source)
+                )
             )
             # Do NOT deduplicate explicit MEDIA tags against prior turns here
             # (#73771). This rescan is already EXPLICIT-ONLY (see docstring):
@@ -22033,7 +22038,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     format_media_drop_notice,
                 )
                 media_files, _media_drops = (
-                    BasePlatformAdapter.filter_media_delivery_paths_with_drops(media_files)
+                    BasePlatformAdapter.filter_media_delivery_paths_with_drops(
+                        media_files, task_id
+                    )
                 )
                 images, text_content = adapter.extract_images(response)
                 # Same rule as the interactive path: a background task must not

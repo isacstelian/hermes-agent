@@ -6,6 +6,8 @@ re-sourced before each command. CWD persists via in-band stdout markers (remote)
 or a temp file (local).
 """
 
+import base64
+import binascii
 import codecs
 import json
 import logging
@@ -585,6 +587,20 @@ def _export_dump_excluding_session_vars(
         ") || true; } "
         f"> {tmp_path}"
     )
+
+
+# ---------------------------------------------------------------------------
+# File extraction (backend -> host)
+# ---------------------------------------------------------------------------
+
+
+class FileFetchError(RuntimeError):
+    """A file could not be extracted from the backend filesystem."""
+
+
+# Extraction of a large file over a slow exec channel (base64 on Modal /
+# Singularity) can legitimately outlast the per-command terminal timeout.
+_FETCH_TIMEOUT_SECONDS = 300
 
 
 # ---------------------------------------------------------------------------
@@ -1380,6 +1396,100 @@ class BaseEnvironment(ABC):
     # ------------------------------------------------------------------
     # Hooks
     # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # File extraction (backend -> host)
+    # ------------------------------------------------------------------
+
+    @property
+    def remote_home(self) -> str | None:
+        """Home directory on the machine where commands actually run, if known.
+
+        Used by delivery-path security checks to resolve ``~``-relative
+        credential locations (``~/.ssh``, ``~/.hermes/.env``) against the
+        backend filesystem. ``None`` means unknown, and callers must fall
+        back to conservative matching.
+        """
+        return getattr(self, "_remote_home", None)
+
+    def fetch_file_size(self, remote_path: str) -> int | None:
+        """Return the byte size of *remote_path* in the backend, or ``None``
+        when the path does not exist or is not a regular file.
+
+        Default transport: ``wc -c`` over the exec channel.
+        """
+        quoted = shlex.quote(remote_path)
+        result = self.execute(
+            f"[ -f {quoted} ] && wc -c < {quoted}",
+            rewrite_compound_background=False,
+        )
+        if int(result.get("returncode") or 0) != 0:
+            return None
+        # Take the last all-digit token so stray login-shell noise in the
+        # merged stdout/stderr stream can't corrupt the parse.
+        for token in reversed((result.get("output") or "").split()):
+            if token.isdigit():
+                return int(token)
+        return None
+
+    def fetch_realpath(self, remote_path: str) -> str | None:
+        """Resolve symlinks of *remote_path* inside the backend, best-effort.
+
+        Returns the resolved absolute path, or ``None`` when the backend
+        cannot resolve it (missing ``readlink``/``realpath``, dead path).
+        Callers re-run the denylist check on the target so a link planted at
+        an innocuous path can't smuggle out a credential.
+        """
+        quoted = shlex.quote(remote_path)
+        result = self.execute(
+            f"readlink -f {quoted} 2>/dev/null || realpath {quoted} 2>/dev/null",
+            rewrite_compound_background=False,
+        )
+        if int(result.get("returncode") or 0) != 0:
+            return None
+        for line in reversed((result.get("output") or "").splitlines()):
+            line = line.strip()
+            if line.startswith("/"):
+                return line
+        return None
+
+    def fetch_file(self, remote_path: str, local_dest: str) -> None:
+        """Copy *remote_path* out of the backend to *local_dest* on the host.
+
+        Raises :class:`FileFetchError` on any failure. Default transport is
+        base64 over the exec channel, which works on any backend that can run
+        a shell; backends with a cheaper native transport override it (Docker
+        reads its bind-mount view or falls back to ``docker cp``).
+
+        The payload is fenced between unique markers so login-shell noise in
+        the merged stdout/stderr stream can never corrupt the decode.
+        """
+        marker = f"__HERMES_FETCH_{uuid.uuid4().hex[:12]}__"
+        quoted = shlex.quote(remote_path)
+        result = self.execute(
+            f"[ -f {quoted} ] && echo {marker} && "
+            f"base64 < {quoted} 2>/dev/null && echo {marker}",
+            timeout=_FETCH_TIMEOUT_SECONDS,
+            rewrite_compound_background=False,
+        )
+        if int(result.get("returncode") or 0) != 0:
+            raise FileFetchError(
+                f"could not read {remote_path!r} in the backend "
+                f"(missing, not a regular file, or unreadable)"
+            )
+        output = result.get("output") or ""
+        first = output.find(marker)
+        last = output.rfind(marker)
+        if first == -1 or last <= first:
+            raise FileFetchError(f"transfer of {remote_path!r} produced no payload")
+        payload = "".join(output[first + len(marker):last].split())
+        try:
+            data = base64.b64decode(payload, validate=True)
+        except (ValueError, binascii.Error) as exc:
+            raise FileFetchError(
+                f"transfer of {remote_path!r} was corrupted in transit: {exc}"
+            ) from exc
+        Path(local_dest).write_bytes(data)
 
     def _before_execute(self) -> None:
         """Hook called before each command execution.
