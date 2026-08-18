@@ -570,7 +570,7 @@ import dataclasses
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Dict, List, Optional, Any, Callable, Awaitable, Tuple, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Any, Callable, Awaitable, Sequence, Tuple, Union
 from enum import Enum
 
 from pathlib import Path as _Path
@@ -1681,8 +1681,25 @@ def _translate_docker_container_media_path(candidate: Path) -> Optional[Path]:
     return translated
 
 
-def validate_media_delivery_path(path: str) -> Optional[str]:
-    """Return a safe absolute file path for native media delivery, else None.
+# Reason codes for a rejected media-delivery path. ``denied`` is a security
+# rejection (credential / system denylist, or a strict-mode miss); ``missing``
+# means nothing deliverable lives at that path *on the gateway host* — the
+# usual shape when the agent runs under a sandboxed terminal backend whose
+# filesystem the gateway process cannot see, and no docker mount maps the
+# container path back to the host (#75065).
+MEDIA_DROP_DENIED = "denied"
+MEDIA_DROP_MISSING = "missing"
+
+
+def classify_media_delivery_path(path: str) -> Tuple[Optional[str], str]:
+    """Resolve *path* for native delivery, and say why when it is rejected.
+
+    Returns ``(resolved_path, "")`` when the file may be delivered, else
+    ``(None, reason)`` with one of the ``MEDIA_DROP_*`` codes above. Callers
+    that only need the accept/reject decision use the
+    :func:`validate_media_delivery_path` wrapper below; the reason exists so
+    the gateway can tell the user *why* an attachment never arrived instead
+    of dropping it behind a host-side log line only (#75065).
 
     Default mode (single-user / private gateway): accept any existing regular
     file that isn't under the credential / system-path denylist
@@ -1702,22 +1719,22 @@ def validate_media_delivery_path(path: str) -> Optional[str]:
     Symlinks are resolved before any containment / denylist check.
     """
     if not path:
-        return None
+        return None, MEDIA_DROP_MISSING
 
     candidate = str(path).strip()
     if len(candidate) >= 2 and candidate[0] == candidate[-1] and candidate[0] in "`\"'":
         candidate = candidate[1:-1].strip()
     candidate = candidate.lstrip("`\"'").rstrip("`\"',.;:)}]")
     if not candidate:
-        return None
+        return None, MEDIA_DROP_MISSING
 
     try:
         expanded = Path(os.path.expanduser(candidate))
     except (OSError, RuntimeError, ValueError):
         # expanduser raises ValueError("embedded null byte") for a ~\x00 path.
-        return None
+        return None, MEDIA_DROP_MISSING
     if not expanded.is_absolute():
-        return None
+        return None, MEDIA_DROP_MISSING
 
     # Docker agents emit MEDIA:/workspace/... (or other configured container
     # mount paths). Resolve those to host paths before the normal host-side
@@ -1729,10 +1746,10 @@ def validate_media_delivery_path(path: str) -> Optional[str]:
         try:
             resolved = expanded.resolve(strict=True)
         except (OSError, RuntimeError, ValueError):
-            return None
+            return None, MEDIA_DROP_MISSING
 
     if not resolved.is_file():
-        return None
+        return None, MEDIA_DROP_MISSING
 
     # Cache / operator allowlist is always honored — these are unconditionally
     # trusted regardless of mode.
@@ -1742,7 +1759,7 @@ def validate_media_delivery_path(path: str) -> Optional[str]:
         except (OSError, RuntimeError, ValueError):
             continue
         if _path_is_within(resolved, resolved_root):
-            return str(resolved)
+            return str(resolved), ""
 
     # Non-strict mode (default): accept anything not on the denylist.
     # The denylist still blocks /etc, /proc, ~/.ssh, ~/.aws, and the
@@ -1753,8 +1770,8 @@ def validate_media_delivery_path(path: str) -> Optional[str]:
     # ``MEDIA:~/.hermes/google_token.json``) remain rejected.
     if not _media_delivery_strict_mode():
         if _path_under_denied_prefix(resolved):
-            return None
-        return str(resolved)
+            return None, MEDIA_DROP_DENIED
+        return str(resolved), ""
 
     # Strict mode: fall back to recency-based trust for freshly-produced
     # files (e.g. ``pandoc -o /tmp/report.pdf`` or
@@ -1764,10 +1781,18 @@ def validate_media_delivery_path(path: str) -> Optional[str]:
     window = _media_delivery_recency_seconds()
     if window > 0 and not _path_under_denied_prefix(resolved):
         if _file_is_recently_produced(resolved, window):
-            return str(resolved)
+            return str(resolved), ""
 
-    return None
+    return None, MEDIA_DROP_DENIED
 
+
+def validate_media_delivery_path(path: str) -> Optional[str]:
+    """Return a safe absolute file path for native media delivery, else None.
+
+    Thin wrapper over :func:`classify_media_delivery_path` for the callers
+    that only care whether the file is deliverable.
+    """
+    return classify_media_delivery_path(path)[0]
 
 # Neutralise control chars and the Unicode line separators (NEL, LS, PS) that
 # str.splitlines() / log aggregators treat as breaks, so a model-emitted path
@@ -1778,6 +1803,68 @@ _LOG_UNSAFE_CHARS = re.compile(r"[\x00-\x1f\x7f\x85\u2028\u2029]")
 def _log_safe_path(path: str) -> str:
     """Return a single-line, length-bounded path for log output."""
     return _LOG_UNSAFE_CHARS.sub("?", str(path))[:200]
+
+
+def _notice_safe_name(path: str) -> str:
+    """Return the basename of *path*, safe to show in a chat message.
+
+    Only the basename: the directory part is host filesystem layout and is
+    never echoed into chat (same rule the send_* fallbacks follow).
+    """
+    candidate = str(path).strip().strip("`\"'").rstrip("`\"',.;:)}]")
+    # Split on both separators: a Windows gateway sees backslash paths, and
+    # the agent may emit either shape regardless of the gateway's own OS.
+    name = re.split(r"[\\/]", candidate)[-1] or "file"
+    return _LOG_UNSAFE_CHARS.sub("?", name)[:80]
+
+
+def _log_media_delivery_drop(kind: str, raw: str, reason: str) -> None:
+    """Log a dropped delivery path, distinguishing *why* it was dropped.
+
+    The ``denied`` wording is unchanged from before the reason codes existed
+    so log searches for the security rejection keep working; ``missing`` gets
+    its own line because the two have completely different fixes (tighten the
+    agent vs. bridge the sandbox filesystem).
+    """
+    if reason == MEDIA_DROP_DENIED:
+        logger.warning("Skipping unsafe %s path: %s", kind, _log_safe_path(raw))
+    else:
+        logger.warning(
+            "Skipping missing %s path (not on the gateway host — a sandboxed "
+            "terminal backend's files are unreachable unless a docker mount "
+            "maps them): %s",
+            kind, _log_safe_path(raw),
+        )
+
+
+# Cap the per-message notice so a response with dozens of bad paths cannot
+# push the real reply out of the platform's message length limit.
+_MEDIA_DROP_NOTICE_MAX_LINES = 5
+
+
+def format_media_drop_notice(dropped: Sequence[Tuple[str, str]]) -> str:
+    """Render a user-visible notice for attachments that were NOT delivered.
+
+    Empty string when nothing was dropped, so callers can append
+    unconditionally. Wording mirrors the ``send_document`` fallback notice so
+    a user sees one consistent failure shape.
+    """
+    if not dropped:
+        return ""
+    lines = []
+    for name, reason in dropped[:_MEDIA_DROP_NOTICE_MAX_LINES]:
+        if reason == MEDIA_DROP_DENIED:
+            why = "blocked by the media delivery policy"
+        else:
+            why = (
+                "the gateway host cannot see that path (files created inside "
+                "the terminal sandbox stay there)"
+            )
+        lines.append(f"⚠️ Couldn't deliver the file attachment ({name}): {why}.")
+    remaining = len(dropped) - _MEDIA_DROP_NOTICE_MAX_LINES
+    if remaining > 0:
+        lines.append(f"⚠️ …and {remaining} more attachment(s) not delivered.")
+    return "\n".join(lines)
 
 
 SUPPORTED_DOCUMENT_TYPES = {
@@ -4740,27 +4827,48 @@ class BasePlatformAdapter(ABC):
     @staticmethod
     def filter_media_delivery_paths(media_files) -> List[Tuple[str, bool]]:
         """Drop unsafe MEDIA paths and normalize accepted paths."""
+        return BasePlatformAdapter.filter_media_delivery_paths_with_drops(media_files)[0]
+
+    @staticmethod
+    def filter_media_delivery_paths_with_drops(
+        media_files,
+    ) -> Tuple[List[Tuple[str, bool]], List[Tuple[str, str]]]:
+        """Filter MEDIA paths, returning the accepted ones and the drops.
+
+        The second element is a list of ``(display_name, reason)`` pairs for
+        the paths that will NOT be delivered, so the caller can tell the user
+        instead of failing silently (#75065). Only the basename is reported —
+        the full path is a host filesystem layout leak.
+        """
         safe_media: List[Tuple[str, bool]] = []
+        dropped: List[Tuple[str, str]] = []
         for media_path, is_voice in media_files or []:
             raw = str(media_path)
-            safe_path = validate_media_delivery_path(raw)
+            safe_path, reason = classify_media_delivery_path(raw)
             if safe_path:
                 safe_media.append((safe_path, bool(is_voice)))
             else:
-                logger.warning("Skipping unsafe MEDIA directive path: %s", _log_safe_path(raw))
-        return safe_media
+                _log_media_delivery_drop("MEDIA directive", raw, reason)
+                dropped.append((_notice_safe_name(raw), reason))
+        return safe_media, dropped
 
     @staticmethod
     def filter_local_delivery_paths(file_paths) -> List[str]:
-        """Drop unsafe bare local file paths and normalize accepted paths."""
+        """Drop unsafe bare local file paths and normalize accepted paths.
+
+        No drop reporting here on purpose: these paths are auto-detected from
+        the message body (a heuristic, #20834), not the explicit MEDIA
+        attachment contract, so a rejected one is usually a path the model
+        merely mentioned — not a delivery the user is waiting for.
+        """
         safe_paths: List[str] = []
         for file_path in file_paths or []:
             raw = str(file_path)
-            safe_path = validate_media_delivery_path(raw)
+            safe_path, reason = classify_media_delivery_path(raw)
             if safe_path:
                 safe_paths.append(safe_path)
             else:
-                logger.warning("Skipping unsafe local file path: %s", _log_safe_path(raw))
+                _log_media_delivery_drop("local file", raw, reason)
         return safe_paths
 
 
@@ -6296,7 +6404,9 @@ class BasePlatformAdapter(ABC):
 
                 # Extract MEDIA:<path> tags (from TTS tool) before other processing
                 media_files, response = self.extract_media(response)
-                media_files = self.filter_media_delivery_paths(media_files)
+                media_files, _media_drops = self.filter_media_delivery_paths_with_drops(
+                    media_files
+                )
 
                 # Extract image URLs and send them as native platform attachments
                 images, text_content = self.extract_images(response)
@@ -6361,6 +6471,17 @@ class BasePlatformAdapter(ABC):
                             self.name, len(_response_pre_extract), event.source.chat_id,
                         )
                         text_content = _recovered
+
+                # An attachment the gateway could not deliver has to be visible
+                # to the user: text alone reads as a successful send, which is
+                # how undelivered files went unnoticed for days (#75065).
+                _drop_notice = format_media_drop_notice(_media_drops)
+                if _drop_notice:
+                    text_content = (
+                        f"{text_content}\n\n{_drop_notice}"
+                        if text_content
+                        else _drop_notice
+                    )
 
                 # Final user-visible content (text, TTS, media, files) gets
                 # the existing notify=True marker. Clone once so typing/status

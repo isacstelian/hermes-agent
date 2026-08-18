@@ -920,6 +920,156 @@ class TestDockerContainerMediaPathTranslation:
 # should_send_media_as_audio
 # ---------------------------------------------------------------------------
 
+class TestMediaDeliveryDropReasons:
+    """A dropped attachment must record WHY it was dropped (#75065).
+
+    ``missing`` (the path does not exist on the gateway host — the shape a
+    sandboxed terminal backend produces) and ``denied`` (credential/system
+    denylist) have opposite fixes, so they must not collapse into one
+    "unsafe path" bucket.
+    """
+
+    def test_nonexistent_path_is_missing_not_denied(self, tmp_path):
+        import gateway.platforms.base as base
+
+        ghost = tmp_path / "container-only" / "raport_iulie.xlsx"
+        resolved, reason = base.classify_media_delivery_path(str(ghost))
+
+        assert resolved is None
+        assert reason == base.MEDIA_DROP_MISSING
+
+    def test_denylisted_path_is_denied(self, tmp_path, monkeypatch):
+        import gateway.platforms.base as base
+
+        denied_root = tmp_path / "secrets"
+        denied_root.mkdir()
+        secret = denied_root / "notes.pdf"
+        secret.write_bytes(b"%PDF-1.4")
+        monkeypatch.setattr(
+            "gateway.platforms.base._MEDIA_DELIVERY_DENIED_PREFIXES",
+            (str(denied_root),),
+        )
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+
+        resolved, reason = base.classify_media_delivery_path(str(secret))
+
+        assert resolved is None
+        assert reason == base.MEDIA_DROP_DENIED
+
+    def test_accepted_path_reports_no_reason(self, tmp_path):
+        import gateway.platforms.base as base
+
+        media = tmp_path / "chart.png"
+        media.write_bytes(b"\x89PNG\r\n\x1a\n")
+
+        assert base.classify_media_delivery_path(str(media)) == (
+            str(media.resolve()), "",
+        )
+
+    def test_filter_reports_drops_by_basename_only(self, tmp_path):
+        import gateway.platforms.base as base
+
+        good = tmp_path / "ok.png"
+        good.write_bytes(b"\x89PNG\r\n\x1a\n")
+        ghost = tmp_path / "host-layout-secret" / "raport_iulie.xlsx"
+
+        safe, dropped = BasePlatformAdapter.filter_media_delivery_paths_with_drops(
+            [(str(good), False), (str(ghost), False)]
+        )
+
+        assert safe == [(str(good.resolve()), False)]
+        assert dropped == [("raport_iulie.xlsx", base.MEDIA_DROP_MISSING)]
+        # The directory half is host filesystem layout — never echoed.
+        assert "host-layout-secret" not in dropped[0][0]
+
+    def test_local_filter_drops_quietly(self, tmp_path, caplog):
+        """Bare auto-detected paths are a heuristic: log, but do not notify."""
+        ghost = tmp_path / "gone" / "notes.txt"
+
+        with caplog.at_level("WARNING", logger="gateway.platforms.base"):
+            assert BasePlatformAdapter.filter_local_delivery_paths([str(ghost)]) == []
+
+        assert any(
+            "Skipping missing local file path" in r.getMessage()
+            for r in caplog.records
+        )
+
+    def test_legacy_filters_keep_their_signature(self, tmp_path):
+        good = tmp_path / "ok.png"
+        good.write_bytes(b"\x89PNG\r\n\x1a\n")
+        ghost = tmp_path / "gone.png"
+
+        assert BasePlatformAdapter.filter_media_delivery_paths(
+            [(str(good), False), (str(ghost), False)]
+        ) == [(str(good.resolve()), False)]
+        assert BasePlatformAdapter.filter_local_delivery_paths(
+            [str(good), str(ghost)]
+        ) == [str(good.resolve())]
+
+    def test_missing_drop_logs_a_distinct_line(self, tmp_path, caplog):
+        ghost = tmp_path / "gone" / "raport.xlsx"
+
+        with caplog.at_level("WARNING", logger="gateway.platforms.base"):
+            BasePlatformAdapter.filter_media_delivery_paths([(str(ghost), False)])
+
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("Skipping missing MEDIA directive path" in m for m in messages)
+        assert not any("Skipping unsafe" in m for m in messages)
+
+    def test_denied_drop_keeps_the_legacy_log_line(self, tmp_path, monkeypatch, caplog):
+        denied_root = tmp_path / "secrets"
+        denied_root.mkdir()
+        secret = denied_root / "notes.pdf"
+        secret.write_bytes(b"%PDF-1.4")
+        monkeypatch.setattr(
+            "gateway.platforms.base._MEDIA_DELIVERY_DENIED_PREFIXES",
+            (str(denied_root),),
+        )
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+
+        with caplog.at_level("WARNING", logger="gateway.platforms.base"):
+            BasePlatformAdapter.filter_media_delivery_paths([(str(secret), False)])
+
+        assert any(
+            "Skipping unsafe MEDIA directive path" in r.getMessage()
+            for r in caplog.records
+        )
+
+
+class TestMediaDropNotice:
+    """The user must be told an attachment did not arrive (#75065)."""
+
+    def test_no_drops_renders_nothing(self):
+        from gateway.platforms.base import format_media_drop_notice
+
+        assert format_media_drop_notice([]) == ""
+
+    def test_missing_and_denied_get_different_wording(self):
+        import gateway.platforms.base as base
+
+        notice = base.format_media_drop_notice([
+            ("raport.xlsx", base.MEDIA_DROP_MISSING),
+            ("id_rsa", base.MEDIA_DROP_DENIED),
+        ])
+
+        lines = notice.splitlines()
+        assert len(lines) == 2
+        assert "raport.xlsx" in lines[0] and "terminal sandbox" in lines[0]
+        assert "id_rsa" in lines[1] and "policy" in lines[1]
+        assert all(line.startswith("⚠️ Couldn't deliver") for line in lines)
+
+    def test_long_drop_list_is_capped_and_counted(self):
+        import gateway.platforms.base as base
+
+        notice = base.format_media_drop_notice(
+            [(f"f{i}.xlsx", base.MEDIA_DROP_MISSING) for i in range(9)]
+        )
+
+        lines = notice.splitlines()
+        assert len(lines) == base._MEDIA_DROP_NOTICE_MAX_LINES + 1
+        assert "and 4 more" in lines[-1]
+
+
 class TestShouldSendMediaAsAudio:
     """Audio-routing policy shared by gateway + scheduler + send_message."""
 

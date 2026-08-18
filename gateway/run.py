@@ -21708,10 +21708,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # send_multiple_images (Telegram sendPhoto recompresses to ~1280px).
             force_document_attachments = "[[as_document]]" in response
 
-            from gateway.platforms.base import BasePlatformAdapter, should_send_media_as_audio
+            from gateway.platforms.base import (
+                BasePlatformAdapter,
+                format_media_drop_notice,
+                should_send_media_as_audio,
+            )
 
             media_files, cleaned = adapter.extract_media(response)
-            media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+            media_files, _media_drops = (
+                BasePlatformAdapter.filter_media_delivery_paths_with_drops(media_files)
+            )
             # Do NOT deduplicate explicit MEDIA tags against prior turns here
             # (#73771). This rescan is already EXPLICIT-ONLY (see docstring):
             # a MEDIA: directive in the final streamed reply is the model
@@ -21788,6 +21794,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                 except Exception as e:
                     logger.warning("[%s] Post-stream media delivery failed: %s", adapter.name, e)
+
+            # The streamed text already reached the user, so an attachment that
+            # was dropped can only be surfaced as its own message (#75065).
+            _drop_notice = format_media_drop_notice(_media_drops)
+            if _drop_notice:
+                await adapter.send(
+                    chat_id=event.source.chat_id,
+                    content=_drop_notice,
+                    metadata=_thread_meta,
+                )
 
         except Exception as e:
             logger.warning("Post-stream media extraction failed: %s", e)
@@ -22012,9 +22028,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Extract media files from the response
             if response:
                 media_files, response = adapter.extract_media(response)
-                from gateway.platforms.base import BasePlatformAdapter
-                media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+                from gateway.platforms.base import (
+                    BasePlatformAdapter,
+                    format_media_drop_notice,
+                )
+                media_files, _media_drops = (
+                    BasePlatformAdapter.filter_media_delivery_paths_with_drops(media_files)
+                )
                 images, text_content = adapter.extract_images(response)
+                # Same rule as the interactive path: a background task must not
+                # report a result with a silently missing attachment (#75065).
+                _drop_notice = format_media_drop_notice(_media_drops)
+                if _drop_notice:
+                    text_content = (
+                        f"{text_content}\n\n{_drop_notice}"
+                        if text_content
+                        else _drop_notice
+                    )
 
                 preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
                 header = f'✅ Background task complete\nPrompt: "{preview}"\n\n'
