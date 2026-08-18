@@ -152,14 +152,46 @@ class TestDockerFetchFile:
 
         assert dest.read_bytes() == b"copied"
 
-    def test_docker_cp_failure_raises_with_stderr(self, tmp_path):
+    def test_docker_cp_miss_falls_back_to_the_exec_transport(self, tmp_path):
+        """tmpfs + gVisor: the archive API cannot see /root, exec can.
+
+        Production shape (2026-08-18): the agent wrote a valid .xlsx to
+        /root inside a runsc container whose /root is a tmpfs. ``docker cp``
+        answered "Could not find the file" because the archive API reads the
+        rootfs layers, not the mounts stacked on them, while ``docker exec``
+        read the same file fine.
+        """
+        payload = b"PK\x03\x04 real xlsx bytes"
+        env = self._make_env()
+        dest = tmp_path / "raport.xlsx"
+
+        def fake_run(cmd, capture_output=None, text=None, timeout=None, stdin=None):
+            return subprocess.CompletedProcess(
+                cmd, 1, stdout="",
+                stderr="Error response from daemon: Could not find the file "
+                       "/root/raport.xlsx in container cafebabe1234",
+            )
+
+        def fake_execute(command, cwd="", **kwargs):
+            marker = command.split("echo ")[1].split(" &&")[0]
+            encoded = base64.b64encode(payload).decode()
+            return {"output": f"{marker}\n{encoded}\n{marker}\n", "returncode": 0}
+
+        env.execute = fake_execute
+        with patch("tools.environments.docker.subprocess.run", side_effect=fake_run):
+            env.fetch_file("/root/raport.xlsx", str(dest))
+
+        assert dest.read_bytes() == payload
+
+    def test_docker_cp_miss_with_no_exec_read_still_raises(self, tmp_path):
         env = self._make_env()
 
         def fake_run(cmd, capture_output=None, text=None, timeout=None, stdin=None):
             return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="no such file")
 
+        env.execute = lambda command, cwd="", **kwargs: {"output": "", "returncode": 1}
         with patch("tools.environments.docker.subprocess.run", side_effect=fake_run):
-            with pytest.raises(FileFetchError, match="no such file"):
+            with pytest.raises(FileFetchError, match="could not read"):
                 env.fetch_file("/nope.txt", str(tmp_path / "out"))
 
     def test_directory_result_is_rejected(self, tmp_path):

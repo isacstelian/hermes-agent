@@ -1696,9 +1696,21 @@ class DockerEnvironment(BaseEnvironment):
         except subprocess.TimeoutExpired:
             raise FileFetchError(f"docker cp of {container_path!r} timed out")
         if result.returncode != 0:
-            raise FileFetchError(
-                f"docker cp of {container_path!r} failed: {result.stderr.strip()}"
+            # The archive API reads the container's ROOTFS LAYERS, not the
+            # mounts stacked on top of them: a file on a tmpfs (/root and
+            # /workspace are tmpfs whenever container_persistent is false) is
+            # reported as "Could not find the file" even though the container
+            # sees it, and a userspace runtime like gVisor widens the gap.
+            # The exec channel reads the container's real view, so fall back
+            # to the base64 transport instead of declaring the file missing.
+            logger.info(
+                "docker cp of %r failed (%s) — falling back to the exec "
+                "transport (tmpfs / userspace-runtime paths are invisible to "
+                "the archive API)",
+                container_path, result.stderr.strip(),
             )
+            super().fetch_file(container_path, local_dest)
+            return
         if not os.path.isfile(local_dest):
             # docker cp of a directory materializes a directory — reject it.
             shutil.rmtree(local_dest, ignore_errors=True)
