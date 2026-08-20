@@ -322,6 +322,67 @@ def find_docker() -> Optional[str]:
     return None
 
 
+def _docker_endpoint_value_is_remote(endpoint: str) -> bool:
+    endpoint = (endpoint or "").strip().lower()
+    if endpoint.startswith(("unix://", "npipe://")):
+        return False
+    return bool(endpoint)
+
+
+def docker_endpoint_is_remote(docker_exe: str) -> bool:
+    """Classify the effective Docker daemon endpoint.
+
+    Bind sources are resolved on the daemon host, so an SSH/TCP daemon must
+    never receive Hermes' local cache/credential auto-mounts. ``DOCKER_HOST``
+    wins; otherwise inspect the selected Docker context. Unknown named
+    contexts fail closed as remote.
+    """
+    explicit_host = (os.getenv("DOCKER_HOST") or "").strip()
+    if explicit_host:
+        return _docker_endpoint_value_is_remote(explicit_host)
+
+    context = (os.getenv("DOCKER_CONTEXT") or "").strip()
+    if not context:
+        try:
+            shown = subprocess.run(
+                [docker_exe, "context", "show"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+                stdin=subprocess.DEVNULL,
+            )
+            if shown.returncode == 0:
+                context = shown.stdout.strip()
+        except (OSError, subprocess.TimeoutExpired):
+            context = ""
+    if not context or context == "default":
+        return False
+
+    try:
+        inspected = subprocess.run(
+            [
+                docker_exe,
+                "context",
+                "inspect",
+                context,
+                "--format",
+                "{{.Endpoints.docker.Host}}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+            stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return True
+    if inspected.returncode != 0:
+        return True
+    endpoint = inspected.stdout.strip()
+    return True if not endpoint else _docker_endpoint_value_is_remote(endpoint)
+
+
 # Security flags applied to every container.
 # The container itself is the security boundary (isolated from host).
 # We drop all capabilities then add back the minimum needed:
