@@ -13,6 +13,7 @@ import shlex
 import stat
 import tarfile
 import uuid
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Iterable, Protocol
 
@@ -111,6 +112,12 @@ class ArtifactBridge:
         self._host_roots = host
         self._container_roots = container
         self._container_generation = getattr(environment, "container_generation", None)
+
+    def _artifact_session(self):
+        session = getattr(self._environment, "artifact_session", None)
+        if callable(session):
+            return session(self._container_generation)
+        return nullcontext()
 
     def _assert_generation(self) -> None:
         if self._container_generation is None:
@@ -277,6 +284,18 @@ class ArtifactBridge:
         destination: str | Path | None = None,
         max_bytes: int | None = None,
     ) -> Path:
+        with self._artifact_session():
+            return self._pull(
+                container_path, destination=destination, max_bytes=max_bytes
+            )
+
+    def _pull(
+        self,
+        container_path: str,
+        *,
+        destination: str | Path | None = None,
+        max_bytes: int | None = None,
+    ) -> Path:
         """Pull a regular file into the host cache and return its final path."""
         self._assert_generation()
         requested = self._guard_container_lexical(container_path)
@@ -369,6 +388,10 @@ class ArtifactBridge:
                 pass
 
     def push(self, host_path: str | Path, container_path: str) -> None:
+        with self._artifact_session():
+            self._push(host_path, container_path)
+
+    def _push(self, host_path: str | Path, container_path: str) -> None:
         """Push one host file and atomically publish it inside the environment."""
         self._assert_generation()
         source = self._guard_host_source(host_path)
@@ -426,6 +449,10 @@ class ArtifactBridge:
                 pass
 
     def push_tree(self, host_dir: str | Path, container_dir: str) -> None:
+        with self._artifact_session():
+            self._push_tree(host_dir, container_dir)
+
+    def _push_tree(self, host_dir: str | Path, container_dir: str) -> None:
         """Publish one host directory with a single verified archive transfer."""
         self._assert_generation()
         source_root = Path(host_dir).expanduser().resolve(strict=True)
@@ -444,11 +471,32 @@ class ArtifactBridge:
             parent,
             f".{posixpath.basename(destination)}.hermes-tree-{uuid.uuid4().hex}.tmp",
         )
+        backup = posixpath.join(
+            parent,
+            f".{posixpath.basename(destination)}.hermes-tree-{uuid.uuid4().hex}.bak",
+        )
         archive_path = self._cache_dir / (
             f".hermes-host-tree-{uuid.uuid4().hex}.tar.tmp"
         )
         expected: dict[str, tuple[int, str]] = {}
         expected_relative: dict[str, tuple[int, str]] = {}
+        published_live = False
+        verified_live = False
+
+        def rollback_publication() -> None:
+            rollback = self._environment.execute(
+                f"rm -rf -- {shlex.quote(destination)}; "
+                f"if test -e {shlex.quote(backup)} || "
+                f"test -L {shlex.quote(backup)}; then "
+                f"mv -- {shlex.quote(backup)} {shlex.quote(destination)}; fi",
+                rewrite_compound_background=False,
+            )
+            if int(rollback.get("returncode") or 0) != 0:
+                raise ArtifactTransferError(
+                    "artifact tree transfer failed and rollback failed "
+                    f"for {container_dir!r}"
+                )
+
         try:
             with tarfile.open(archive_path, mode="w") as archive:
                 for root, dirnames, filenames in os.walk(source_root):
@@ -526,15 +574,24 @@ class ArtifactBridge:
                 raise ArtifactTransferError(
                     f"artifact tree verification failed while pushing {host_dir!s}"
                 )
+            self._assert_generation()
             published = self._environment.execute(
-                f"rm -rf -- {shlex.quote(destination)} && "
-                f"mv -- {shlex.quote(staging)} {shlex.quote(destination)}",
+                f"if test -e {shlex.quote(destination)} || "
+                f"test -L {shlex.quote(destination)}; then "
+                f"mv -- {shlex.quote(destination)} {shlex.quote(backup)} || exit $?; "
+                "fi; "
+                f"if mv -- {shlex.quote(staging)} {shlex.quote(destination)}; then "
+                ":; else status=$?; "
+                f"if test -e {shlex.quote(backup)} || test -L {shlex.quote(backup)}; "
+                f"then mv -- {shlex.quote(backup)} {shlex.quote(destination)}; fi; "
+                "exit $status; fi",
                 rewrite_compound_background=False,
             )
             if int(published.get("returncode") or 0) != 0:
                 raise ArtifactTransferError(
                     f"could not publish container artifact tree: {container_dir}"
                 )
+            published_live = True
             self._assert_generation()
             final = self._environment.fetch_file_metadata_many(expected)
             self._assert_generation()
@@ -542,9 +599,34 @@ class ArtifactBridge:
                 raise ArtifactTransferError(
                     f"artifact tree verification failed after publishing {container_dir!r}"
                 )
-        except ArtifactTransferError:
+            verified_live = True
+            removed = self._environment.execute(
+                f"rm -rf -- {shlex.quote(backup)}",
+                rewrite_compound_background=False,
+            )
+            if int(removed.get("returncode") or 0) != 0:
+                raise ArtifactTransferError(
+                    f"could not remove container artifact tree backup: {container_dir}"
+                )
+        except ArtifactTransferError as exc:
+            if published_live and not verified_live:
+                try:
+                    rollback_publication()
+                except ArtifactTransferError as rollback_error:
+                    raise ArtifactTransferError(
+                        "artifact tree transfer failed and rollback failed "
+                        f"for {container_dir!r}"
+                    ) from rollback_error
             raise
         except Exception as exc:
+            if published_live and not verified_live:
+                try:
+                    rollback_publication()
+                except ArtifactTransferError as rollback_error:
+                    raise ArtifactTransferError(
+                        "artifact tree transfer failed and rollback failed "
+                        f"for {container_dir!r}"
+                    ) from rollback_error
             raise ArtifactTransferError(
                 f"could not push host artifact tree {host_dir!s}: {exc}"
             ) from exc

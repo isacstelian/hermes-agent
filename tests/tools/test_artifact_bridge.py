@@ -2,6 +2,7 @@
 
 import hashlib
 import os
+import re
 import shlex
 import tarfile
 from pathlib import Path
@@ -25,18 +26,29 @@ class _FakeEnvironment:
         self.put_destinations = []
         self.archive_destinations = []
         self.commands = []
+        self.metadata_calls = []
+        self.metadata_many_calls = []
 
     def fetch_realpath(self, path):
         return self.realpaths.get(path, path)
 
     def fetch_file_metadata(self, path):
+        self.metadata_calls.append(path)
         payload = self.files.get(path)
         if payload is None:
             return None
         return len(payload), hashlib.sha256(payload).hexdigest()
 
     def fetch_file_metadata_many(self, paths):
-        return {path: self.fetch_file_metadata(path) for path in paths}
+        paths = list(paths)
+        self.metadata_many_calls.append(paths)
+        return {
+            path: (
+                (len(self.files[path]), hashlib.sha256(self.files[path]).hexdigest())
+                if path in self.files else None
+            )
+            for path in paths
+        }
 
     def fetch_file(self, path, destination, max_bytes=None):
         self.fetch_destinations.append(Path(destination))
@@ -77,28 +89,58 @@ class _FakeEnvironment:
         if command.startswith("rm -f -- "):
             self.files.pop(command.removeprefix("rm -f -- "), None)
             return {"returncode": 0, "output": ""}
-        if command.startswith("rm -rf -- ") and " && mv -- " in command:
-            remove, move = command.split(" && mv -- ", 1)
-            destination = shlex.split(remove)[-1]
-            staging, published = shlex.split(move)
+        if command.startswith("if test -e ") and "; if mv -- " in command:
+            moves = re.findall(r"mv -- ([^ ;]+) ([^ ;]+)", command)
+            destination, backup = moves[0]
+            staging, published = moves[1]
+            previous = {
+                backup + path.removeprefix(destination): payload
+                for path, payload in self.files.items()
+                if path == destination or path.startswith(destination + "/")
+            }
             staged = {
                 published + path.removeprefix(staging): payload
                 for path, payload in self.files.items()
-                if path.startswith(staging + "/")
+                if path == staging or path.startswith(staging + "/")
             }
             for path in list(self.files):
-                if path.startswith(staging + "/") or path.startswith(
-                    destination + "/"
+                if (
+                    path == staging
+                    or path.startswith(staging + "/")
+                    or path == destination
+                    or path.startswith(destination + "/")
                 ):
                     self.files.pop(path)
+            self.files.update(previous)
             self.files.update(staged)
             self.realpaths[published] = published
             return {"returncode": 0, "output": ""}
-        if command.startswith("rm -rf -- "):
-            prefix = shlex.split(command)[-1]
+        if command.startswith("rm -rf -- ") and "; if test -e " in command:
+            destination = shlex.split(command.split(";", 1)[0])[-1]
+            backup, restored = re.findall(
+                r"mv -- ([^ ;]+) ([^ ;]+)", command
+            )[-1]
+            restored_files = {
+                restored + path.removeprefix(backup): payload
+                for path, payload in self.files.items()
+                if path == backup or path.startswith(backup + "/")
+            }
             for path in list(self.files):
-                if path == prefix or path.startswith(prefix + "/"):
+                if (
+                    path == destination
+                    or path.startswith(destination + "/")
+                    or path == backup
+                    or path.startswith(backup + "/")
+                ):
                     self.files.pop(path)
+            self.files.update(restored_files)
+            return {"returncode": 0, "output": ""}
+        if command.startswith("rm -rf -- "):
+            prefixes = shlex.split(command)[3:]
+            for prefix in prefixes:
+                for path in list(self.files):
+                    if path == prefix or path.startswith(prefix + "/"):
+                        self.files.pop(path)
             return {"returncode": 0, "output": ""}
         raise AssertionError(f"unexpected command: {command}")
 
@@ -228,6 +270,76 @@ def test_push_tree_batches_files_and_atomically_publishes(tmp_path):
     assert env.files["/workspace/skills/report/SKILL.md"] == b"# Report"
     assert env.files["/workspace/skills/report/scripts/run.py"] == b"print('ok')"
     assert not any("hermes-tree" in path for path in env.files)
+    assert list(cache.iterdir()) == []
+
+
+def test_push_tree_532_files_has_constant_transport_call_budget(tmp_path):
+    env = _FakeEnvironment()
+    bridge, inbox, cache = _bridge(tmp_path, env)
+    tree = inbox / "skills"
+    tree.mkdir()
+    expected = {}
+    for index in range(532):
+        path = tree / f"skill-{index:03d}.bin"
+        payload = f"payload-{index}".encode()
+        path.write_bytes(payload)
+        expected[f"/workspace/skills/{path.name}"] = payload
+
+    bridge.push_tree(tree, "/workspace/skills")
+
+    assert env.archive_destinations and len(env.archive_destinations) == 1
+    assert len(env.metadata_many_calls) == 2
+    assert all(len(paths) == 532 for paths in env.metadata_many_calls)
+    assert env.put_destinations == []
+    assert env.metadata_calls == []
+    assert {path: env.files[path] for path in expected} == expected
+    assert list(cache.iterdir()) == []
+
+
+def test_push_tree_hash_mismatch_rejects_before_publication_and_cleans(tmp_path):
+    class CorruptStagingEnvironment(_FakeEnvironment):
+        def fetch_file_metadata_many(self, paths):
+            result = super().fetch_file_metadata_many(paths)
+            first = next(iter(result))
+            result[first] = (0, "0" * 64)
+            return result
+
+    old_path = "/workspace/skills/existing.bin"
+    env = CorruptStagingEnvironment({old_path: b"old"})
+    bridge, inbox, cache = _bridge(tmp_path, env)
+    tree = inbox / "skills"
+    tree.mkdir()
+    (tree / "new.bin").write_bytes(b"new")
+
+    with pytest.raises(ArtifactTransferError, match="verification failed"):
+        bridge.push_tree(tree, "/workspace/skills")
+
+    assert env.files[old_path] == b"old"
+    assert "/workspace/skills/new.bin" not in env.files
+    assert not any("hermes-tree" in path for path in env.files)
+    assert list(cache.iterdir()) == []
+
+
+def test_push_tree_final_hash_mismatch_rolls_back_previous_tree(tmp_path):
+    class CorruptFinalEnvironment(_FakeEnvironment):
+        def fetch_file_metadata_many(self, paths):
+            result = super().fetch_file_metadata_many(paths)
+            if len(self.metadata_many_calls) == 2:
+                first = next(iter(result))
+                result[first] = (0, "0" * 64)
+            return result
+
+    old_path = "/workspace/skills/existing.bin"
+    env = CorruptFinalEnvironment({old_path: b"old"})
+    bridge, inbox, cache = _bridge(tmp_path, env)
+    tree = inbox / "skills"
+    tree.mkdir()
+    (tree / "new.bin").write_bytes(b"new")
+
+    with pytest.raises(ArtifactTransferError, match="verification failed"):
+        bridge.push_tree(tree, "/workspace/skills")
+
+    assert env.files == {old_path: b"old"}
     assert list(cache.iterdir()) == []
 
 

@@ -427,6 +427,61 @@ class TestDockerFetchFile:
         }
         assert "eval" not in calls[0][0]
 
+    def test_docker_metadata_batch_hashes_532_real_files(self, tmp_path):
+        env = self._make_env()
+        payloads = {}
+        for index in range(532):
+            name = f"file {index:03d} $(not-executed).bin"
+            path = tmp_path / name
+            payload = f"payload-{index}".encode()
+            path.write_bytes(payload)
+            payloads[str(path)] = payload
+        missing = str(tmp_path / "missing file")
+        calls = []
+
+        def shell_execute(command, **kwargs):
+            calls.append(command)
+            result = subprocess.run(
+                ["bash", "-c", command],
+                input=kwargs["stdin_data"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            return {"returncode": result.returncode, "output": result.stdout + result.stderr}
+
+        env.execute = shell_execute
+        result = env.fetch_file_metadata_many([*payloads, missing])
+
+        assert len(calls) == 1
+        assert result == {
+            **{
+                path: (len(payload), hashlib.sha256(payload).hexdigest())
+                for path, payload in payloads.items()
+            },
+            missing: None,
+        }
+        assert 'sha256sum "$path"' not in calls[0]
+
+    def test_docker_artifact_session_disables_transparent_recreation(self):
+        from tools.environments.docker import DockerEnvironment
+
+        env = DockerEnvironment.__new__(DockerEnvironment)
+        env._container_generation = 3
+        env._persist_across_processes = True
+        env._recreate_container = Mock(return_value=True)
+
+        with patch.object(
+            BaseEnvironment,
+            "execute",
+            return_value={"returncode": 1, "output": "No such container"},
+        ):
+            with env.artifact_session(3):
+                result = env.execute("true")
+
+        assert result["returncode"] == 1
+        env._recreate_container.assert_not_called()
+
     def test_docker_archive_push_streams_one_tar(self, tmp_path):
         env = self._make_env()
         archive_path = tmp_path / "skills.tar"

@@ -19,6 +19,7 @@ import tarfile
 import tempfile
 import threading
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -1051,6 +1052,7 @@ class DockerEnvironment(BaseEnvironment):
         self._init_unset_passthrough_names: tuple[str, ...] = ()
         self._container_id: Optional[str] = None
         self._container_generation = 0
+        self._artifact_transfer_lock = threading.RLock()
         self._labels: dict[str, str] = {}
         self._image: str = ""
         self._container_name: str = ""
@@ -1780,6 +1782,30 @@ class DockerEnvironment(BaseEnvironment):
         """Whether bind sources resolve on a different daemon host."""
         return self._remote_endpoint
 
+    @contextmanager
+    def artifact_session(self, expected_generation: int | None):
+        """Disable transparent recreation during one verified transfer."""
+        lock = getattr(self, "_artifact_transfer_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._artifact_transfer_lock = lock
+        active = getattr(self, "_artifact_session_state", None)
+        if active is None:
+            active = threading.local()
+            self._artifact_session_state = active
+        with lock:
+            previous = getattr(active, "expected_generation", None)
+            if (
+                expected_generation is not None
+                and self._container_generation != expected_generation
+            ):
+                raise FileFetchError("Docker container generation changed")
+            active.expected_generation = expected_generation
+            try:
+                yield
+            finally:
+                active.expected_generation = previous
+
     def _stage_remote_auto_inputs(self) -> None:
         """Mirror declared credentials and skills when bind mounts are invalid."""
         if not getattr(self, "_remote_endpoint", False):
@@ -1967,26 +1993,38 @@ class DockerEnvironment(BaseEnvironment):
             raise FileFetchError("invalid path in container metadata batch")
         marker = f"__HERMES_META_{uuid.uuid4().hex[:12]}__"
         command = (
-            "if command -v sha256sum >/dev/null 2>&1; then hasher=sha256sum; "
-            "elif command -v shasum >/dev/null 2>&1; then hasher=shasum; "
-            "elif command -v openssl >/dev/null 2>&1; then hasher=openssl; "
-            "else exit 127; fi\n"
+            "manifest=$(mktemp) && indexes=$(mktemp) && sizes=$(mktemp) && "
+            "digests=$(mktemp) || exit 1\n"
+            "trap 'rm -f -- \"$manifest\" \"$indexes\" \"$sizes\" "
+            "\"$digests\"' EXIT\n"
             "index=0\n"
             "while IFS= read -r path; do\n"
             "  if test -f \"$path\"; then\n"
-            "    size=$(wc -c < \"$path\") || exit 1\n"
-            "    if test \"$hasher\" = sha256sum; then "
-            "digest=$(sha256sum \"$path\" 2>/dev/null | awk '{print $1}'); "
-            "elif test \"$hasher\" = shasum; then "
-            "digest=$(shasum -a 256 \"$path\" 2>/dev/null | awk '{print $1}'); "
-            "else digest=$(openssl dgst -sha256 \"$path\" 2>/dev/null | "
-            "awk '{print $NF}'); fi || exit 1\n"
-            f"    printf '{marker}%s %s %s\\n' \"$index\" \"$size\" \"$digest\"\n"
+            "    printf '%s\\0' \"$path\" >> \"$manifest\" || exit 1\n"
+            "    printf '%s\\n' \"$index\" >> \"$indexes\" || exit 1\n"
             "  else\n"
             f"    printf '{marker}%s MISSING\\n' \"$index\"\n"
             "  fi\n"
             "  index=$((index + 1))\n"
-            "done"
+            "done\n"
+            "if test -s \"$manifest\"; then\n"
+            "  xargs -0 stat -c '%s' -- < \"$manifest\" > \"$sizes\" || exit 1\n"
+            "  if command -v sha256sum >/dev/null 2>&1; then\n"
+            "    xargs -0 sha256sum -- < \"$manifest\" | "
+            "awk '{print $1}' > \"$digests\"\n"
+            "  elif command -v shasum >/dev/null 2>&1; then\n"
+            "    xargs -0 shasum -a 256 -- < \"$manifest\" | "
+            "awk '{print $1}' > \"$digests\"\n"
+            "  elif command -v openssl >/dev/null 2>&1; then\n"
+            "    xargs -0 openssl dgst -sha256 -- < \"$manifest\" | "
+            "awk '{print $NF}' > \"$digests\"\n"
+            "  else exit 127; fi\n"
+            "  test \"${PIPESTATUS[0]}\" -eq 0 || exit 1\n"
+            f"  paste \"$indexes\" \"$sizes\" \"$digests\" | "
+            f"while IFS='\t' read -r item_index size digest; do "
+            f"printf '{marker}%s %s %s\\n' \"$item_index\" \"$size\" "
+            "\"$digest\"; done\n"
+            "fi"
         )
         result = self.execute(
             command,
@@ -2537,6 +2575,14 @@ class DockerEnvironment(BaseEnvironment):
         return any(p in output for p in self._NO_CONTAINER_PATTERNS)
 
     def _recreate_container(self) -> bool:
+        lock = getattr(self, "_artifact_transfer_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._artifact_transfer_lock = lock
+        with lock:
+            return self._recreate_container_locked()
+
+    def _recreate_container_locked(self) -> bool:
         """Recreate the container after it was removed out-of-band.
 
         Tries label-based reuse first; if no existing container is found,
@@ -2630,7 +2676,21 @@ class DockerEnvironment(BaseEnvironment):
         OOM kill, daemon restart), detect the error and recreate the container
         transparently before retrying once.
         """
+        state = getattr(self, "_artifact_session_state", None)
+        expected_generation = (
+            getattr(state, "expected_generation", None) if state is not None else None
+        )
+        if (
+            expected_generation is not None
+            and self._container_generation != expected_generation
+        ):
+            return {
+                "returncode": 125,
+                "output": "Docker container generation changed during artifact transfer",
+            }
         result = super().execute(command, cwd, **kwargs)
+        if expected_generation is not None:
+            return result
         if (
             result.get("returncode", 0) != 0
             and self._is_container_gone(result.get("output", ""))

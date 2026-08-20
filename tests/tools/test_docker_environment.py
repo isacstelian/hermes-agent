@@ -1,6 +1,7 @@
 import hashlib
 import logging
 import os
+import re
 import shlex
 from io import BytesIO, StringIO
 from pathlib import Path
@@ -877,27 +878,36 @@ def test_remote_auto_inputs_stage_from_read_only_source_directory(monkeypatch, t
         if command.startswith("rm -f -- "):
             files.pop(command.removeprefix("rm -f -- "), None)
             return {"returncode": 0, "output": ""}
-        if command.startswith("rm -rf -- ") and " && mv -- " in command:
-            remove, move = command.split(" && mv -- ", 1)
-            destination = shlex.split(remove)[-1]
-            staging, published = shlex.split(move)
+        if command.startswith("if test -e ") and "; if mv -- " in command:
+            moves = re.findall(r"mv -- ([^ ;]+) ([^ ;]+)", command)
+            destination, backup = moves[0]
+            staging, published = moves[1]
+            previous = {
+                backup + path.removeprefix(destination): payload
+                for path, payload in list(files.items())
+                if path == destination or path.startswith(destination + "/")
+            }
             staged = {
                 published + path.removeprefix(staging): payload
                 for path, payload in list(files.items())
-                if path.startswith(staging + "/")
+                if path == staging or path.startswith(staging + "/")
             }
             for path in list(files):
-                if path.startswith(staging + "/") or path.startswith(
-                    destination + "/"
+                if (
+                    path == staging
+                    or path.startswith(staging + "/")
+                    or path == destination
+                    or path.startswith(destination + "/")
                 ):
                     files.pop(path, None)
+            files.update(previous)
             files.update(staged)
             return {"returncode": 0, "output": ""}
         if command.startswith("rm -rf -- "):
-            prefix = shlex.split(command)[-1]
-            for path in list(files):
-                if path == prefix or path.startswith(prefix + "/"):
-                    files.pop(path, None)
+            for prefix in shlex.split(command)[3:]:
+                for path in list(files):
+                    if path == prefix or path.startswith(prefix + "/"):
+                        files.pop(path, None)
             return {"returncode": 0, "output": ""}
         raise AssertionError(f"unexpected command: {command}")
 
