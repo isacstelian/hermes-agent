@@ -166,6 +166,38 @@ class TestRunBackgroundTask:
         mock_agent_instance.shutdown_memory_provider.assert_called_once()
         mock_agent_instance.close.assert_called_once()
 
+    @pytest.mark.asyncio
+    async def test_inbound_document_is_staged_before_agent_run(self):
+        runner = _make_runner()
+        mock_adapter = AsyncMock()
+        mock_adapter.send = AsyncMock()
+        mock_adapter.extract_media = MagicMock(return_value=([], "done"))
+        mock_adapter.extract_images = MagicMock(return_value=([], "done"))
+        runner.adapters[Platform.TELEGRAM] = mock_adapter
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            user_id="12345",
+            chat_id="67890",
+            user_name="testuser",
+        )
+        document = "/root/.hermes/cache/documents/Audit.pdf"
+
+        with patch(
+            "gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "test-key"}
+        ), patch("gateway.run._load_gateway_config", return_value={}), patch(
+            "gateway.media_fetch.stage_inbound_media", return_value=[]
+        ) as stage, patch("run_agent.AIAgent") as MockAgent:
+            agent = MagicMock()
+            agent.run_conversation.return_value = {"final_response": "done"}
+            MockAgent.return_value = agent
+
+            await runner._run_background_task(
+                "read it", source, "bg_docs", media_urls=[document]
+            )
+
+        stage.assert_called_once_with([document], "bg_docs")
+        agent.run_conversation.assert_called_once()
+
 
 # ---------------------------------------------------------------------------
 # /background in help and known_commands

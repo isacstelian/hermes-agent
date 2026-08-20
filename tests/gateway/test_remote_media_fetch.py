@@ -8,7 +8,10 @@ and a failed fetch still produces the user-facing notice.
 """
 
 import asyncio
+import hashlib
+import shlex
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -18,6 +21,7 @@ from gateway.media_fetch import (
     fetch_remote_media,
     media_fetch_max_bytes,
     remote_path_is_denied,
+    stage_inbound_media,
 )
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
@@ -33,10 +37,12 @@ from tools.environments.base import FileFetchError
 class _FakeRemoteEnv:
     """Duck-typed environment serving files from an in-memory dict."""
 
-    def __init__(self, files=None, home="/root", links=None):
+    def __init__(self, files=None, home="/root", links=None, remote_endpoint=True):
         self.files = files or {}
         self.links = links or {}
         self._remote_home = home
+        self.remote_endpoint = remote_endpoint
+        self.container_generation = 1
         self.fetched = []
 
     @property
@@ -50,6 +56,12 @@ class _FakeRemoteEnv:
         data = self.files.get(remote_path)
         return None if data is None else len(data)
 
+    def fetch_file_metadata(self, remote_path):
+        data = self.files.get(remote_path)
+        if data is None:
+            return None
+        return len(data), hashlib.sha256(data).hexdigest()
+
     def fetch_file(self, remote_path, local_dest):
         data = self.files.get(remote_path)
         if data is None:
@@ -57,6 +69,23 @@ class _FakeRemoteEnv:
         self.fetched.append(remote_path)
         with open(local_dest, "wb") as f:
             f.write(data)
+
+    def put_file(self, local_source, remote_dest):
+        with open(local_source, "rb") as stream:
+            self.files[remote_dest] = stream.read()
+
+    def execute(self, command, **_kwargs):
+        argv = shlex.split(command)
+        if argv[:3] == ["mkdir", "-p", "--"]:
+            return {"returncode": 0, "output": ""}
+        if argv[:3] == ["mv", "-f", "--"]:
+            source, destination = argv[3:5]
+            self.files[destination] = self.files.pop(source)
+            return {"returncode": 0, "output": ""}
+        if argv[:3] == ["rm", "-f", "--"]:
+            self.files.pop(argv[3], None)
+            return {"returncode": 0, "output": ""}
+        return {"returncode": 1, "output": "unsupported command"}
 
 
 @pytest.fixture()
@@ -217,6 +246,78 @@ class TestMediaDeliveryLease:
         monkeypatch.setenv("TERMINAL_ENV", "local")
 
         assert acquire_media_delivery_lease("session-1") is None
+
+
+class TestInboundMediaStaging:
+    @pytest.fixture()
+    def cache_mount(self, tmp_path, monkeypatch):
+        host_cache = tmp_path / "documents"
+        host_cache.mkdir()
+        container_cache = "/root/.hermes/cache/documents"
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+        monkeypatch.setattr(
+            "tools.credential_files.get_cache_directory_mounts",
+            lambda **_kwargs: [{
+                "host_path": str(host_cache),
+                "container_path": container_cache,
+            }],
+        )
+        return host_cache, container_cache
+
+    @pytest.mark.parametrize("agent_visible", [False, True])
+    def test_pushes_direct_and_replied_document_paths(
+        self, cache_mount, monkeypatch, agent_visible
+    ):
+        host_cache, container_cache = cache_mount
+        document = host_cache / "Audit Creste cu Magic.pdf"
+        document.write_bytes(b"%PDF-1.7\ntelegram attachment")
+        env = _FakeRemoteEnv()
+        monkeypatch.setattr("tools.terminal_tool.ensure_task_env", lambda task_id: env)
+        input_path = (
+            f"{container_cache}/{document.name}" if agent_visible else str(document)
+        )
+
+        failures = stage_inbound_media([input_path], "session-1")
+
+        assert failures == []
+        assert env.files[f"{container_cache}/{document.name}"] == document.read_bytes()
+
+    def test_local_daemon_relies_on_bind_mount(self, cache_mount, monkeypatch):
+        host_cache, _container_cache = cache_mount
+        document = host_cache / "report.pdf"
+        document.write_bytes(b"%PDF")
+        env = _FakeRemoteEnv(remote_endpoint=False)
+        monkeypatch.setattr("tools.terminal_tool.ensure_task_env", lambda task_id: env)
+
+        assert stage_inbound_media([str(document)], "session-1") == []
+        assert env.files == {}
+
+    @pytest.mark.asyncio
+    async def test_gateway_stages_event_media_before_agent_run(self, monkeypatch):
+        from gateway.run import GatewayRunner
+
+        runner = object.__new__(GatewayRunner)
+        runner.config = SimpleNamespace(multiplex_profiles=False)
+        runner._prepare_inbound_message_text = AsyncMock(return_value="read attachment")
+        runner._agent_task_id_for_source = lambda source: "agent-session"
+        staged = []
+        monkeypatch.setattr(
+            "gateway.media_fetch.stage_inbound_media",
+            lambda paths, task_id: staged.append((paths, task_id)) or [],
+        )
+        source = SessionSource(platform=Platform.TELEGRAM, chat_id="123")
+        event = MessageEvent(
+            text="read it",
+            source=source,
+            media_urls=["/root/.hermes/cache/documents/Audit.pdf"],
+        )
+
+        prepared = await runner._prepare_profile_scoped_inbound_message_text(
+            event=event, source=source, history=[]
+        )
+
+        assert prepared == "read attachment"
+        assert staged == [([event.media_urls[0]], "agent-session")]
 
 
 

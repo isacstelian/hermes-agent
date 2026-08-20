@@ -58,6 +58,61 @@ def acquire_media_delivery_lease(task_id: Optional[str]):
     return acquire_environment_lease(task_id)
 
 
+def stage_inbound_media(
+    paths: list[str], task_id: Optional[str]
+) -> list[tuple[str, str]]:
+    """Push host-cached inbound files into a remote Docker container.
+
+    Returns ``(basename, reason)`` entries for files that could not be staged.
+    Local Docker uses bind mounts and therefore needs no transfer.
+    """
+    backend = (os.getenv("TERMINAL_ENV") or "local").strip().lower()
+    if backend != "docker" or not task_id or not paths:
+        return []
+
+    from tools.credential_files import (
+        from_agent_visible_cache_path,
+        get_cache_directory_mounts,
+        to_agent_visible_cache_path,
+    )
+    from tools.environments.artifact_bridge import ArtifactBridge
+    from tools.terminal_tool import ensure_task_env
+
+    env = ensure_task_env(task_id)
+    if env is None or not bool(getattr(env, "remote_endpoint", False)):
+        return []
+
+    mounts = get_cache_directory_mounts()
+    failures: list[tuple[str, str]] = []
+    for raw_path in paths:
+        host_path = Path(from_agent_visible_cache_path(str(raw_path)))
+        container_path = to_agent_visible_cache_path(str(host_path))
+        mount = next(
+            (
+                entry
+                for entry in mounts
+                if container_path == entry["container_path"]
+                or container_path.startswith(entry["container_path"] + "/")
+            ),
+            None,
+        )
+        if mount is None or container_path == str(host_path):
+            failures.append((host_path.name or "file", "not in a managed media cache"))
+            continue
+        try:
+            bridge = ArtifactBridge(
+                env,
+                cache_dir=mount["host_path"],
+                host_roots=(mount["host_path"],),
+                container_roots=(mount["container_path"],),
+            )
+            bridge.push(host_path, container_path)
+        except Exception as exc:  # noqa: BLE001 — report all staging failures
+            logger.warning("Inbound media staging failed for %s: %s", host_path.name, exc)
+            failures.append((host_path.name or "file", str(exc)))
+    return failures
+
+
 def media_fetch_max_bytes() -> int:
     """Return the configured remote-fetch size cap in bytes."""
     raw = os.environ.get(MEDIA_FETCH_MAX_BYTES_ENV, "").strip()
@@ -188,7 +243,7 @@ def fetch_remote_media(
         get_document_cache_dir,
         validate_media_delivery_path,
     )
-    from tools.environments.base import FileFetchError
+    from tools.environments.artifact_bridge import ArtifactBridge, ArtifactTransferError
 
     backend, env = _active_remote_environment(task_id)
     if not backend:
@@ -228,11 +283,19 @@ def fetch_remote_media(
                 f"{_format_size(limit)} delivery limit"
             )
 
-        dest = get_document_cache_dir() / (
+        cache_dir = get_document_cache_dir()
+        dest = cache_dir / (
             f"doc_{uuid.uuid4().hex[:12]}_{_sanitize_basename(candidate)}"
         )
-        env.fetch_file(resolved or candidate, str(dest))
-    except FileFetchError as exc:
+        remote_source = resolved or candidate
+        bridge = ArtifactBridge(
+            env,
+            cache_dir=cache_dir,
+            host_roots=(cache_dir,),
+            container_roots=(posixpath.dirname(remote_source) or "/",),
+        )
+        bridge.pull(remote_source, destination=dest)
+    except ArtifactTransferError as exc:
         return None, str(exc)
     except Exception as exc:
         logger.warning(

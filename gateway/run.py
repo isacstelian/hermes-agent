@@ -17992,20 +17992,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_key: Optional[str] = None,
     ) -> Optional[str]:
         """Run inbound preprocessing under the routed profile when multiplexed."""
+        async def _prepare_and_stage() -> Optional[str]:
+            prepared = await self._prepare_inbound_message_text(
+                event=event,
+                source=source,
+                history=history,
+                session_key=session_key,
+            )
+            if prepared is None or not event.media_urls:
+                return prepared
+            from gateway.media_fetch import stage_inbound_media
+
+            task_id = self._agent_task_id_for_source(source)
+            failures = await asyncio.to_thread(
+                stage_inbound_media, list(event.media_urls), task_id
+            )
+            if failures:
+                names = ", ".join(name for name, _reason in failures[:3])
+                prepared = (
+                    f"[System note: attachment staging failed for {names}; do not "
+                    "claim those files were read.]\n\n" + prepared
+                )
+            return prepared
+
         if getattr(getattr(self, "config", None), "multiplex_profiles", False):
             with _profile_runtime_scope(self._resolve_profile_home_for_source(source)):
-                return await self._prepare_inbound_message_text(
-                    event=event,
-                    source=source,
-                    history=history,
-                    session_key=session_key,
-                )
-        return await self._prepare_inbound_message_text(
-            event=event,
-            source=source,
-            history=history,
-            session_key=session_key,
-        )
+                return await _prepare_and_stage()
+        return await _prepare_and_stage()
 
     async def _prepare_clarify_reply_text(self, event) -> str:
         """Return raw text or successful voice transcripts for a clarify reply."""
@@ -21969,7 +21982,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         _thread_metadata = self._thread_metadata_for_source(source, event_message_id)
 
-        from gateway.media_fetch import acquire_media_delivery_lease
+        from gateway.media_fetch import acquire_media_delivery_lease, stage_inbound_media
 
         _artifact_lease = acquire_media_delivery_lease(task_id)
 
@@ -22008,6 +22021,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # agent can see user-attached images (same as the main flow).
             enriched_prompt = prompt
             if media_urls:
+                _stage_failures = await asyncio.to_thread(
+                    stage_inbound_media, list(media_urls), task_id
+                )
+                if _stage_failures:
+                    _failed_names = ", ".join(
+                        name for name, _reason in _stage_failures[:3]
+                    )
+                    enriched_prompt = (
+                        f"[System note: attachment staging failed for {_failed_names}; "
+                        "do not claim those files were read.]\n\n" + enriched_prompt
+                    )
                 image_paths = []
                 for i, path in enumerate(media_urls):
                     mtype = media_types[i] if i < len(media_types) else ""
