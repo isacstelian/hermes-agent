@@ -62,10 +62,12 @@ class _FakeRemoteEnv:
             return None
         return len(data), hashlib.sha256(data).hexdigest()
 
-    def fetch_file(self, remote_path, local_dest):
+    def fetch_file(self, remote_path, local_dest, max_bytes=None):
         data = self.files.get(remote_path)
         if data is None:
             raise FileFetchError(f"{remote_path!r} not found")
+        if max_bytes is not None and len(data) > max_bytes:
+            raise FileFetchError("artifact exceeds transfer limit")
         self.fetched.append(remote_path)
         with open(local_dest, "wb") as f:
             f.write(data)
@@ -81,6 +83,10 @@ class _FakeRemoteEnv:
         if argv[:3] == ["mv", "-f", "--"]:
             source, destination = argv[3:5]
             self.files[destination] = self.files.pop(source)
+            return {"returncode": 0, "output": ""}
+        if argv[:2] == ["ln", "--"]:
+            source, destination = argv[2:4]
+            self.files[destination] = self.files[source]
             return {"returncode": 0, "output": ""}
         if argv[:3] == ["rm", "-f", "--"]:
             self.files.pop(argv[3], None)
@@ -150,7 +156,9 @@ class TestFetchRemoteMedia:
 
         assert reason is None
         assert local and open(local, "rb").read() == b"xlsx bytes"
-        assert env.fetched == ["/root/raport.xlsx"]
+        assert len(env.fetched) == 1
+        assert env.fetched[0].startswith("/root/.raport.xlsx.hermes-artifact-")
+        assert env.fetched[0].endswith(".snapshot")
         assert "raport.xlsx" in local
 
     def test_missing_in_backend_reports_reason(self, remote_backend):
@@ -295,6 +303,16 @@ class TestInboundMediaStaging:
 
         assert stage_inbound_media([str(document)], "session-1") == []
         assert env.files == {}
+
+    def test_missing_remote_environment_is_reported(self, cache_mount, monkeypatch):
+        host_cache, _container_cache = cache_mount
+        document = host_cache / "report.pdf"
+        document.write_bytes(b"%PDF")
+        monkeypatch.setattr("tools.terminal_tool.ensure_task_env", lambda task_id: None)
+
+        failures = stage_inbound_media([str(document)], "session-1")
+
+        assert failures == [("report.pdf", "remote Docker environment unavailable")]
 
     @pytest.mark.asyncio
     async def test_gateway_stages_event_media_before_agent_run(self, monkeypatch):
@@ -491,6 +509,44 @@ class TestSandboxLookupUsesTheAgentSessionId:
         assert len(adapter.documents) == 1, adapter.sent
         assert open(adapter.documents[0], "rb").read() == b"lucrator,total\n"
         assert all("Couldn't deliver" not in s for s in adapter.sent), adapter.sent
+
+    @pytest.mark.asyncio
+    async def test_session_rotation_keeps_pre_rotation_artifact_environment(
+        self, tmp_path, monkeypatch
+    ):
+        old_session = "session-before-compression"
+        current_session = [old_session]
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+        monkeypatch.setattr(
+            "gateway.platforms.base.DOCUMENT_CACHE_DIR", tmp_path / "doc_cache"
+        )
+        env = _FakeRemoteEnv({"/root/report.pdf": b"%PDF-old-session"})
+        monkeypatch.setattr(
+            "tools.terminal_tool.get_active_env",
+            lambda task_id: env if task_id == old_session else None,
+        )
+        adapter = _SessionKeyedAdapter(old_session)
+        adapter._session_store = SimpleNamespace(
+            peek_session_id=lambda _key: current_session[0]
+        )
+        adapter._keep_typing = _hold_typing
+
+        async def handler(_event):
+            current_session[0] = "session-after-compression"
+            return "MEDIA:/root/report.pdf"
+
+        adapter.set_message_handler(handler)
+        event = MessageEvent(
+            text="raport",
+            source=SessionSource(platform=Platform.TELEGRAM, chat_id="111"),
+        )
+
+        await adapter._process_message_background(
+            event, build_session_key(event.source)
+        )
+
+        assert len(adapter.documents) == 1, adapter.sent
+        assert open(adapter.documents[0], "rb").read() == b"%PDF-old-session"
 
     @pytest.mark.asyncio
     async def test_adapter_holds_environment_lease_through_delivery(self, monkeypatch):

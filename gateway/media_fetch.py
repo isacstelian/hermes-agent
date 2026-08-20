@@ -83,8 +83,18 @@ def stage_inbound_media(
     from tools.environments.artifact_bridge import ArtifactBridge
     from tools.terminal_tool import ensure_task_env
 
-    env = ensure_task_env(task_id)
-    if env is None or not bool(getattr(env, "remote_endpoint", False)):
+    try:
+        env = ensure_task_env(task_id)
+    except Exception as exc:  # noqa: BLE001 — convert startup failure to a note
+        logger.warning("Remote Docker environment creation failed: %s", exc)
+        env = None
+    if env is None:
+        return [
+            (Path(from_agent_visible_cache_path(str(path))).name or "file",
+             "remote Docker environment unavailable")
+            for path in paths
+        ]
+    if not bool(getattr(env, "remote_endpoint", False)):
         return []
 
     mounts = get_cache_directory_mounts()
@@ -299,7 +309,7 @@ def fetch_remote_media(
             host_roots=(cache_dir,),
             container_roots=(posixpath.dirname(remote_source) or "/",),
         )
-        bridge.pull(remote_source, destination=dest)
+        bridge.pull(remote_source, destination=dest, max_bytes=limit)
     except ArtifactTransferError as exc:
         return None, str(exc)
     except Exception as exc:

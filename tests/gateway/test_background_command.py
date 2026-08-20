@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from gateway.config import Platform
-from gateway.platforms.base import MessageEvent
+from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult
 from gateway.session import SessionSource
 
 
@@ -197,6 +197,51 @@ class TestRunBackgroundTask:
 
         stage.assert_called_once_with([document], "bg_docs")
         agent.run_conversation.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_failed_background_document_upload_sends_notice(
+        self, tmp_path, monkeypatch
+    ):
+        runner = _make_runner()
+        document = tmp_path / "Audit.pdf"
+        document.write_bytes(b"%PDF")
+        monkeypatch.setattr(
+            "gateway.platforms.base.MEDIA_DELIVERY_SAFE_ROOTS", (tmp_path,)
+        )
+        adapter = AsyncMock()
+        adapter.extract_media = BasePlatformAdapter.extract_media
+        adapter.extract_images = BasePlatformAdapter.extract_images
+        adapter.media_delivery_max_bytes = MagicMock(return_value=50 * 1024 * 1024)
+        adapter.send_document = AsyncMock(
+            return_value=SendResult(success=False, error="Telegram upload rejected")
+        )
+        adapter.send = AsyncMock(return_value=SendResult(success=True))
+        runner.adapters[Platform.TELEGRAM] = adapter
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            user_id="12345",
+            chat_id="67890",
+            user_name="testuser",
+        )
+
+        with patch(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            return_value={"api_key": "test-key"},
+        ), patch("gateway.run._load_gateway_config", return_value={}), patch(
+            "run_agent.AIAgent"
+        ) as MockAgent:
+            agent = MagicMock()
+            agent.run_conversation.return_value = {
+                "final_response": f"Raport gata.\nMEDIA:{document}"
+            }
+            MockAgent.return_value = agent
+
+            await runner._run_background_task("raport", source, "bg_docs")
+
+        adapter.send_document.assert_awaited_once()
+        notices = [call.kwargs.get("content", "") for call in adapter.send.await_args_list]
+        assert any("Couldn't deliver" in content for content in notices)
+        assert any("Audit.pdf" in content for content in notices)
 
 
 # ---------------------------------------------------------------------------

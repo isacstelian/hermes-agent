@@ -4929,6 +4929,7 @@ class BasePlatformAdapter(ABC):
             raw = str(media_path)
             safe_path, reason = classify_media_delivery_path(raw)
             fetch_reason = ""
+            fetched_remote = False
             if not safe_path and reason == MEDIA_DROP_MISSING:
                 if not task_id_resolved:
                     task_id_resolved = True
@@ -4939,6 +4940,7 @@ class BasePlatformAdapter(ABC):
                 safe_path, fetch_reason = _maybe_fetch_remote_media(
                     raw, task_id, max_bytes=max_bytes
                 )
+                fetched_remote = bool(safe_path)
             if safe_path and max_bytes is not None:
                 try:
                     size = os.path.getsize(safe_path)
@@ -4947,6 +4949,11 @@ class BasePlatformAdapter(ABC):
                     reason = MEDIA_DROP_MISSING
                 else:
                     if size > max_bytes:
+                        if fetched_remote:
+                            try:
+                                Path(safe_path).unlink(missing_ok=True)
+                            except OSError:
+                                pass
                         safe_path = None
                         reason = "oversize"
                         fetch_reason = (
@@ -6535,7 +6542,10 @@ class BasePlatformAdapter(ABC):
                 except (TypeError, ValueError):
                     _filter_accepts_limit = True
                 _filter_kwargs: dict[str, Any] = {
-                    "task_id_factory": lambda: self.agent_task_id_for_session(session_key),
+                    "task_id_factory": lambda: (
+                        getattr(_artifact_lease, "requested_task_id", None)
+                        or self.agent_task_id_for_session(session_key)
+                    ),
                 }
                 if _filter_accepts_limit:
                     _filter_kwargs["max_bytes"] = self.media_delivery_max_bytes()

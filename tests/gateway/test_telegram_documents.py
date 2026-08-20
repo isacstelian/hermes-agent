@@ -16,13 +16,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from gateway.config import PlatformConfig
+from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     SendResult,
     SUPPORTED_VIDEO_TYPES,
 )
+from gateway.session import SessionSource
 
 
 # ---------------------------------------------------------------------------
@@ -211,6 +212,28 @@ def _make_photo(file_obj=None):
 
 
 class TestDocumentDownloadBlock:
+
+    @pytest.mark.asyncio
+    async def test_replied_pdf_is_cached_as_real_event_media(self, adapter):
+        payload = b"%PDF-1.7\nreplied telegram document"
+        replied = _make_message(
+            document=_make_document(
+                file_name="Audit Creste cu Magic.pdf",
+                file_obj=_make_file_obj(payload),
+            )
+        )
+        msg = _make_message(caption="citeste documentul")
+        msg.reply_to_message = replied
+        event = MessageEvent(
+            text="citeste documentul",
+            source=SessionSource(platform=Platform.TELEGRAM, chat_id="123"),
+        )
+
+        await adapter._cache_replied_media(msg, event)
+
+        assert len(event.media_urls) == 1
+        assert open(event.media_urls[0], "rb").read() == payload
+        assert event.media_types == ["application/pdf"]
 
 
     @pytest.mark.asyncio

@@ -1109,8 +1109,9 @@ _docker_orphan_reaper_lock = threading.Lock()
 class EnvironmentLease:
     """Keep a task environment alive while artifacts are being staged."""
 
-    def __init__(self, task_id: str):
+    def __init__(self, task_id: str, requested_task_id: Optional[str] = None):
         self.task_id = task_id
+        self.requested_task_id = requested_task_id or task_id
         self._released = False
 
     @property
@@ -1141,7 +1142,7 @@ def acquire_environment_lease(task_id: str) -> EnvironmentLease:
     lookup = _resolve_container_task_id(task_id)
     with _env_lock:
         _environment_leases[lookup] = _environment_leases.get(lookup, 0) + 1
-    return EnvironmentLease(lookup)
+    return EnvironmentLease(lookup, requested_task_id=task_id)
 
 
 def _register_active_environment_locked(task_id: str, env: Any) -> int:

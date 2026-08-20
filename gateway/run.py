@@ -20275,7 +20275,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if _media_adapter:
                         await self._deliver_media_from_response(
                             response, event, _media_adapter,
-                            task_id=session_entry.session_id,
+                            task_id=_run_start_session_id,
                         )
                 # Streaming already delivered the body text, but the footer was
                 # intentionally held back (see the `not already_sent` gate above).
@@ -21818,37 +21818,64 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if image_paths:
                 try:
                     images = [(f"file://{_quote(p)}", "") for p in image_paths]
-                    await adapter.send_multiple_images(
+                    _image_result = await adapter.send_multiple_images(
                         chat_id=event.source.chat_id,
                         images=images,
                         metadata=_thread_meta,
                     )
+                    if (
+                        _image_result is not None
+                        and getattr(_image_result, "success", True) is False
+                    ):
+                        _detail = getattr(_image_result, "error", None) or "platform upload failed"
+                        _media_drops.extend(
+                            (Path(path).name, "upload_failed", _detail)
+                            for path in image_paths
+                        )
                 except Exception as e:
                     logger.warning("[%s] Post-stream image batch delivery failed: %s", adapter.name, e)
+                    _media_drops.extend(
+                        (Path(path).name, "upload_failed", str(e) or "platform upload failed")
+                        for path in image_paths
+                    )
 
             for media_path, is_voice in non_image_media:
                 try:
                     ext = Path(media_path).suffix.lower()
                     if should_send_media_as_audio(event.source.platform, ext, is_voice=is_voice):
-                        await adapter.send_voice(
+                        _send_result = await adapter.send_voice(
                             chat_id=event.source.chat_id,
                             audio_path=media_path,
                             metadata=_thread_meta,
                         )
                     elif ext in _VIDEO_EXTS:
-                        await adapter.send_video(
+                        _send_result = await adapter.send_video(
                             chat_id=event.source.chat_id,
                             video_path=media_path,
                             metadata=_thread_meta,
                         )
                     else:
-                        await adapter.send_document(
+                        _send_result = await adapter.send_document(
                             chat_id=event.source.chat_id,
                             file_path=media_path,
                             metadata=_thread_meta,
                         )
+                    if (
+                        _send_result is not None
+                        and getattr(_send_result, "success", True) is False
+                    ):
+                        _media_drops.append((
+                            Path(media_path).name,
+                            "upload_failed",
+                            getattr(_send_result, "error", None) or "platform upload failed",
+                        ))
                 except Exception as e:
                     logger.warning("[%s] Post-stream media delivery failed: %s", adapter.name, e)
+                    _media_drops.append((
+                        Path(media_path).name,
+                        "upload_failed",
+                        str(e) or "platform upload failed",
+                    ))
 
             # The streamed text already reached the user, so an attachment that
             # was dropped can only be surfaced as its own message (#75065).
@@ -22160,35 +22187,57 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
                 _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
+                _delivery_drops = []
                 for media_path, _is_voice in (media_files or []):
                     _ext = os.path.splitext(media_path)[1].lower()
                     try:
                         if _should_send_media_as_audio(source.platform, _ext, _is_voice):
-                            await adapter.send_voice(
+                            _send_result = await adapter.send_voice(
                                 chat_id=source.chat_id,
                                 audio_path=media_path,
                                 metadata=_thread_metadata,
                             )
                         elif _ext in _VIDEO_EXTS:
-                            await adapter.send_video(
+                            _send_result = await adapter.send_video(
                                 chat_id=source.chat_id,
                                 video_path=media_path,
                                 metadata=_thread_metadata,
                             )
                         elif _ext in _IMAGE_EXTS:
-                            await adapter.send_image_file(
+                            _send_result = await adapter.send_image_file(
                                 chat_id=source.chat_id,
                                 image_path=media_path,
                                 metadata=_thread_metadata,
                             )
                         else:
-                            await adapter.send_document(
+                            _send_result = await adapter.send_document(
                                 chat_id=source.chat_id,
                                 file_path=media_path,
                                 metadata=_thread_metadata,
                             )
-                    except Exception:
-                        pass
+                        if (
+                            _send_result is not None
+                            and getattr(_send_result, "success", True) is False
+                        ):
+                            _delivery_drops.append((
+                                os.path.basename(media_path),
+                                "upload_failed",
+                                getattr(_send_result, "error", None)
+                                or "platform upload failed",
+                            ))
+                    except Exception as exc:
+                        _delivery_drops.append((
+                            os.path.basename(media_path),
+                            "upload_failed",
+                            str(exc) or "platform upload failed",
+                        ))
+                _delivery_notice = format_media_drop_notice(_delivery_drops)
+                if _delivery_notice:
+                    await adapter.send(
+                        chat_id=source.chat_id,
+                        content=_delivery_notice,
+                        metadata=_thread_metadata,
+                    )
             else:
                 preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
                 await adapter.send(
