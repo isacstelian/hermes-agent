@@ -1,7 +1,8 @@
 import logging
 import os
-from io import StringIO
+from io import BytesIO, StringIO
 import subprocess
+import tarfile
 
 import pytest
 
@@ -573,6 +574,42 @@ def test_label_sanitizer_rejects_invalid_characters():
     assert len(docker_env._sanitize_label_value(long_value)) == 63
 
 
+def test_identity_labels_do_not_collapse_sanitized_task_or_profile_names(
+    monkeypatch,
+):
+    assert docker_env._sanitize_label_value("session/tenant") == "session_tenant"
+    assert docker_env._sanitize_label_value("session_tenant") == "session_tenant"
+    assert (
+        docker_env._identity_label_value("session/tenant")
+        != docker_env._identity_label_value("session_tenant")
+    )
+
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+    monkeypatch.setattr(
+        docker_env, "_get_active_profile_name", lambda: "board/profile"
+    )
+    env = _make_dummy_env(task_id="session/tenant", persist_across_processes=False)
+    calls.clear()
+
+    env._remove_stale_config_containers(
+        env._labels["hermes-task-id"],
+        env._labels["hermes-profile"],
+        env._labels[docker_env._EGRESS_LABEL_KEY],
+        env._labels[docker_env._MOUNTS_LABEL_KEY],
+    )
+
+    ps_cmd = next(cmd for cmd, _ in calls if cmd[1:3] == ["ps", "-a"])
+    assert (
+        f"label={docker_env._TASK_KEY_LABEL_KEY}="
+        f"{docker_env._identity_label_value('session/tenant')}"
+    ) in ps_cmd
+    assert (
+        f"label={docker_env._PROFILE_KEY_LABEL_KEY}="
+        f"{docker_env._identity_label_value('board/profile')}"
+    ) in ps_cmd
+
+
 def test_run_command_sanitizes_unsafe_task_id(monkeypatch):
     """A task_id containing characters Docker rejects in label values must be
     sanitized before reaching ``docker run --label``; otherwise the daemon
@@ -604,6 +641,8 @@ def test_labels_attribute_populated_after_init(monkeypatch):
         "hermes-agent": "1",
         "hermes-task-id": "abc",
         "hermes-profile": "default",
+        "hermes-task-key": docker_env._identity_label_value("abc"),
+        "hermes-profile-key": docker_env._identity_label_value("default"),
         "hermes-egress": "off",
         "hermes-mounts": env._labels["hermes-mounts"],
     }
@@ -808,6 +847,44 @@ def test_stale_immutable_config_container_is_removed(monkeypatch):
     env._remove_stale_config_containers("task", "default", "off", "new-mounts")
 
     assert any(cmd[1:4] == ["rm", "-f", "old-cid"] for cmd, _ in calls)
+
+
+def test_bounded_exec_tar_pull_accepts_single_large_file(monkeypatch, tmp_path):
+    payload = b"x" * (9 * 1024 * 1024)
+    archive_bytes = BytesIO()
+    with tarfile.open(fileobj=archive_bytes, mode="w") as archive:
+        member = tarfile.TarInfo("report.docx")
+        member.size = len(payload)
+        archive.addfile(member, BytesIO(payload))
+
+    class TarProcess:
+        def __init__(self):
+            self.stdout = BytesIO(archive_bytes.getvalue())
+            self.returncode = None
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            self.returncode = 0
+            return 0
+
+        def kill(self):
+            self.returncode = -9
+
+    env = docker_env.DockerEnvironment.__new__(docker_env.DockerEnvironment)
+    env._container_id = "container-id"
+    env._docker_exe = "/usr/bin/docker"
+    monkeypatch.setattr(docker_env.subprocess, "Popen", lambda *_a, **_k: TarProcess())
+    destination = tmp_path / "report.docx"
+
+    env._fetch_file_with_tar(
+        "/workspace/report.docx",
+        str(destination),
+        max_bytes=10 * 1024 * 1024,
+    )
+
+    assert destination.read_bytes() == payload
 
 
 # ── Cross-process container reuse (issue #20561) ──────────────────

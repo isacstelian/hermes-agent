@@ -95,7 +95,7 @@ class TestRunBackgroundTask:
     async def test_no_credentials_sends_error(self):
         """When provider credentials are missing, an error is sent."""
         runner = _make_runner()
-        mock_adapter = AsyncMock()
+        mock_adapter = MagicMock()
         mock_adapter.send = AsyncMock()
         runner.adapters[Platform.TELEGRAM] = mock_adapter
 
@@ -118,10 +118,11 @@ class TestRunBackgroundTask:
     async def test_successful_task_sends_result(self):
         """When the agent completes successfully, the result is sent."""
         runner = _make_runner()
-        mock_adapter = AsyncMock()
+        mock_adapter = MagicMock()
         mock_adapter.send = AsyncMock()
         mock_adapter.extract_media = MagicMock(return_value=([], "Hello from background!"))
         mock_adapter.extract_images = MagicMock(return_value=([], "Hello from background!"))
+        mock_adapter.media_delivery_max_bytes = MagicMock(return_value=None)
         runner.adapters[Platform.TELEGRAM] = mock_adapter
 
         source = SessionSource(
@@ -169,10 +170,11 @@ class TestRunBackgroundTask:
     @pytest.mark.asyncio
     async def test_inbound_document_is_staged_before_agent_run(self):
         runner = _make_runner()
-        mock_adapter = AsyncMock()
+        mock_adapter = MagicMock()
         mock_adapter.send = AsyncMock()
         mock_adapter.extract_media = MagicMock(return_value=([], "done"))
         mock_adapter.extract_images = MagicMock(return_value=([], "done"))
+        mock_adapter.media_delivery_max_bytes = MagicMock(return_value=None)
         runner.adapters[Platform.TELEGRAM] = mock_adapter
         source = SessionSource(
             platform=Platform.TELEGRAM,
@@ -208,7 +210,7 @@ class TestRunBackgroundTask:
         monkeypatch.setattr(
             "gateway.platforms.base.MEDIA_DELIVERY_SAFE_ROOTS", (tmp_path,)
         )
-        adapter = AsyncMock()
+        adapter = MagicMock()
         adapter.extract_media = BasePlatformAdapter.extract_media
         adapter.extract_images = BasePlatformAdapter.extract_images
         adapter.media_delivery_max_bytes = MagicMock(return_value=50 * 1024 * 1024)

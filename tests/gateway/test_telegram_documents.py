@@ -214,11 +214,24 @@ def _make_photo(file_obj=None):
 class TestDocumentDownloadBlock:
 
     @pytest.mark.asyncio
-    async def test_replied_pdf_is_cached_as_real_event_media(self, adapter):
-        payload = b"%PDF-1.7\nreplied telegram document"
+    @pytest.mark.parametrize(
+        ("filename", "mime_type", "payload"),
+        [
+            ("Audit Creste cu Magic.pdf", "application/pdf", b"%PDF-1.7\ntelegram"),
+            (
+                "Raport board.docx",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                b"PK\x03\x04word document bytes",
+            ),
+        ],
+    )
+    async def test_replied_document_is_cached_as_real_event_media(
+        self, adapter, filename, mime_type, payload
+    ):
         replied = _make_message(
             document=_make_document(
-                file_name="Audit Creste cu Magic.pdf",
+                file_name=filename,
+                mime_type=mime_type,
                 file_obj=_make_file_obj(payload),
             )
         )
@@ -233,7 +246,7 @@ class TestDocumentDownloadBlock:
 
         assert len(event.media_urls) == 1
         assert open(event.media_urls[0], "rb").read() == payload
-        assert event.media_types == ["application/pdf"]
+        assert event.media_types == [mime_type]
 
 
     @pytest.mark.asyncio

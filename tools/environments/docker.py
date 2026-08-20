@@ -50,6 +50,8 @@ _docker_executable: Optional[str] = None  # resolved once, cached
 _ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _EGRESS_LABEL_KEY = "hermes-egress"
 _MOUNTS_LABEL_KEY = "hermes-mounts"
+_TASK_KEY_LABEL_KEY = "hermes-task-key"
+_PROFILE_KEY_LABEL_KEY = "hermes-profile-key"
 
 
 def _volume_spec_uses_host_path(spec: str) -> bool:
@@ -166,6 +168,11 @@ def _sanitize_label_value(value: str) -> str:
     cleaned = _LABEL_VALUE_OK_RE.sub("_", value)
     cleaned = cleaned[:63] or "unknown"
     return cleaned
+
+
+def _identity_label_value(value: str) -> str:
+    """Return a collision-resistant Docker label for an application identity."""
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:32]
 
 
 def _get_active_profile_name() -> str:
@@ -1533,10 +1540,14 @@ class DockerEnvironment(BaseEnvironment):
         # _sanitize_label_value(); the active Hermes profile is captured at
         # container-start time and never changes for the container's lifetime.
         task_label = _sanitize_label_value(task_id)
+        task_key = _identity_label_value(task_id)
+        profile_key = _identity_label_value(active_profile)
         label_args = [
             "--label", "hermes-agent=1",
             "--label", f"hermes-task-id={task_label}",
             "--label", f"hermes-profile={profile_name}",
+            "--label", f"{_TASK_KEY_LABEL_KEY}={task_key}",
+            "--label", f"{_PROFILE_KEY_LABEL_KEY}={profile_key}",
             "--label", f"{_EGRESS_LABEL_KEY}={egress_label}",
             "--label", f"{_MOUNTS_LABEL_KEY}={mount_fingerprint}",
         ]
@@ -1550,6 +1561,8 @@ class DockerEnvironment(BaseEnvironment):
             "hermes-agent": "1",
             "hermes-task-id": task_label,
             "hermes-profile": profile_name,
+            _TASK_KEY_LABEL_KEY: task_key,
+            _PROFILE_KEY_LABEL_KEY: profile_key,
             _EGRESS_LABEL_KEY: egress_label,
             _MOUNTS_LABEL_KEY: mount_fingerprint,
         }
@@ -2079,7 +2092,8 @@ class DockerEnvironment(BaseEnvironment):
                 timeout_timer.daemon = True
                 timeout_timer.start()
                 with tarfile.open(fileobj=process.stdout, mode="r|*") as stream:
-                    member = next(iter(stream), None)
+                    members = iter(stream)
+                    member = next(members, None)
                     if member is None:
                         raise FileFetchError(
                             f"exec-tar pull of {container_path!r} returned no entries"
@@ -2100,7 +2114,7 @@ class DockerEnvironment(BaseEnvironment):
                         )
                     with open(local_dest, "wb") as destination:
                         shutil.copyfileobj(source, destination, length=1024 * 1024)
-                    if next(iter(stream), None) is not None:
+                    if next(members, None) is not None:
                         raise FileFetchError(
                             f"exec-tar pull of {container_path!r} returned multiple entries"
                         )
@@ -2459,6 +2473,17 @@ class DockerEnvironment(BaseEnvironment):
             + _EGRESS_LABEL_KEY
             + '"}}'
         )
+        task_key = self._labels.get(_TASK_KEY_LABEL_KEY, "")
+        profile_key = self._labels.get(_PROFILE_KEY_LABEL_KEY, "")
+        identity_filters = []
+        if task_key:
+            identity_filters.extend(
+                ["--filter", f"label={_TASK_KEY_LABEL_KEY}={task_key}"]
+            )
+        if profile_key:
+            identity_filters.extend(
+                ["--filter", f"label={_PROFILE_KEY_LABEL_KEY}={profile_key}"]
+            )
         try:
             result = subprocess.run(
                 [
@@ -2471,6 +2496,7 @@ class DockerEnvironment(BaseEnvironment):
                     f"label=hermes-task-id={task_label}",
                     "--filter",
                     f"label=hermes-profile={profile_label}",
+                    *identity_filters,
                     "--format",
                     fmt,
                 ],
@@ -2550,6 +2576,16 @@ class DockerEnvironment(BaseEnvironment):
                 "--filter", f"label=hermes-profile={profile_label}",
                 "--filter", f"label={_MOUNTS_LABEL_KEY}={mounts_label}",
             ]
+            task_key = self._labels.get(_TASK_KEY_LABEL_KEY, "")
+            profile_key = self._labels.get(_PROFILE_KEY_LABEL_KEY, "")
+            if task_key:
+                filters.extend(
+                    ["--filter", f"label={_TASK_KEY_LABEL_KEY}={task_key}"]
+                )
+            if profile_key:
+                filters.extend(
+                    ["--filter", f"label={_PROFILE_KEY_LABEL_KEY}={profile_key}"]
+                )
             if egress_label != "off":
                 filters.extend(["--filter", f"label={_EGRESS_LABEL_KEY}={egress_label}"])
                 fmt = "{{.ID}}\t{{.State}}"
