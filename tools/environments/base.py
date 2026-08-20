@@ -627,6 +627,11 @@ class BaseEnvironment(ABC):
     # snapshot semantics until they implement the same resolver contract.
     _profile_scoped_passthrough: bool = False
 
+    # Base64 is a compatibility transport for backends without a native byte
+    # stream. Keep its memory amplification bounded; Docker overrides this
+    # with archive/tar streaming for normal transfers.
+    _base64_transfer_limit_bytes = 8 * 1024 * 1024
+
     def get_temp_dir(self) -> str:
         """Return the backend temp directory used for session artifacts.
 
@@ -1432,6 +1437,28 @@ class BaseEnvironment(ABC):
                 return int(token)
         return None
 
+    def fetch_file_metadata(self, remote_path: str) -> tuple[int, str] | None:
+        """Return ``(size, sha256)`` for one regular backend file.
+
+        Size and digest are produced by one shell probe so callers can detect
+        a file changing across a transfer by probing before and after it.
+        """
+        quoted = shlex.quote(remote_path)
+        result = self.execute(
+            f"test -f {quoted} && size=$(wc -c < {quoted}) && "
+            f"digest=$(sha256sum {quoted} 2>/dev/null | awk '{{print $1}}') && "
+            "printf '%s %s\\n' \"$size\" \"$digest\"",
+            rewrite_compound_background=False,
+        )
+        if int(result.get("returncode") or 0) != 0:
+            return None
+        pattern = re.compile(r"^([0-9]+) ([0-9a-fA-F]{64})$")
+        for line in reversed((result.get("output") or "").splitlines()):
+            match = pattern.fullmatch(line.strip())
+            if match:
+                return int(match.group(1)), match.group(2).lower()
+        return None
+
     def fetch_realpath(self, remote_path: str) -> str | None:
         """Resolve symlinks of *remote_path* inside the backend, best-effort.
 
@@ -1490,6 +1517,38 @@ class BaseEnvironment(ABC):
                 f"transfer of {remote_path!r} was corrupted in transit: {exc}"
             ) from exc
         Path(local_dest).write_bytes(data)
+
+    def put_file(self, local_source: str, remote_dest: str) -> None:
+        """Copy one host file into the backend via a capped base64 fallback.
+
+        Streaming backends should override this method. The cap is deliberate:
+        base64 expands the payload and ``execute`` carries it as an in-memory
+        string, so it is only a last-resort compatibility path.
+        """
+        source = Path(local_source)
+        try:
+            size = source.stat().st_size
+        except OSError as exc:
+            raise FileFetchError(f"could not read host file {local_source!r}") from exc
+        if not source.is_file():
+            raise FileFetchError(f"{local_source!r} is not a regular file")
+        if size > self._base64_transfer_limit_bytes:
+            raise FileFetchError(
+                f"{local_source!r} exceeds the base64 fallback limit "
+                f"of {self._base64_transfer_limit_bytes} bytes"
+            )
+
+        encoded = base64.b64encode(source.read_bytes()).decode("ascii")
+        result = self.execute(
+            f"base64 -d > {shlex.quote(remote_dest)}",
+            stdin_data=encoded,
+            timeout=_FETCH_TIMEOUT_SECONDS,
+            rewrite_compound_background=False,
+        )
+        if int(result.get("returncode") or 0) != 0:
+            raise FileFetchError(
+                f"could not write {remote_dest!r} in the backend"
+            )
 
     def _before_execute(self) -> None:
         """Hook called before each command execution.
