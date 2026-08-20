@@ -98,6 +98,17 @@ class ArtifactBridge:
         self._cache_dir = cache
         self._host_roots = host
         self._container_roots = container
+        self._container_generation = getattr(environment, "container_generation", None)
+
+    def _assert_generation(self) -> None:
+        if self._container_generation is None:
+            return
+        current = getattr(self._environment, "container_generation", None)
+        if current != self._container_generation:
+            raise ArtifactTransferError(
+                "container generation changed while the artifact handle was active "
+                f"(expected {self._container_generation}, got {current})"
+            )
 
     def _guard_host_source(self, path: str | Path) -> Path:
         try:
@@ -146,6 +157,46 @@ class ArtifactBridge:
             )
         return resolved
 
+    def _ensure_container_directory(self, path: str) -> str:
+        """Create *path* below a verified existing ancestor.
+
+        Calling ``mkdir -p`` on the caller's lexical path first would follow
+        a planted parent symlink and could create directories outside the
+        allowed roots before the later realpath check noticed.
+        """
+        probe = self._guard_container_lexical(path)
+        missing: list[str] = []
+        while True:
+            resolved = self._environment.fetch_realpath(probe)
+            self._assert_generation()
+            if resolved:
+                canonical = _normalize_container_path(resolved)
+                if not _is_within_container(canonical, self._container_roots):
+                    raise ArtifactSecurityError(
+                        f"artifact is outside allowed container roots: {path}"
+                    )
+                break
+            if probe == "/":
+                raise ArtifactSecurityError(
+                    f"could not resolve a safe container ancestor for: {path}"
+                )
+            missing.append(posixpath.basename(probe))
+            probe = posixpath.dirname(probe) or "/"
+
+        for component in reversed(missing):
+            canonical = posixpath.join(canonical, component)
+        canonical = self._guard_container_lexical(canonical)
+        mkdir = self._environment.execute(
+            f"mkdir -p -- {shlex.quote(canonical)}",
+            rewrite_compound_background=False,
+        )
+        self._assert_generation()
+        if int(mkdir.get("returncode") or 0) != 0:
+            raise ArtifactTransferError(
+                f"could not create container artifact directory: {path}"
+            )
+        return self._guard_container_resolved(canonical)
+
     @staticmethod
     def _verified(actual: tuple[int, str], expected: tuple[int, str]) -> bool:
         return actual[0] == expected[0] and actual[1].lower() == expected[1].lower()
@@ -157,9 +208,12 @@ class ArtifactBridge:
         destination: str | Path | None = None,
     ) -> Path:
         """Pull a regular file into the host cache and return its final path."""
+        self._assert_generation()
         requested = self._guard_container_lexical(container_path)
         source = self._guard_container_resolved(requested)
+        self._assert_generation()
         before = self._environment.fetch_file_metadata(source)
+        self._assert_generation()
         if before is None:
             raise ArtifactTransferError(
                 f"container artifact is missing or not a regular file: {container_path}"
@@ -185,8 +239,10 @@ class ArtifactBridge:
         os.close(descriptor)
         try:
             self._environment.fetch_file(source, str(temp_path))
+            self._assert_generation()
             actual = _sha256(temp_path)
             after = self._environment.fetch_file_metadata(source)
+            self._assert_generation()
             if after is None or before != after or not self._verified(actual, before):
                 raise ArtifactTransferError(
                     f"artifact verification failed while pulling {container_path!r}"
@@ -207,20 +263,15 @@ class ArtifactBridge:
 
     def push(self, host_path: str | Path, container_path: str) -> None:
         """Push one host file and atomically publish it inside the environment."""
+        self._assert_generation()
         source = self._guard_host_source(host_path)
         expected = _sha256(source)
         destination = self._guard_container_lexical(container_path)
-        parent = posixpath.dirname(destination) or "/"
-
-        mkdir = self._environment.execute(
-            f"mkdir -p -- {shlex.quote(parent)}",
-            rewrite_compound_background=False,
+        parent = self._ensure_container_directory(
+            posixpath.dirname(destination) or "/"
         )
-        if int(mkdir.get("returncode") or 0) != 0:
-            raise ArtifactTransferError(
-                f"could not create container artifact directory: {parent}"
-            )
-        self._guard_container_resolved(parent)
+        self._assert_generation()
+        destination = posixpath.join(parent, posixpath.basename(destination))
 
         temp_path = posixpath.join(
             parent,
@@ -228,7 +279,9 @@ class ArtifactBridge:
         )
         try:
             self._environment.put_file(str(source), temp_path)
+            self._assert_generation()
             uploaded = self._environment.fetch_file_metadata(temp_path)
+            self._assert_generation()
             if uploaded is None or not self._verified(uploaded, expected):
                 raise ArtifactTransferError(
                     f"artifact verification failed while pushing {host_path!s}"
@@ -241,7 +294,9 @@ class ArtifactBridge:
                 raise ArtifactTransferError(
                     f"could not publish container artifact: {container_path}"
                 )
+            self._assert_generation()
             published = self._environment.fetch_file_metadata(destination)
+            self._assert_generation()
             if published is None or not self._verified(published, expected):
                 raise ArtifactTransferError(
                     f"artifact verification failed after publishing {container_path!r}"

@@ -673,6 +673,7 @@ def test_reuse_attaches_to_running_container_without_docker_run(monkeypatch):
     assert env._container_id == "reused-cid", (
         f"expected reused container id, got {env._container_id!r}"
     )
+    assert env.container_generation == 1
     # And it must NOT have run `docker run`.
     run_invocations = [c for c in calls if isinstance(c[0], list) and len(c[0]) >= 2 and c[0][1] == "run"]
     assert not run_invocations, (
@@ -722,6 +723,7 @@ def test_egress_enabled_does_not_reuse_pre_egress_container(monkeypatch):
     env = _make_dummy_env(task_id="reuse-egress")
 
     assert env._container_id == "fresh-cid"
+    assert env.container_generation == 1
     run_invocations = [
         c for c in calls
         if isinstance(c[0], list) and len(c[0]) >= 2 and c[0][1] == "run"
@@ -1391,6 +1393,24 @@ def test_execute_does_not_recover_when_not_persistent(monkeypatch):
 
     result = env.execute("echo hi")
     assert result.get("returncode") == 1, "the original error must pass through unchanged"
+
+
+def test_recreate_container_increments_generation(monkeypatch):
+    env = docker_env.DockerEnvironment.__new__(docker_env.DockerEnvironment)
+    env._container_id = "gone-cid"
+    env._container_generation = 1
+    env._labels = {
+        "hermes-task-id": "task",
+        "hermes-profile": "default",
+        docker_env._EGRESS_LABEL_KEY: "off",
+    }
+    env._find_reusable_container = lambda *_args: ("replacement-cid", "running")
+    env._snapshot_ready = True
+    env.init_session = lambda: None
+
+    assert env._recreate_container() is True
+    assert env._container_id == "replacement-cid"
+    assert env.container_generation == 2
 
 
 def test_execute_does_not_recover_on_ordinary_failure(monkeypatch):

@@ -16,6 +16,7 @@ from tools.environments.base import BaseEnvironment, FileFetchError
 
 class _FakeEnvironment:
     def __init__(self, files=None, realpaths=None):
+        self.container_generation = 1
         self.files = dict(files or {})
         self.realpaths = dict(realpaths or {})
         self.fetch_destinations = []
@@ -162,6 +163,23 @@ def test_push_rejects_lexical_container_traversal(tmp_path):
         bridge.push(source, "/workspace/../etc/passwd")
 
 
+def test_push_does_not_mkdir_through_escaped_container_symlink(tmp_path):
+    env = _FakeEnvironment(
+        realpaths={
+            "/workspace/link/new": None,
+            "/workspace/link": "/etc",
+        }
+    )
+    bridge, inbox, _cache = _bridge(tmp_path, env)
+    source = inbox / "payload"
+    source.write_bytes(b"x")
+
+    with pytest.raises(ArtifactSecurityError, match="outside allowed container roots"):
+        bridge.push(source, "/workspace/link/new/payload")
+
+    assert env.commands == []
+
+
 def test_pull_refuses_to_overwrite_cache_through_symlink(tmp_path):
     env = _FakeEnvironment({"/workspace/report": b"report"})
     bridge, _inbox, cache = _bridge(tmp_path, env)
@@ -192,6 +210,33 @@ def test_bridge_requires_explicit_containment_roots(tmp_path):
             host_roots=(tmp_path,),
             container_roots=(),
         )
+
+
+def test_bridge_rejects_stale_container_generation(tmp_path):
+    env = _FakeEnvironment({"/workspace/report": b"report"})
+    bridge, _inbox, _cache = _bridge(tmp_path, env)
+    env.container_generation = 2
+
+    with pytest.raises(ArtifactTransferError, match="container generation changed"):
+        bridge.pull("/workspace/report")
+
+    assert env.fetch_destinations == []
+
+
+def test_pull_detects_recreation_during_transfer(tmp_path):
+    env = _FakeEnvironment({"/workspace/report": b"report"})
+    bridge, _inbox, cache = _bridge(tmp_path, env)
+
+    def recreating_fetch(path, destination):
+        Path(destination).write_bytes(env.files[path])
+        env.container_generation += 1
+
+    env.fetch_file = recreating_fetch
+
+    with pytest.raises(ArtifactTransferError, match="container generation changed"):
+        bridge.pull("/workspace/report")
+
+    assert list(cache.iterdir()) == []
 
 
 def test_base_metadata_returns_size_and_sha256_from_one_probe():

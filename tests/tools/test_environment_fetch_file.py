@@ -8,9 +8,11 @@ Docker daemon is remote and no host-side view exists at all.
 """
 
 import base64
+import io
 import subprocess
+import tarfile
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -152,7 +154,7 @@ class TestDockerFetchFile:
 
         assert dest.read_bytes() == b"copied"
 
-    def test_docker_cp_miss_falls_back_to_the_exec_transport(self, tmp_path):
+    def test_docker_cp_miss_falls_back_to_raw_tar_before_base64(self, tmp_path):
         """tmpfs + gVisor: the archive API cannot see /root, exec can.
 
         Production shape (2026-08-18): the agent wrote a valid .xlsx to
@@ -161,7 +163,6 @@ class TestDockerFetchFile:
         rootfs layers, not the mounts stacked on them, while ``docker exec``
         read the same file fine.
         """
-        payload = b"PK\x03\x04 real xlsx bytes"
         env = self._make_env()
         dest = tmp_path / "raport.xlsx"
 
@@ -172,16 +173,17 @@ class TestDockerFetchFile:
                        "/root/raport.xlsx in container cafebabe1234",
             )
 
-        def fake_execute(command, cwd="", **kwargs):
-            marker = command.split("echo ")[1].split(" &&")[0]
-            encoded = base64.b64encode(payload).decode()
-            return {"output": f"{marker}\n{encoded}\n{marker}\n", "returncode": 0}
-
-        env.execute = fake_execute
+        env._fetch_file_with_tar = Mock(
+            side_effect=lambda _source, target: Path(target).write_bytes(b"tar-stream")
+        )
+        env.execute = Mock(side_effect=AssertionError("base64 fallback must not run"))
         with patch("tools.environments.docker.subprocess.run", side_effect=fake_run):
             env.fetch_file("/root/raport.xlsx", str(dest))
 
-        assert dest.read_bytes() == payload
+        env._fetch_file_with_tar.assert_called_once_with(
+            "/root/raport.xlsx", str(dest)
+        )
+        assert dest.read_bytes() == b"tar-stream"
 
     def test_docker_cp_miss_with_no_exec_read_still_raises(self, tmp_path):
         env = self._make_env()
@@ -189,9 +191,12 @@ class TestDockerFetchFile:
         def fake_run(cmd, capture_output=None, text=None, timeout=None, stdin=None):
             return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="no such file")
 
+        env._fetch_file_with_tar = Mock(
+            side_effect=FileFetchError("tar stream failed")
+        )
         env.execute = lambda command, cwd="", **kwargs: {"output": "", "returncode": 1}
         with patch("tools.environments.docker.subprocess.run", side_effect=fake_run):
-            with pytest.raises(FileFetchError, match="could not read"):
+            with pytest.raises(FileFetchError, match="tar stream failed"):
                 env.fetch_file("/nope.txt", str(tmp_path / "out"))
 
     def test_directory_result_is_rejected(self, tmp_path):
@@ -214,3 +219,76 @@ class TestDockerFetchFile:
 
         with pytest.raises(FileFetchError, match="not started"):
             env.fetch_file("/root/x.txt", str(tmp_path / "out"))
+
+    def test_raw_tar_pull_preserves_arbitrary_bytes(self, tmp_path):
+        env = self._make_env()
+        payload = b"\x00\xffPK\x03\x04binary"
+        archive = io.BytesIO()
+        with tarfile.open(fileobj=archive, mode="w") as stream:
+            info = tarfile.TarInfo("blob")
+            info.size = len(payload)
+            stream.addfile(info, io.BytesIO(payload))
+
+        def fake_run(cmd, **kwargs):
+            assert cmd[:3] == ["docker", "exec", "cafebabe1234"]
+            assert cmd[3:6] == ["tar", "-cf", "-"]
+            kwargs["stdout"].write(archive.getvalue())
+            return subprocess.CompletedProcess(cmd, 0, stdout=None, stderr=b"")
+
+        destination = tmp_path / "blob"
+        with patch("tools.environments.docker.subprocess.run", side_effect=fake_run):
+            env._fetch_file_with_tar("/workspace/blob", str(destination))
+
+        assert destination.read_bytes() == payload
+
+    def test_docker_put_uses_cp_fast_path(self, tmp_path):
+        env = self._make_env()
+        source = tmp_path / "blob"
+        source.write_bytes(b"payload")
+
+        with patch(
+            "tools.environments.docker.subprocess.run",
+            return_value=subprocess.CompletedProcess([], 0, stdout="", stderr=""),
+        ) as run_mock:
+            env.put_file(str(source), "/workspace/blob")
+
+        assert run_mock.call_args.args[0] == [
+            "docker", "cp", "-L", str(source), "cafebabe1234:/workspace/blob"
+        ]
+
+    def test_docker_put_cp_failure_falls_back_to_raw_tar(self, tmp_path):
+        env = self._make_env()
+        source = tmp_path / "blob"
+        source.write_bytes(b"payload")
+        env._put_file_with_tar = Mock()
+        env.execute = Mock(side_effect=AssertionError("base64 fallback must not run"))
+
+        with patch(
+            "tools.environments.docker.subprocess.run",
+            return_value=subprocess.CompletedProcess([], 1, stdout="", stderr="cp failed"),
+        ):
+            env.put_file(str(source), "/workspace/blob")
+
+        env._put_file_with_tar.assert_called_once_with(
+            str(source), "/workspace/blob"
+        )
+
+    def test_raw_tar_push_preserves_arbitrary_bytes(self, tmp_path):
+        env = self._make_env()
+        payload = b"\x00\xffarbitrary bytes"
+        source = tmp_path / "blob"
+        source.write_bytes(payload)
+
+        def fake_run(cmd, **kwargs):
+            assert cmd[:4] == ["docker", "exec", "-i", "cafebabe1234"]
+            assert cmd[4:7] == ["tar", "-xf", "-"]
+            with tarfile.open(fileobj=kwargs["stdin"], mode="r:") as stream:
+                member = stream.next()
+                assert member is not None
+                extracted = stream.extractfile(member)
+                assert extracted is not None
+                assert extracted.read() == payload
+            return subprocess.CompletedProcess(cmd, 0, stdout=b"", stderr=b"")
+
+        with patch("tools.environments.docker.subprocess.run", side_effect=fake_run):
+            env._put_file_with_tar(str(source), "/workspace/blob")

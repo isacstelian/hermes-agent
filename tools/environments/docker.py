@@ -15,6 +15,8 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tarfile
+import tempfile
 import uuid
 from pathlib import Path
 from typing import Optional
@@ -966,6 +968,7 @@ class DockerEnvironment(BaseEnvironment):
         self._env = _normalize_env_dict(env)
         self._init_unset_passthrough_names: tuple[str, ...] = ()
         self._container_id: Optional[str] = None
+        self._container_generation = 0
         self._labels: dict[str, str] = {}
         self._image: str = ""
         self._container_name: str = ""
@@ -1587,6 +1590,10 @@ class DockerEnvironment(BaseEnvironment):
             self._container_id = result.stdout.strip()
             logger.info("Started container %s (%s)", container_name, self._container_id[:12])
 
+        # A generation identifies the exact container attachment represented
+        # by this environment, whether it was newly created or reused.
+        self._container_generation += 1
+
         # Build the init-time env forwarding args used to seed the snapshot.
         self._init_env_args = self._build_init_env_args()
 
@@ -1610,6 +1617,11 @@ class DockerEnvironment(BaseEnvironment):
         for key in sorted(exec_env):
             args.extend(["-e", f"{key}={exec_env[key]}"])
         return args
+
+    @property
+    def container_generation(self) -> int:
+        """Monotonic identity snapshot for artifact/lifecycle consumers."""
+        return self._container_generation
 
     def _build_passthrough_env(self) -> dict[str, str]:
         """Resolve forwarded host variables through the active profile scope."""
@@ -1736,7 +1748,9 @@ class DockerEnvironment(BaseEnvironment):
         straight from the host-side view when it exists. Everything else
         streams through ``docker cp`` (the Archive API). ``-L`` dereferences
         symlinks inside the container so the copy can never land as a
-        host-side symlink.
+        host-side symlink. If the archive API cannot see a tmpfs/userspace
+        mount, a raw ``docker exec tar`` stream is used before the capped
+        base64 compatibility fallback.
         """
         host_path = self._host_path_for(container_path)
         if host_path and os.path.isfile(host_path):
@@ -1755,27 +1769,233 @@ class DockerEnvironment(BaseEnvironment):
                 stdin=subprocess.DEVNULL,
             )
         except subprocess.TimeoutExpired:
-            raise FileFetchError(f"docker cp of {container_path!r} timed out")
-        if result.returncode != 0:
+            result = None
+        if result is None or result.returncode != 0:
             # The archive API reads the container's ROOTFS LAYERS, not the
             # mounts stacked on top of them: a file on a tmpfs (/root and
             # /workspace are tmpfs whenever container_persistent is false) is
             # reported as "Could not find the file" even though the container
             # sees it, and a userspace runtime like gVisor widens the gap.
             # The exec channel reads the container's real view, so fall back
-            # to the base64 transport instead of declaring the file missing.
+            # to raw tar instead of declaring the file missing.
+            detail = "timed out" if result is None else result.stderr.strip()
             logger.info(
-                "docker cp of %r failed (%s) — falling back to the exec "
-                "transport (tmpfs / userspace-runtime paths are invisible to "
-                "the archive API)",
-                container_path, result.stderr.strip(),
+                "docker cp of %r failed (%s) — falling back to raw exec-tar",
+                container_path, detail,
             )
-            super().fetch_file(container_path, local_dest)
-            return
+            self._remove_local_transfer_target(local_dest)
+            try:
+                self._fetch_file_with_tar(container_path, local_dest)
+                return
+            except FileFetchError as tar_error:
+                size = self.fetch_file_size(container_path)
+                if size is None or size > self._base64_transfer_limit_bytes:
+                    raise tar_error
+                logger.info(
+                    "exec-tar pull of %r failed — using capped base64 fallback",
+                    container_path,
+                )
+                super().fetch_file(container_path, local_dest)
+                return
         if not os.path.isfile(local_dest):
             # docker cp of a directory materializes a directory — reject it.
             shutil.rmtree(local_dest, ignore_errors=True)
             raise FileFetchError(f"{container_path!r} is not a regular file")
+
+    @staticmethod
+    def _remove_local_transfer_target(path: str) -> None:
+        target = Path(path)
+        try:
+            if target.is_dir() and not target.is_symlink():
+                shutil.rmtree(target)
+            else:
+                target.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def _fetch_file_with_tar(self, container_path: str, local_dest: str) -> None:
+        """Pull one file through raw tar bytes without buffering it in RAM."""
+        if not self._container_id:
+            raise FileFetchError("Docker container not started")
+        normalized = posixpath.normpath(container_path)
+        if not normalized.startswith("/") or normalized == "/":
+            raise FileFetchError(f"invalid container artifact path: {container_path!r}")
+        parent = posixpath.dirname(normalized)
+        basename = posixpath.basename(normalized)
+        command = [
+            self._docker_exe,
+            "exec",
+            self._container_id,
+            "tar",
+            "-cf",
+            "-",
+            "-C",
+            parent,
+            f"./{basename}",
+        ]
+        try:
+            with tempfile.TemporaryFile() as archive:
+                result = subprocess.run(
+                    command,
+                    stdout=archive,
+                    stderr=subprocess.PIPE,
+                    timeout=_FETCH_TIMEOUT_SECONDS,
+                    stdin=subprocess.DEVNULL,
+                )
+                if result.returncode != 0:
+                    detail = (result.stderr or b"").decode("utf-8", "replace").strip()
+                    raise FileFetchError(
+                        f"exec-tar pull of {container_path!r} failed: {detail}"
+                    )
+                archive.seek(0)
+                with tarfile.open(fileobj=archive, mode="r:*") as stream:
+                    members = stream.getmembers()
+                    if len(members) != 1:
+                        raise FileFetchError(
+                            f"exec-tar pull of {container_path!r} returned "
+                            f"{len(members)} entries"
+                        )
+                    member = members[0]
+                    member_name = posixpath.normpath(member.name)
+                    if member_name != basename or not member.isfile():
+                        raise FileFetchError(
+                            f"{container_path!r} is not a regular file"
+                        )
+                    source = stream.extractfile(member)
+                    if source is None:
+                        raise FileFetchError(
+                            f"exec-tar pull of {container_path!r} produced no payload"
+                        )
+                    with open(local_dest, "wb") as destination:
+                        shutil.copyfileobj(source, destination, length=1024 * 1024)
+        except subprocess.TimeoutExpired as exc:
+            self._remove_local_transfer_target(local_dest)
+            raise FileFetchError(
+                f"exec-tar pull of {container_path!r} timed out"
+            ) from exc
+        except (OSError, tarfile.TarError) as exc:
+            self._remove_local_transfer_target(local_dest)
+            raise FileFetchError(
+                f"exec-tar pull of {container_path!r} failed: {exc}"
+            ) from exc
+
+    def put_file(self, local_source: str, remote_dest: str) -> None:
+        """Push one file through docker cp, raw exec-tar, then capped base64."""
+        if not self._container_id:
+            raise FileFetchError("Docker container not started")
+        source = Path(local_source)
+        if not source.is_file():
+            raise FileFetchError(f"{local_source!r} is not a regular file")
+        try:
+            result = subprocess.run(
+                [
+                    self._docker_exe,
+                    "cp",
+                    "-L",
+                    str(source),
+                    f"{self._container_id}:{remote_dest}",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=_FETCH_TIMEOUT_SECONDS,
+                stdin=subprocess.DEVNULL,
+            )
+        except subprocess.TimeoutExpired:
+            result = None
+        if result is not None and result.returncode == 0:
+            return
+
+        detail = "timed out" if result is None else result.stderr.strip()
+        logger.info(
+            "docker cp push to %r failed (%s) — falling back to raw exec-tar",
+            remote_dest, detail,
+        )
+        self._remove_remote_transfer_target(remote_dest)
+        try:
+            self._put_file_with_tar(str(source), remote_dest)
+            return
+        except FileFetchError as tar_error:
+            if source.stat().st_size > self._base64_transfer_limit_bytes:
+                raise tar_error
+            logger.info(
+                "exec-tar push to %r failed — using capped base64 fallback",
+                remote_dest,
+            )
+            super().put_file(str(source), remote_dest)
+
+    def _remove_remote_transfer_target(self, remote_path: str) -> None:
+        if not self._container_id:
+            return
+        try:
+            subprocess.run(
+                [
+                    self._docker_exe,
+                    "exec",
+                    self._container_id,
+                    "rm",
+                    "-f",
+                    "--",
+                    remote_path,
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=30,
+                stdin=subprocess.DEVNULL,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+    def _put_file_with_tar(self, local_source: str, remote_dest: str) -> None:
+        """Push one file through raw tar bytes without buffering it in RAM."""
+        if not self._container_id:
+            raise FileFetchError("Docker container not started")
+        normalized = posixpath.normpath(remote_dest)
+        if not normalized.startswith("/") or normalized == "/":
+            raise FileFetchError(f"invalid container artifact path: {remote_dest!r}")
+        parent = posixpath.dirname(normalized)
+        basename = posixpath.basename(normalized)
+        source = Path(local_source)
+        try:
+            source_stat = source.stat()
+            with tempfile.TemporaryFile() as archive:
+                with tarfile.open(fileobj=archive, mode="w") as stream:
+                    member = tarfile.TarInfo(basename)
+                    member.size = source_stat.st_size
+                    member.mode = source_stat.st_mode & 0o777
+                    member.mtime = int(source_stat.st_mtime)
+                    with source.open("rb") as payload:
+                        stream.addfile(member, payload)
+                archive.seek(0)
+                result = subprocess.run(
+                    [
+                        self._docker_exe,
+                        "exec",
+                        "-i",
+                        self._container_id,
+                        "tar",
+                        "-xf",
+                        "-",
+                        "-C",
+                        parent,
+                    ],
+                    stdin=archive,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=_FETCH_TIMEOUT_SECONDS,
+                )
+            if result.returncode != 0:
+                detail = (result.stderr or b"").decode("utf-8", "replace").strip()
+                raise FileFetchError(
+                    f"exec-tar push to {remote_dest!r} failed: {detail}"
+                )
+        except subprocess.TimeoutExpired as exc:
+            raise FileFetchError(
+                f"exec-tar push to {remote_dest!r} timed out"
+            ) from exc
+        except (OSError, tarfile.TarError) as exc:
+            raise FileFetchError(
+                f"exec-tar push to {remote_dest!r} failed: {exc}"
+            ) from exc
 
     # ------------------------------------------------------------------
     # "No such container" recovery (issue #36266)
@@ -1865,6 +2085,7 @@ class DockerEnvironment(BaseEnvironment):
                 return False
 
         # 3. Re-initialize session snapshot in the (re)created container.
+        self._container_generation += 1
         try:
             self._snapshot_ready = False
             self.init_session()
