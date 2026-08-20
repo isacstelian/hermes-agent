@@ -21,10 +21,29 @@ pytestmark = pytest.mark.skipif(
 
 def test_real_ssh_daemon_round_trips_docx_and_large_pdf(tmp_path, monkeypatch):
     assert os.getenv("DOCKER_HOST", "").startswith("ssh://")
+    profile_home = tmp_path / "profile"
+    profile_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    skills = tmp_path / "skills"
+    skills.mkdir()
+    expected_skills = {}
+    for index in range(532):
+        path = skills / f"skill-{index:03d}.txt"
+        payload = f"remote-skill-{index}".encode()
+        path.write_bytes(payload)
+        expected_skills[path.name] = (
+            len(payload),
+            hashlib.sha256(payload).hexdigest(),
+        )
     monkeypatch.setattr(
-        docker_env.DockerEnvironment,
-        "_stage_remote_auto_inputs",
-        lambda self: None,
+        "tools.credential_files.get_credential_file_mounts", lambda: []
+    )
+    monkeypatch.setattr(
+        "tools.credential_files.get_skills_directory_mount",
+        lambda: [{
+            "host_path": str(skills),
+            "container_path": "/root/.hermes/skills",
+        }],
     )
     monkeypatch.setattr(
         docker_env, "_get_active_profile_name", lambda: "remote-artifact-integration"
@@ -63,6 +82,11 @@ def test_real_ssh_daemon_round_trips_docx_and_large_pdf(tmp_path, monkeypatch):
             check=True,
         )
         assert all(mount.get("Type") != "bind" for mount in json.loads(inspected.stdout))
+        auto_staged = {
+            f"/root/.hermes/skills/{name}": metadata
+            for name, metadata in expected_skills.items()
+        }
+        assert env.fetch_file_metadata_many(auto_staged) == auto_staged
 
         inbound = tmp_path / "Raport board.docx"
         inbound.write_bytes(b"PK\x03\x04real telegram word bytes")
@@ -86,21 +110,13 @@ def test_real_ssh_daemon_round_trips_docx_and_large_pdf(tmp_path, monkeypatch):
             rewrite_compound_background=False,
         )
         assert existing["returncode"] == 0, existing
-        skills = tmp_path / "skills"
-        skills.mkdir()
-        expected_skills = {}
-        for index in range(532):
-            path = skills / f"skill-{index:03d}.txt"
-            payload = f"remote-skill-{index}".encode()
-            path.write_bytes(payload)
-            expected_skills[f"/workspace/skills/{path.name}"] = (
-                len(payload),
-                hashlib.sha256(payload).hexdigest(),
-            )
-
         bridge.push_tree(skills, "/workspace/skills")
 
-        assert env.fetch_file_metadata_many(expected_skills) == expected_skills
+        workspace_skills = {
+            f"/workspace/skills/{name}": metadata
+            for name, metadata in expected_skills.items()
+        }
+        assert env.fetch_file_metadata_many(workspace_skills) == workspace_skills
         assert env.fetch_file_metadata("/workspace/skills/old.txt") is None
 
         payload_size = 9 * 1024 * 1024
