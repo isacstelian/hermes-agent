@@ -52,6 +52,7 @@ _EGRESS_LABEL_KEY = "hermes-egress"
 _MOUNTS_LABEL_KEY = "hermes-mounts"
 _TASK_KEY_LABEL_KEY = "hermes-task-key"
 _PROFILE_KEY_LABEL_KEY = "hermes-profile-key"
+_podman_cli_cache: dict[str, bool] = {}
 
 
 def _volume_spec_uses_host_path(spec: str) -> bool:
@@ -371,6 +372,34 @@ def _docker_endpoint_value_is_remote(endpoint: str) -> bool:
     return bool(endpoint)
 
 
+def _docker_cli_is_podman(docker_exe: str) -> bool:
+    """Detect Podman even when installed as a ``docker`` compatibility shim."""
+    resolved = os.path.realpath(docker_exe)
+    if os.path.basename(resolved).lower().startswith("podman"):
+        return True
+    if not os.path.isfile(docker_exe):
+        return False
+    cached = _podman_cli_cache.get(resolved)
+    if cached is not None:
+        return cached
+    try:
+        version = subprocess.run(
+            [docker_exe, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+            stdin=subprocess.DEVNULL,
+        )
+        is_podman = "podman" in (
+            (version.stdout or "") + "\n" + (version.stderr or "")
+        ).lower()
+    except (OSError, subprocess.TimeoutExpired):
+        is_podman = False
+    _podman_cli_cache[resolved] = is_podman
+    return is_podman
+
+
 def docker_endpoint_is_remote(docker_exe: str) -> bool:
     """Classify the effective Docker daemon endpoint.
 
@@ -379,14 +408,16 @@ def docker_endpoint_is_remote(docker_exe: str) -> bool:
     ``DOCKER_CONTEXT`` wins over ``DOCKER_HOST``, matching Docker CLI
     precedence. Unknown named contexts fail closed as remote.
     """
-    runtime_name = os.path.basename(docker_exe).lower()
-    if runtime_name.startswith("podman"):
+    runtime_name = os.path.basename(os.path.realpath(docker_exe)).lower()
+    if _docker_cli_is_podman(docker_exe):
         # Podman has no ``docker context`` command. Its documented remote
         # selectors enable remote mode explicitly; without either selector
         # the Linux CLI talks to its local runtime.
+        container_host = (os.getenv("CONTAINER_HOST") or "").strip()
+        if container_host:
+            return _docker_endpoint_value_is_remote(container_host)
         return runtime_name.startswith("podman-remote") or bool(
-            (os.getenv("CONTAINER_HOST") or "").strip()
-            or (os.getenv("CONTAINER_CONNECTION") or "").strip()
+            (os.getenv("CONTAINER_CONNECTION") or "").strip()
         )
 
     context = (os.getenv("DOCKER_CONTEXT") or "").strip()

@@ -142,3 +142,34 @@ def test_explicit_podman_remote_environment_is_remote(monkeypatch, variable):
     )
 
     assert docker_env.docker_endpoint_is_remote("podman") is True
+
+
+def test_local_podman_unix_service_is_local(monkeypatch):
+    monkeypatch.setenv(
+        "CONTAINER_HOST", "unix:///run/user/1000/podman/podman.sock"
+    )
+    monkeypatch.delenv("CONTAINER_CONNECTION", raising=False)
+
+    assert docker_env.docker_endpoint_is_remote("podman") is False
+
+
+def test_local_podman_docker_compatibility_shim_is_local(monkeypatch, tmp_path):
+    shim = tmp_path / "docker"
+    shim.write_text("#!/bin/sh\nexec podman \"$@\"\n")
+    for name in (
+        "DOCKER_HOST",
+        "DOCKER_CONTEXT",
+        "CONTAINER_HOST",
+        "CONTAINER_CONNECTION",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    def _run(cmd, **kwargs):
+        assert cmd == [str(shim), "--version"]
+        return subprocess.CompletedProcess(
+            cmd, 0, stdout="podman version 5.5.2\n", stderr=""
+        )
+
+    monkeypatch.setattr(docker_env.subprocess, "run", _run)
+
+    assert docker_env.docker_endpoint_is_remote(str(shim)) is False
