@@ -605,7 +605,154 @@ def test_labels_attribute_populated_after_init(monkeypatch):
         "hermes-task-id": "abc",
         "hermes-profile": "default",
         "hermes-egress": "off",
+        "hermes-mounts": env._labels["hermes-mounts"],
     }
+    assert len(env._labels["hermes-mounts"]) == 16
+
+
+def test_remote_daemon_omits_local_auto_mounts(monkeypatch, tmp_path):
+    credential = tmp_path / "auth.json"
+    credential.write_text("{}")
+    skills = tmp_path / "skills"
+    skills.mkdir()
+    cache = tmp_path / "documents"
+    cache.mkdir()
+
+    monkeypatch.setenv("DOCKER_HOST", "ssh://sandbox-vps")
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    staged = []
+    monkeypatch.setattr(
+        docker_env.DockerEnvironment,
+        "_stage_remote_auto_inputs",
+        lambda self: staged.append(self.container_generation),
+    )
+    monkeypatch.setattr(
+        "tools.credential_files.get_credential_file_mounts",
+        lambda: [{"host_path": str(credential), "container_path": "/root/.hermes/auth.json"}],
+    )
+    monkeypatch.setattr(
+        "tools.credential_files.get_skills_directory_mount",
+        lambda: [{"host_path": str(skills), "container_path": "/root/.hermes/skills"}],
+    )
+    monkeypatch.setattr(
+        "tools.credential_files.get_cache_directory_mounts",
+        lambda: [{"host_path": str(cache), "container_path": "/root/.hermes/cache/documents"}],
+    )
+    calls = _mock_subprocess_run(monkeypatch)
+
+    env = _make_dummy_env(volumes=["board-output:/output"])
+
+    run_cmd = next(cmd for cmd, _ in calls if cmd[1:2] == ["run"])
+    rendered = " ".join(run_cmd)
+    assert env.remote_endpoint is True
+    assert str(credential) not in rendered
+    assert str(skills) not in rendered
+    assert str(cache) not in rendered
+    assert "board-output:/output" in rendered
+    assert staged == [1]
+
+
+def test_remote_persistent_sandbox_uses_daemon_named_volumes(monkeypatch):
+    monkeypatch.setenv("DOCKER_HOST", "ssh://sandbox-vps")
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(
+        docker_env.DockerEnvironment, "_stage_remote_auto_inputs", lambda self: None
+    )
+    calls = _mock_subprocess_run(monkeypatch)
+
+    _make_dummy_env(persistent_filesystem=True, task_id="board-session")
+
+    run_cmd = next(cmd for cmd, _ in calls if cmd[1:2] == ["run"])
+    rendered = " ".join(run_cmd)
+    assert "type=volume,source=hermes-home-" in rendered
+    assert "type=volume,source=hermes-workspace-" in rendered
+    assert ".hermes/sandboxes" not in rendered
+
+
+def test_remote_daemon_rejects_user_host_bind(monkeypatch):
+    monkeypatch.setenv("DOCKER_HOST", "ssh://sandbox-vps")
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    _mock_subprocess_run(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="daemon is remote"):
+        _make_dummy_env(volumes=["/tmp/reports:/reports"])
+
+
+def test_remote_daemon_rejects_extra_arg_bind(monkeypatch):
+    monkeypatch.setenv("DOCKER_HOST", "ssh://sandbox-vps")
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    _mock_subprocess_run(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="daemon is remote"):
+        _make_dummy_env(extra_args=[
+            "--mount", "type=bind,source=/tmp/reports,target=/reports",
+        ])
+
+
+def test_remote_auto_inputs_use_verified_artifact_bridge(monkeypatch, tmp_path):
+    credential = tmp_path / "token.json"
+    credential.write_bytes(b'{"token":"scoped"}')
+    skill = tmp_path / "skills" / "report" / "SKILL.md"
+    skill.parent.mkdir(parents=True)
+    skill.write_text("# Report")
+    pushed = []
+
+    monkeypatch.setattr(
+        "tools.credential_files.get_credential_file_mounts",
+        lambda: [{
+            "host_path": str(credential),
+            "container_path": "/root/.hermes/token.json",
+        }],
+    )
+    monkeypatch.setattr(
+        "tools.credential_files.iter_skills_files",
+        lambda: [{
+            "host_path": str(skill),
+            "container_path": "/root/.hermes/skills/report/SKILL.md",
+        }],
+    )
+
+    class _Bridge:
+        def __init__(self, env, **kwargs):
+            assert env is remote_env
+            assert kwargs["host_roots"]
+            assert kwargs["container_roots"]
+
+        def push(self, host_path, container_path):
+            pushed.append((str(host_path), container_path))
+
+    monkeypatch.setattr("tools.environments.artifact_bridge.ArtifactBridge", _Bridge)
+    remote_env = docker_env.DockerEnvironment.__new__(docker_env.DockerEnvironment)
+    remote_env._remote_endpoint = True
+
+    remote_env._stage_remote_auto_inputs()
+
+    assert pushed == [
+        (str(credential), "/root/.hermes/token.json"),
+        (str(skill), "/root/.hermes/skills/report/SKILL.md"),
+    ]
+
+
+def test_reuse_query_requires_mount_fingerprint(monkeypatch):
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+    env = _make_dummy_env(persist_across_processes=False)
+    calls.clear()
+
+    env._find_reusable_container("task", "default", "off", "mount-hash")
+
+    ps_cmd = next(cmd for cmd, _ in calls if cmd[1:3] == ["ps", "-a"])
+    assert "label=hermes-mounts=mount-hash" in ps_cmd
+
+
+def test_mount_config_change_invalidates_reuse_fingerprint(monkeypatch):
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    _mock_subprocess_run(monkeypatch)
+
+    first = _make_dummy_env(volumes=["board-output-v1:/output"])
+    second = _make_dummy_env(volumes=["board-output-v2:/output"])
+
+    assert first._labels["hermes-mounts"] != second._labels["hermes-mounts"]
 
 
 # ── Cross-process container reuse (issue #20561) ──────────────────

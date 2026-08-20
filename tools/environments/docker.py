@@ -48,6 +48,38 @@ _DOCKER_SEARCH_PATHS = [
 _docker_executable: Optional[str] = None  # resolved once, cached
 _ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _EGRESS_LABEL_KEY = "hermes-egress"
+_MOUNTS_LABEL_KEY = "hermes-mounts"
+
+
+def _volume_spec_uses_host_path(spec: str) -> bool:
+    """Return True when a Docker ``source:target`` spec is a bind mount."""
+    source = spec.split(":", 1)[0]
+    return (
+        source.startswith(("/", ".", "~", "\\"))
+        or "/" in source
+        or "\\" in source
+        or bool(re.match(r"^[A-Za-z]:[\\/]", spec))
+    )
+
+
+def _extra_args_use_host_bind(extra_args: list[str]) -> bool:
+    """Detect bind mounts passed outside the structured volumes setting."""
+    for index, arg in enumerate(extra_args):
+        if arg in ("-v", "--volume"):
+            if index + 1 >= len(extra_args) or _volume_spec_uses_host_path(
+                extra_args[index + 1]
+            ):
+                return True
+        if arg.startswith(("-v=", "--volume=")) and _volume_spec_uses_host_path(
+            arg.split("=", 1)[1]
+        ):
+            return True
+        if arg == "--mount" and index + 1 < len(extra_args):
+            if "type=bind" in extra_args[index + 1].lower():
+                return True
+        if arg.startswith("--mount=") and "type=bind" in arg.lower():
+            return True
+    return False
 
 
 def _normalize_forward_env_names(forward_env: list[str] | None) -> list[str]:
@@ -432,7 +464,7 @@ _DEFAULT_PIDS_LIMIT = "256"
 _DEFAULT_SHM_SIZE = "1g"
 
 
-def _extra_args_set_shm_size(extra_args: list) -> bool:
+def _extra_args_set_shm_size(extra_args: list | None) -> bool:
     """True when user-supplied docker_extra_args already set ``--shm-size``.
 
     In that case we skip our default so the user's value is unambiguous
@@ -943,14 +975,14 @@ class DockerEnvironment(BaseEnvironment):
         disk: int = 0,
         persistent_filesystem: bool = False,
         task_id: str = "default",
-        volumes: list = None,
+        volumes: list | None = None,
         forward_env: list[str] | None = None,
         env: dict | None = None,
         network: bool = True,
         host_cwd: Optional[str] = None,
         auto_mount_cwd: bool = False,
         run_as_host_user: bool = False,
-        extra_args: list = None,
+        extra_args: list | None = None,
         persist_across_processes: bool = True,
         shm_size: str = _DEFAULT_SHM_SIZE,
     ):
@@ -982,6 +1014,8 @@ class DockerEnvironment(BaseEnvironment):
 
         # Fail fast if Docker is not available.
         _ensure_docker_available()
+        self._docker_exe = find_docker() or "docker"
+        self._remote_endpoint = docker_endpoint_is_remote(self._docker_exe)
 
         # Build resource limit args (gated by cgroup availability probe so
         # they degrade gracefully on hosts without controller delegation,
@@ -1027,6 +1061,11 @@ class DockerEnvironment(BaseEnvironment):
             if not vol:
                 continue
             if ":" in vol:
+                if self._remote_endpoint and _volume_spec_uses_host_path(vol):
+                    raise RuntimeError(
+                        "docker_volumes contains a host bind path, but the Docker "
+                        "daemon is remote; use a named volume or the artifact bridge"
+                    )
                 volume_args.extend(["-v", vol])
                 if ":/workspace" in vol:
                     workspace_explicitly_mounted = True
@@ -1036,29 +1075,46 @@ class DockerEnvironment(BaseEnvironment):
         host_cwd_abs = os.path.abspath(os.path.expanduser(host_cwd)) if host_cwd else ""
         bind_host_cwd = (
             auto_mount_cwd
+            and not self._remote_endpoint
             and bool(host_cwd_abs)
             and os.path.isdir(host_cwd_abs)
             and not workspace_explicitly_mounted
         )
-        if auto_mount_cwd and host_cwd and not os.path.isdir(host_cwd_abs):
+        if auto_mount_cwd and self._remote_endpoint:
+            logger.warning(
+                "Docker: skipping auto_mount_cwd for remote daemon; host paths "
+                "are not visible on the daemon host"
+            )
+        elif auto_mount_cwd and host_cwd and not os.path.isdir(host_cwd_abs):
             logger.debug("Skipping docker cwd mount: host_cwd is not a valid directory: %s", host_cwd)
 
         self._workspace_dir: Optional[str] = None
         self._home_dir: Optional[str] = None
         writable_args = []
         if self._persistent:
-            sandbox = get_sandbox_dir() / "docker" / task_id
-            self._home_dir = str(sandbox / "home")
-            os.makedirs(self._home_dir, exist_ok=True)
-            writable_args.extend([
-                "-v", f"{self._home_dir}:/root",
-            ])
-            if not bind_host_cwd and not workspace_explicitly_mounted:
-                self._workspace_dir = str(sandbox / "workspace")
-                os.makedirs(self._workspace_dir, exist_ok=True)
+            if self._remote_endpoint:
+                volume_key = hashlib.sha256(task_id.encode("utf-8")).hexdigest()[:16]
                 writable_args.extend([
-                    "-v", f"{self._workspace_dir}:/workspace",
+                    "--mount", f"type=volume,source=hermes-home-{volume_key},target=/root",
                 ])
+                if not workspace_explicitly_mounted:
+                    writable_args.extend([
+                        "--mount",
+                        f"type=volume,source=hermes-workspace-{volume_key},target=/workspace",
+                    ])
+            else:
+                sandbox = get_sandbox_dir() / "docker" / task_id
+                self._home_dir = str(sandbox / "home")
+                os.makedirs(self._home_dir, exist_ok=True)
+                writable_args.extend([
+                    "-v", f"{self._home_dir}:/root",
+                ])
+                if not bind_host_cwd and not workspace_explicitly_mounted:
+                    self._workspace_dir = str(sandbox / "workspace")
+                    os.makedirs(self._workspace_dir, exist_ok=True)
+                    writable_args.extend([
+                        "-v", f"{self._workspace_dir}:/workspace",
+                    ])
         else:
             if not bind_host_cwd and not workspace_explicitly_mounted:
                 writable_args.extend([
@@ -1084,7 +1140,12 @@ class DockerEnvironment(BaseEnvironment):
                 get_cache_directory_mounts,
             )
 
-            for mount_entry in get_credential_file_mounts():
+            if self._remote_endpoint:
+                logger.info(
+                    "Docker: remote daemon detected; cache, skill, and credential "
+                    "files will use the artifact bridge instead of bind mounts"
+                )
+            for mount_entry in ([] if self._remote_endpoint else get_credential_file_mounts()):
                 src = Path(mount_entry["host_path"])
                 if src.is_dir():
                     # Docker-in-Docker: Docker auto-created the source path as
@@ -1113,7 +1174,7 @@ class DockerEnvironment(BaseEnvironment):
 
             # Mount skill directories (local + external) so skill
             # scripts/templates are available inside the container.
-            for skills_mount in get_skills_directory_mount():
+            for skills_mount in ([] if self._remote_endpoint else get_skills_directory_mount()):
                 src = Path(skills_mount["host_path"])
                 if not src.is_dir():
                     logger.warning(
@@ -1135,7 +1196,7 @@ class DockerEnvironment(BaseEnvironment):
             # screenshots) so the agent can access uploaded files and other
             # cached media from inside the container.  Read-only — the
             # container reads these but the host gateway manages writes.
-            for cache_mount in get_cache_directory_mounts():
+            for cache_mount in ([] if self._remote_endpoint else get_cache_directory_mounts()):
                 src = Path(cache_mount["host_path"])
                 if not src.is_dir():
                     logger.warning(
@@ -1162,6 +1223,11 @@ class DockerEnvironment(BaseEnvironment):
         egress_volume_args, egress_env_overrides, egress_host_args = (
             _egress_proxy_args_for_docker()
         )
+        if self._remote_endpoint and egress_volume_args:
+            raise RuntimeError(
+                "Docker egress proxy uses host bind mounts and cannot be applied "
+                "to a remote Docker daemon"
+            )
         egress_label = _egress_reuse_fingerprint(
             egress_volume_args, egress_env_overrides, egress_host_args,
         )
@@ -1364,10 +1430,6 @@ class DockerEnvironment(BaseEnvironment):
                 # Fall back to the full cap set — without --user, an image's
                 # init may still need s6-setuidgid/gosu/su to drop privileges.
 
-        # Resolve the docker executable once so it works even when
-        # /usr/local/bin is not in PATH (common on macOS gateway/service).
-        self._docker_exe = find_docker() or "docker"
-
         # Best-effort home for delivery-path security checks (remote_home):
         # containers run as root unless run_as_host_user remaps the uid, in
         # which case the in-container home is unknown.
@@ -1401,6 +1463,11 @@ class DockerEnvironment(BaseEnvironment):
                 logger.warning("Ignoring non-string docker_extra_args entry: %r", arg)
                 continue
             validated_extra.append(arg)
+        if self._remote_endpoint and _extra_args_use_host_bind(validated_extra):
+            raise RuntimeError(
+                "docker_extra_args contains a host bind mount, but the Docker "
+                "daemon is remote; use a named volume or the artifact bridge"
+            )
         if egress_env_overrides:
             _extra_collisions = _extra_args_egress_collisions(
                 validated_extra, _critical_egress_names,
@@ -1431,6 +1498,18 @@ class DockerEnvironment(BaseEnvironment):
             + validated_extra
         )
         logger.info("Docker run_args: %s", all_run_args)
+        mount_fingerprint = hashlib.sha256(
+            json.dumps(
+                {
+                    "remote_endpoint": self._remote_endpoint,
+                    "writable_args": writable_args,
+                    "volume_args": volume_args,
+                    "extra_args": validated_extra,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()[:16]
 
         # Start the container directly via `docker run -d`.
         container_name = f"hermes-{uuid.uuid4().hex[:8]}"
@@ -1448,6 +1527,7 @@ class DockerEnvironment(BaseEnvironment):
             "--label", f"hermes-task-id={task_label}",
             "--label", f"hermes-profile={profile_name}",
             "--label", f"{_EGRESS_LABEL_KEY}={egress_label}",
+            "--label", f"{_MOUNTS_LABEL_KEY}={mount_fingerprint}",
         ]
         # Save args for container recreation on "No such container" recovery.
         self._image = image
@@ -1460,6 +1540,7 @@ class DockerEnvironment(BaseEnvironment):
             "hermes-task-id": task_label,
             "hermes-profile": profile_name,
             _EGRESS_LABEL_KEY: egress_label,
+            _MOUNTS_LABEL_KEY: mount_fingerprint,
         }
 
         # Cross-process container reuse (issue #20561 — docs claim "ONE long-lived
@@ -1476,7 +1557,7 @@ class DockerEnvironment(BaseEnvironment):
         reused = False
         if persist_across_processes:
             existing = self._find_reusable_container(
-                task_label, profile_name, egress_label,
+                task_label, profile_name, egress_label, mount_fingerprint,
             )
             if existing is not None:
                 container_id, state = existing
@@ -1599,6 +1680,7 @@ class DockerEnvironment(BaseEnvironment):
 
         # Initialize session snapshot inside the container
         self.init_session()
+        self._stage_remote_auto_inputs()
 
     def _build_init_env_args(self) -> list[str]:
         """Build -e KEY=VALUE args for injecting host env vars into init_session.
@@ -1622,6 +1704,45 @@ class DockerEnvironment(BaseEnvironment):
     def container_generation(self) -> int:
         """Monotonic identity snapshot for artifact/lifecycle consumers."""
         return self._container_generation
+
+    @property
+    def remote_endpoint(self) -> bool:
+        """Whether bind sources resolve on a different daemon host."""
+        return self._remote_endpoint
+
+    def _stage_remote_auto_inputs(self) -> None:
+        """Mirror declared credentials and skills when bind mounts are invalid."""
+        if not getattr(self, "_remote_endpoint", False):
+            return
+
+        from tools.credential_files import (
+            get_credential_file_mounts,
+            iter_skills_files,
+        )
+        from tools.environments.artifact_bridge import (
+            ArtifactBridge,
+            ArtifactTransferError,
+        )
+
+        entries = {
+            entry["container_path"]: entry["host_path"]
+            for entry in [*get_credential_file_mounts(), *iter_skills_files()]
+        }
+        for container_path, host_path in entries.items():
+            source = Path(host_path)
+            if not source.is_file():
+                continue
+            try:
+                ArtifactBridge(
+                    self,
+                    cache_dir=source.parent,
+                    host_roots=(source.parent,),
+                    container_roots=(posixpath.dirname(container_path) or "/",),
+                ).push(source, container_path)
+            except (ArtifactTransferError, OSError, ValueError) as exc:
+                raise RuntimeError(
+                    f"Docker remote input staging failed for {container_path}: {exc}"
+                ) from exc
 
     def _build_passthrough_env(self) -> dict[str, str]:
         """Resolve forwarded host variables through the active profile scope."""
@@ -1741,7 +1862,7 @@ class DockerEnvironment(BaseEnvironment):
                 return os.path.join(host_root, normalized[len(prefix):].lstrip("/"))
         return None
 
-    def fetch_file(self, container_path: str, local_dest: str) -> None:
+    def fetch_file(self, remote_path: str, local_dest: str) -> None:
         """Copy a file out of the container to *local_dest* on the host.
 
         Persistent /root and /workspace are bind mounts, so those paths copy
@@ -1752,7 +1873,7 @@ class DockerEnvironment(BaseEnvironment):
         mount, a raw ``docker exec tar`` stream is used before the capped
         base64 compatibility fallback.
         """
-        host_path = self._host_path_for(container_path)
+        host_path = self._host_path_for(remote_path)
         if host_path and os.path.isfile(host_path):
             shutil.copy2(host_path, local_dest)
             return
@@ -1762,7 +1883,7 @@ class DockerEnvironment(BaseEnvironment):
         try:
             result = subprocess.run(
                 [self._docker_exe, "cp", "-L",
-                 f"{self._container_id}:{container_path}", local_dest],
+                 f"{self._container_id}:{remote_path}", local_dest],
                 capture_output=True,
                 text=True,
                 timeout=_FETCH_TIMEOUT_SECONDS,
@@ -1781,26 +1902,26 @@ class DockerEnvironment(BaseEnvironment):
             detail = "timed out" if result is None else result.stderr.strip()
             logger.info(
                 "docker cp of %r failed (%s) — falling back to raw exec-tar",
-                container_path, detail,
+                remote_path, detail,
             )
             self._remove_local_transfer_target(local_dest)
             try:
-                self._fetch_file_with_tar(container_path, local_dest)
+                self._fetch_file_with_tar(remote_path, local_dest)
                 return
             except FileFetchError as tar_error:
-                size = self.fetch_file_size(container_path)
+                size = self.fetch_file_size(remote_path)
                 if size is None or size > self._base64_transfer_limit_bytes:
                     raise tar_error
                 logger.info(
                     "exec-tar pull of %r failed — using capped base64 fallback",
-                    container_path,
+                    remote_path,
                 )
-                super().fetch_file(container_path, local_dest)
+                super().fetch_file(remote_path, local_dest)
                 return
         if not os.path.isfile(local_dest):
             # docker cp of a directory materializes a directory — reject it.
             shutil.rmtree(local_dest, ignore_errors=True)
-            raise FileFetchError(f"{container_path!r} is not a regular file")
+            raise FileFetchError(f"{remote_path!r} is not a regular file")
 
     @staticmethod
     def _remove_local_transfer_target(path: str) -> None:
@@ -2030,6 +2151,7 @@ class DockerEnvironment(BaseEnvironment):
         profile_label = self._labels.get("hermes-profile", "")
         existing = self._find_reusable_container(
             task_label, profile_label, self._labels.get(_EGRESS_LABEL_KEY, "off"),
+            self._labels.get(_MOUNTS_LABEL_KEY, ""),
         )
         if existing is not None:
             cid, state = existing
@@ -2089,6 +2211,7 @@ class DockerEnvironment(BaseEnvironment):
         try:
             self._snapshot_ready = False
             self.init_session()
+            self._stage_remote_auto_inputs()
         except Exception as e:
             logger.error("Recovery: init_session failed in new container: %s", e)
             return False
@@ -2195,6 +2318,7 @@ class DockerEnvironment(BaseEnvironment):
         task_label: str,
         profile_label: str,
         egress_label: str,
+        mounts_label: str,
     ) -> Optional[tuple[str, str]]:
         """Look for an existing container labeled for this (task, profile).
 
@@ -2213,6 +2337,7 @@ class DockerEnvironment(BaseEnvironment):
                 "--filter", "label=hermes-agent=1",
                 "--filter", f"label=hermes-task-id={task_label}",
                 "--filter", f"label=hermes-profile={profile_label}",
+                "--filter", f"label={_MOUNTS_LABEL_KEY}={mounts_label}",
             ]
             if egress_label != "off":
                 filters.extend(["--filter", f"label={_EGRESS_LABEL_KEY}={egress_label}"])
