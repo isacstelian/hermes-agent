@@ -109,3 +109,36 @@ def test_current_context_probe_timeout_fails_closed(monkeypatch):
     )
 
     assert docker_env.docker_endpoint_is_remote("docker") is True
+
+
+def test_local_podman_does_not_probe_docker_context(monkeypatch):
+    for name in (
+        "DOCKER_HOST",
+        "DOCKER_CONTEXT",
+        "CONTAINER_HOST",
+        "CONTAINER_CONNECTION",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(
+        docker_env.subprocess,
+        "run",
+        lambda *args, **kwargs: pytest.fail("local Podman has no Docker context"),
+    )
+
+    assert docker_env.docker_endpoint_is_remote("/usr/bin/podman") is False
+
+
+@pytest.mark.parametrize("variable", ["CONTAINER_HOST", "CONTAINER_CONNECTION"])
+def test_explicit_podman_remote_environment_is_remote(monkeypatch, variable):
+    monkeypatch.delenv("DOCKER_HOST", raising=False)
+    monkeypatch.delenv("DOCKER_CONTEXT", raising=False)
+    monkeypatch.delenv("CONTAINER_HOST", raising=False)
+    monkeypatch.delenv("CONTAINER_CONNECTION", raising=False)
+    monkeypatch.setenv(variable, "ssh://board-host" if variable.endswith("HOST") else "board")
+    monkeypatch.setattr(
+        docker_env.subprocess,
+        "run",
+        lambda *args, **kwargs: pytest.fail("explicit Podman remote needs no probe"),
+    )
+
+    assert docker_env.docker_endpoint_is_remote("podman") is True

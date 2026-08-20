@@ -185,6 +185,57 @@ class TestDockerFetchFile:
         )
         assert dest.read_bytes() == b"tar-stream"
 
+    def test_bounded_pull_uses_archive_api_before_exec_tar(self, tmp_path):
+        env = self._make_env()
+        payload = b"x" * (9 * 1024 * 1024)
+        archive = io.BytesIO()
+        with tarfile.open(fileobj=archive, mode="w") as stream:
+            info = tarfile.TarInfo("report.pdf")
+            info.size = len(payload)
+            stream.addfile(info, io.BytesIO(payload))
+
+        commands = []
+
+        class FakeProcess:
+            def __init__(self, command, **_kwargs):
+                commands.append(command)
+                self.stdout = io.BytesIO(archive.getvalue())
+                self.returncode = None
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout=None):
+                self.returncode = 0
+                return 0
+
+            def kill(self):
+                self.returncode = -9
+
+        env._fetch_file_with_tar = Mock(
+            side_effect=AssertionError("exec-tar fallback must not run")
+        )
+        env.execute = Mock(side_effect=AssertionError("base64 fallback must not run"))
+        destination = tmp_path / "report.pdf"
+
+        with patch("tools.environments.docker.subprocess.Popen", FakeProcess):
+            env.fetch_file(
+                "/workspace/report.pdf",
+                str(destination),
+                max_bytes=10 * 1024 * 1024,
+            )
+
+        assert commands == [
+            [
+                "docker",
+                "cp",
+                "-L",
+                "cafebabe1234:/workspace/report.pdf",
+                "-",
+            ]
+        ]
+        assert destination.read_bytes() == payload
+
     def test_docker_cp_miss_with_no_exec_read_still_raises(self, tmp_path):
         env = self._make_env()
 

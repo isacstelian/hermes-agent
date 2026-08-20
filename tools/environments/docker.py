@@ -379,6 +379,16 @@ def docker_endpoint_is_remote(docker_exe: str) -> bool:
     ``DOCKER_CONTEXT`` wins over ``DOCKER_HOST``, matching Docker CLI
     precedence. Unknown named contexts fail closed as remote.
     """
+    runtime_name = os.path.basename(docker_exe).lower()
+    if runtime_name.startswith("podman"):
+        # Podman has no ``docker context`` command. Its documented remote
+        # selectors enable remote mode explicitly; without either selector
+        # the Linux CLI talks to its local runtime.
+        return runtime_name.startswith("podman-remote") or bool(
+            (os.getenv("CONTAINER_HOST") or "").strip()
+            or (os.getenv("CONTAINER_CONNECTION") or "").strip()
+        )
+
     context = (os.getenv("DOCKER_CONTEXT") or "").strip()
     explicit_host = (os.getenv("DOCKER_HOST") or "").strip()
     if not context and explicit_host:
@@ -1932,7 +1942,16 @@ class DockerEnvironment(BaseEnvironment):
         if not self._container_id:
             raise FileFetchError("Docker container not started")
         result = None
-        if max_bytes is None:
+        cp_error: FileFetchError | None = None
+        if max_bytes is not None:
+            try:
+                self._fetch_file_with_cp_archive(
+                    remote_path, local_dest, max_bytes=max_bytes
+                )
+                return
+            except FileFetchError as exc:
+                cp_error = exc
+        else:
             try:
                 result = subprocess.run(
                     [self._docker_exe, "cp", "-L",
@@ -1944,7 +1963,7 @@ class DockerEnvironment(BaseEnvironment):
                 )
             except subprocess.TimeoutExpired:
                 result = None
-        if result is None or result.returncode != 0:
+        if cp_error is not None or result is None or result.returncode != 0:
             # The archive API reads the container's ROOTFS LAYERS, not the
             # mounts stacked on top of them: a file on a tmpfs (/root and
             # /workspace are tmpfs whenever container_persistent is false) is
@@ -1952,7 +1971,10 @@ class DockerEnvironment(BaseEnvironment):
             # sees it, and a userspace runtime like gVisor widens the gap.
             # The exec channel reads the container's real view, so fall back
             # to raw tar instead of declaring the file missing.
-            detail = "timed out" if result is None else result.stderr.strip()
+            if cp_error is not None:
+                detail = str(cp_error)
+            else:
+                detail = "timed out" if result is None else result.stderr.strip()
             logger.info(
                 "docker cp of %r failed (%s) — falling back to raw exec-tar",
                 remote_path, detail,
@@ -1996,6 +2018,127 @@ class DockerEnvironment(BaseEnvironment):
                 target.unlink(missing_ok=True)
         except OSError:
             pass
+
+    def _fetch_file_with_cp_archive(
+        self,
+        container_path: str,
+        local_dest: str,
+        *,
+        max_bytes: int,
+    ) -> None:
+        """Pull one bounded file through Docker's Archive API."""
+        if not self._container_id:
+            raise FileFetchError("Docker container not started")
+        normalized = posixpath.normpath(container_path)
+        if not normalized.startswith("/") or normalized == "/":
+            raise FileFetchError(
+                f"invalid container artifact path: {container_path!r}"
+            )
+        self._fetch_file_from_archive_command(
+            [
+                self._docker_exe,
+                "cp",
+                "-L",
+                f"{self._container_id}:{normalized}",
+                "-",
+            ],
+            container_path,
+            local_dest,
+            max_bytes=max_bytes,
+            transport="docker cp",
+        )
+
+    def _fetch_file_from_archive_command(
+        self,
+        command: list[str],
+        container_path: str,
+        local_dest: str,
+        *,
+        max_bytes: int,
+        transport: str,
+    ) -> None:
+        """Extract one regular file from a bounded streaming tar command."""
+        basename = posixpath.basename(posixpath.normpath(container_path))
+        process = None
+        timeout_timer = None
+        try:
+            with tempfile.TemporaryFile() as stderr:
+                process = subprocess.Popen(
+                    command,
+                    stdout=subprocess.PIPE,
+                    stderr=stderr,
+                    stdin=subprocess.DEVNULL,
+                )
+                if process.stdout is None:
+                    raise FileFetchError(f"{transport} pull produced no stream")
+                timeout_timer = threading.Timer(
+                    _FETCH_TIMEOUT_SECONDS,
+                    lambda: process.kill() if process.poll() is None else None,
+                )
+                timeout_timer.daemon = True
+                timeout_timer.start()
+                with process.stdout:
+                    with tarfile.open(fileobj=process.stdout, mode="r|*") as stream:
+                        members = iter(stream)
+                        member = next(members, None)
+                        if member is None:
+                            raise FileFetchError(
+                                f"{transport} pull of {container_path!r} returned no entries"
+                            )
+                        if (
+                            posixpath.basename(posixpath.normpath(member.name))
+                            != basename
+                            or not member.isfile()
+                        ):
+                            raise FileFetchError(
+                                f"{container_path!r} is not a regular file"
+                            )
+                        if member.size > max_bytes:
+                            raise FileFetchError(
+                                f"{container_path!r} exceeds the "
+                                f"{max_bytes}-byte transfer limit"
+                            )
+                        source = stream.extractfile(member)
+                        if source is None:
+                            raise FileFetchError(
+                                f"{transport} pull of {container_path!r} "
+                                "produced no payload"
+                            )
+                        with open(local_dest, "wb") as destination:
+                            shutil.copyfileobj(
+                                source, destination, length=1024 * 1024
+                            )
+                        if next(members, None) is not None:
+                            raise FileFetchError(
+                                f"{transport} pull of {container_path!r} "
+                                "returned multiple entries"
+                            )
+                returncode = process.wait(timeout=_FETCH_TIMEOUT_SECONDS)
+                if returncode != 0:
+                    stderr.seek(0)
+                    detail = stderr.read().decode("utf-8", "replace").strip()
+                    raise FileFetchError(
+                        f"{transport} pull of {container_path!r} failed: {detail}"
+                    )
+        except subprocess.TimeoutExpired as exc:
+            self._remove_local_transfer_target(local_dest)
+            raise FileFetchError(
+                f"{transport} pull of {container_path!r} timed out"
+            ) from exc
+        except FileFetchError:
+            self._remove_local_transfer_target(local_dest)
+            raise
+        except (OSError, tarfile.TarError) as exc:
+            self._remove_local_transfer_target(local_dest)
+            raise FileFetchError(
+                f"{transport} pull of {container_path!r} failed: {exc}"
+            ) from exc
+        finally:
+            if timeout_timer is not None:
+                timeout_timer.cancel()
+            if process is not None and process.poll() is None:
+                process.kill()
+                process.wait()
 
     def _fetch_file_with_tar(
         self,
@@ -2074,77 +2217,13 @@ class DockerEnvironment(BaseEnvironment):
                     f"exec-tar pull of {container_path!r} failed: {exc}"
                 ) from exc
 
-        process = None
-        timeout_timer = None
-        try:
-            with tempfile.TemporaryFile() as stderr:
-                process = subprocess.Popen(
-                    command,
-                    stdout=subprocess.PIPE,
-                    stderr=stderr,
-                    stdin=subprocess.DEVNULL,
-                )
-                if process.stdout is None:
-                    raise FileFetchError("exec-tar pull produced no stream")
-                timeout_timer = threading.Timer(
-                    _FETCH_TIMEOUT_SECONDS,
-                    lambda: process.kill() if process.poll() is None else None,
-                )
-                timeout_timer.daemon = True
-                timeout_timer.start()
-                with tarfile.open(fileobj=process.stdout, mode="r|*") as stream:
-                    members = iter(stream)
-                    member = next(members, None)
-                    if member is None:
-                        raise FileFetchError(
-                            f"exec-tar pull of {container_path!r} returned no entries"
-                        )
-                    member_name = posixpath.normpath(member.name)
-                    if member_name != basename or not member.isfile():
-                        raise FileFetchError(
-                            f"{container_path!r} is not a regular file"
-                        )
-                    if max_bytes is not None and member.size > max_bytes:
-                        raise FileFetchError(
-                            f"{container_path!r} exceeds the {max_bytes}-byte transfer limit"
-                        )
-                    source = stream.extractfile(member)
-                    if source is None:
-                        raise FileFetchError(
-                            f"exec-tar pull of {container_path!r} produced no payload"
-                        )
-                    with open(local_dest, "wb") as destination:
-                        shutil.copyfileobj(source, destination, length=1024 * 1024)
-                    if next(members, None) is not None:
-                        raise FileFetchError(
-                            f"exec-tar pull of {container_path!r} returned multiple entries"
-                        )
-                returncode = process.wait(timeout=_FETCH_TIMEOUT_SECONDS)
-                if returncode != 0:
-                    stderr.seek(0)
-                    detail = stderr.read().decode("utf-8", "replace").strip()
-                    raise FileFetchError(
-                        f"exec-tar pull of {container_path!r} failed: {detail}"
-                    )
-        except subprocess.TimeoutExpired as exc:
-            self._remove_local_transfer_target(local_dest)
-            raise FileFetchError(
-                f"exec-tar pull of {container_path!r} timed out"
-            ) from exc
-        except FileFetchError:
-            self._remove_local_transfer_target(local_dest)
-            raise
-        except (OSError, tarfile.TarError) as exc:
-            self._remove_local_transfer_target(local_dest)
-            raise FileFetchError(
-                f"exec-tar pull of {container_path!r} failed: {exc}"
-            ) from exc
-        finally:
-            if timeout_timer is not None:
-                timeout_timer.cancel()
-            if process is not None and process.poll() is None:
-                process.kill()
-                process.wait()
+        self._fetch_file_from_archive_command(
+            command,
+            container_path,
+            local_dest,
+            max_bytes=max_bytes,
+            transport="exec-tar",
+        )
 
     def put_file(self, local_source: str, remote_dest: str) -> None:
         """Push one file through docker cp, raw exec-tar, then capped base64."""
