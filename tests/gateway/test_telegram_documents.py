@@ -11,6 +11,7 @@ We mock the telegram module at import time to avoid collection errors.
 import asyncio
 import os
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -245,7 +246,7 @@ class TestDocumentDownloadBlock:
         await adapter._cache_replied_media(msg, event)
 
         assert len(event.media_urls) == 1
-        assert open(event.media_urls[0], "rb").read() == payload
+        assert Path(event.media_urls[0]).read_bytes() == payload
         assert event.media_types == [mime_type]
 
 

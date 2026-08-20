@@ -10,6 +10,7 @@ and a failed fetch still produces the user-facing notice.
 import asyncio
 import hashlib
 import shlex
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -155,7 +156,7 @@ class TestFetchRemoteMedia:
         local, reason = fetch_remote_media("/root/raport.xlsx", "session-1")
 
         assert reason is None
-        assert local and open(local, "rb").read() == b"xlsx bytes"
+        assert local and Path(local).read_bytes() == b"xlsx bytes"
         assert len(env.fetched) == 1
         assert env.fetched[0].startswith("/root/.raport.xlsx.hermes-artifact-")
         assert env.fetched[0].endswith(".snapshot")
@@ -357,7 +358,7 @@ class TestFilterUsesTheFetch:
         assert len(safe) == 1
         path, is_voice = safe[0]
         assert is_voice is False
-        assert open(path, "rb").read() == b"xlsx"
+        assert Path(path).read_bytes() == b"xlsx"
 
     @pytest.mark.parametrize("name", ["Caddyfile", "script.py", "data.weirdext"])
     def test_explicit_media_is_extension_agnostic(self, remote_backend, name):
@@ -372,7 +373,7 @@ class TestFilterUsesTheFetch:
         assert cleaned.strip() == "done"
         assert dropped == []
         assert len(safe) == 1
-        assert open(safe[0][0], "rb").read() == b"artifact"
+        assert Path(safe[0][0]).read_bytes() == b"artifact"
 
     def test_failed_fetch_still_reports_the_drop(self, remote_backend):
         remote_backend(_FakeRemoteEnv({}))
@@ -507,7 +508,7 @@ class TestSandboxLookupUsesTheAgentSessionId:
         )
 
         assert len(adapter.documents) == 1, adapter.sent
-        assert open(adapter.documents[0], "rb").read() == b"lucrator,total\n"
+        assert Path(adapter.documents[0]).read_bytes() == b"lucrator,total\n"
         assert all("Couldn't deliver" not in s for s in adapter.sent), adapter.sent
 
     @pytest.mark.asyncio
@@ -546,7 +547,7 @@ class TestSandboxLookupUsesTheAgentSessionId:
         )
 
         assert len(adapter.documents) == 1, adapter.sent
-        assert open(adapter.documents[0], "rb").read() == b"%PDF-old-session"
+        assert Path(adapter.documents[0]).read_bytes() == b"%PDF-old-session"
 
     @pytest.mark.asyncio
     async def test_adapter_holds_environment_lease_through_delivery(self, monkeypatch):

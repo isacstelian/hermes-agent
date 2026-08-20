@@ -600,14 +600,11 @@ def test_identity_labels_do_not_collapse_sanitized_task_or_profile_names(
     )
 
     ps_cmd = next(cmd for cmd, _ in calls if cmd[1:3] == ["ps", "-a"])
-    assert (
-        f"label={docker_env._TASK_KEY_LABEL_KEY}="
-        f"{docker_env._identity_label_value('session/tenant')}"
-    ) in ps_cmd
-    assert (
-        f"label={docker_env._PROFILE_KEY_LABEL_KEY}="
-        f"{docker_env._identity_label_value('board/profile')}"
-    ) in ps_cmd
+    assert "label=hermes-task-id=session_tenant" in ps_cmd
+    assert "label=hermes-profile=board_profile" in ps_cmd
+    rendered = " ".join(ps_cmd)
+    assert docker_env._TASK_KEY_LABEL_KEY in rendered
+    assert docker_env._PROFILE_KEY_LABEL_KEY in rendered
 
 
 def test_run_command_sanitizes_unsafe_task_id(monkeypatch):
@@ -838,7 +835,14 @@ def test_stale_immutable_config_container_is_removed(monkeypatch):
         calls.append((list(cmd), kwargs))
         if cmd[1:3] == ["ps", "-a"]:
             return subprocess.CompletedProcess(
-                cmd, 0, stdout="old-cid\told-mounts\toff\n", stderr=""
+                cmd,
+                0,
+                stdout=(
+                    "old-cid\told-mounts\toff\t"
+                    f"{env._labels[docker_env._TASK_KEY_LABEL_KEY]}\t"
+                    f"{env._labels[docker_env._PROFILE_KEY_LABEL_KEY]}\n"
+                ),
+                stderr="",
             )
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
@@ -847,6 +851,65 @@ def test_stale_immutable_config_container_is_removed(monkeypatch):
     env._remove_stale_config_containers("task", "default", "off", "new-mounts")
 
     assert any(cmd[1:4] == ["rm", "-f", "old-cid"] for cmd, _ in calls)
+
+
+def test_pre_identity_label_container_is_removed_during_upgrade(monkeypatch):
+    """A persistent container from before identity labels must not survive an
+    upgrade and race a fresh container for ports or writable mounts."""
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+    env = _make_dummy_env(persist_across_processes=False)
+    calls.clear()
+
+    def _run(cmd, **kwargs):
+        calls.append((list(cmd), kwargs))
+        if cmd[1:3] == ["ps", "-a"]:
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout="legacy-cid\tnew-mounts\toff\t\t\n",
+                stderr="",
+            )
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(docker_env.subprocess, "run", _run)
+
+    env._remove_stale_config_containers("task", "default", "off", "new-mounts")
+
+    ps_cmd = next(cmd for cmd, _ in calls if cmd[1:3] == ["ps", "-a"])
+    assert not any("hermes-task-key=" in part for part in ps_cmd)
+    assert not any("hermes-profile-key=" in part for part in ps_cmd)
+    assert any(cmd[1:4] == ["rm", "-f", "legacy-cid"] for cmd, _ in calls)
+
+
+def test_stale_cleanup_preserves_exact_identity_collision(monkeypatch):
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+    env = _make_dummy_env(task_id="session/tenant", persist_across_processes=False)
+    calls.clear()
+
+    def _run(cmd, **kwargs):
+        calls.append((list(cmd), kwargs))
+        if cmd[1:3] == ["ps", "-a"]:
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout=(
+                    "foreign-cid\told-mounts\toff\t"
+                    f"{docker_env._identity_label_value('session_tenant')}\t"
+                    f"{env._labels[docker_env._PROFILE_KEY_LABEL_KEY]}\n"
+                ),
+                stderr="",
+            )
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(docker_env.subprocess, "run", _run)
+
+    env._remove_stale_config_containers(
+        "session_tenant", "default", "off", "new-mounts"
+    )
+
+    assert not any(cmd[1:4] == ["rm", "-f", "foreign-cid"] for cmd, _ in calls)
 
 
 def test_bounded_exec_tar_pull_accepts_single_large_file(monkeypatch, tmp_path):

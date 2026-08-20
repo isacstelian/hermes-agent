@@ -2471,19 +2471,14 @@ class DockerEnvironment(BaseEnvironment):
             + _MOUNTS_LABEL_KEY
             + '"}}\t{{.Label "'
             + _EGRESS_LABEL_KEY
+            + '"}}\t{{.Label "'
+            + _TASK_KEY_LABEL_KEY
+            + '"}}\t{{.Label "'
+            + _PROFILE_KEY_LABEL_KEY
             + '"}}'
         )
         task_key = self._labels.get(_TASK_KEY_LABEL_KEY, "")
         profile_key = self._labels.get(_PROFILE_KEY_LABEL_KEY, "")
-        identity_filters = []
-        if task_key:
-            identity_filters.extend(
-                ["--filter", f"label={_TASK_KEY_LABEL_KEY}={task_key}"]
-            )
-        if profile_key:
-            identity_filters.extend(
-                ["--filter", f"label={_PROFILE_KEY_LABEL_KEY}={profile_key}"]
-            )
         try:
             result = subprocess.run(
                 [
@@ -2496,7 +2491,6 @@ class DockerEnvironment(BaseEnvironment):
                     f"label=hermes-task-id={task_label}",
                     "--filter",
                     f"label=hermes-profile={profile_label}",
-                    *identity_filters,
                     "--format",
                     fmt,
                 ],
@@ -2520,15 +2514,41 @@ class DockerEnvironment(BaseEnvironment):
 
         for line in result.stdout.splitlines():
             parts = line.split("\t")
-            if len(parts) != 3:
+            if len(parts) != 5:
                 continue
-            container_id, actual_mounts, actual_egress = parts
+            (
+                container_id,
+                actual_mounts,
+                actual_egress,
+                actual_task_key,
+                actual_profile_key,
+            ) = parts
+            missing_labels = {"", "<no value>"}
+            task_key_missing = actual_task_key in missing_labels
+            profile_key_missing = actual_profile_key in missing_labels
+            if task_key_missing != profile_key_missing:
+                logger.warning(
+                    "Ignoring Docker container %s with incomplete identity labels",
+                    container_id[:12],
+                )
+                continue
+            legacy_identity = task_key_missing and profile_key_missing
+            if not legacy_identity and (
+                actual_task_key != task_key or actual_profile_key != profile_key
+            ):
+                # Sanitized legacy labels can collide. Never remove a container
+                # whose exact identity labels belong to another task/profile.
+                continue
             egress_matches = (
                 actual_egress in {"", "off"}
                 if egress_label == "off"
                 else actual_egress == egress_label
             )
-            if actual_mounts == mounts_label and egress_matches:
+            if (
+                not legacy_identity
+                and actual_mounts == mounts_label
+                and egress_matches
+            ):
                 continue
             removed = subprocess.run(
                 [self._docker_exe, "rm", "-f", container_id],
@@ -2546,7 +2566,7 @@ class DockerEnvironment(BaseEnvironment):
                     f"{container_id[:12]}: {removed.stderr.strip()}"
                 )
             logger.info(
-                "Removed stale Docker container %s after immutable config change",
+                "Removed stale Docker container %s after identity/config change",
                 container_id[:12],
             )
 
