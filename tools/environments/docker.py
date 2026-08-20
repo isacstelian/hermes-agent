@@ -15,6 +15,9 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tarfile
+import tempfile
+import threading
 import uuid
 from pathlib import Path
 from typing import Optional
@@ -46,6 +49,41 @@ _DOCKER_SEARCH_PATHS = [
 _docker_executable: Optional[str] = None  # resolved once, cached
 _ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _EGRESS_LABEL_KEY = "hermes-egress"
+_MOUNTS_LABEL_KEY = "hermes-mounts"
+_TASK_KEY_LABEL_KEY = "hermes-task-key"
+_PROFILE_KEY_LABEL_KEY = "hermes-profile-key"
+_podman_cli_cache: dict[str, bool] = {}
+
+
+def _volume_spec_uses_host_path(spec: str) -> bool:
+    """Return True when a Docker ``source:target`` spec is a bind mount."""
+    source = spec.split(":", 1)[0]
+    return (
+        source.startswith(("/", ".", "~", "\\"))
+        or "/" in source
+        or "\\" in source
+        or bool(re.match(r"^[A-Za-z]:[\\/]", spec))
+    )
+
+
+def _extra_args_use_host_bind(extra_args: list[str]) -> bool:
+    """Detect bind mounts passed outside the structured volumes setting."""
+    for index, arg in enumerate(extra_args):
+        if arg in ("-v", "--volume"):
+            if index + 1 >= len(extra_args) or _volume_spec_uses_host_path(
+                extra_args[index + 1]
+            ):
+                return True
+        if arg.startswith(("-v=", "--volume=")) and _volume_spec_uses_host_path(
+            arg.split("=", 1)[1]
+        ):
+            return True
+        if arg == "--mount" and index + 1 < len(extra_args):
+            if "type=bind" in extra_args[index + 1].lower():
+                return True
+        if arg.startswith("--mount=") and "type=bind" in arg.lower():
+            return True
+    return False
 
 
 def _normalize_forward_env_names(forward_env: list[str] | None) -> list[str]:
@@ -131,6 +169,11 @@ def _sanitize_label_value(value: str) -> str:
     cleaned = _LABEL_VALUE_OK_RE.sub("_", value)
     cleaned = cleaned[:63] or "unknown"
     return cleaned
+
+
+def _identity_label_value(value: str) -> str:
+    """Return a collision-resistant Docker label for an application identity."""
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:32]
 
 
 def _get_active_profile_name() -> str:
@@ -322,6 +365,107 @@ def find_docker() -> Optional[str]:
     return None
 
 
+def _docker_endpoint_value_is_remote(endpoint: str) -> bool:
+    endpoint = (endpoint or "").strip().lower()
+    if endpoint.startswith(("unix://", "npipe://")):
+        return False
+    return bool(endpoint)
+
+
+def _docker_cli_is_podman(docker_exe: str) -> bool:
+    """Detect Podman even when installed as a ``docker`` compatibility shim."""
+    resolved = os.path.realpath(docker_exe)
+    if os.path.basename(resolved).lower().startswith("podman"):
+        return True
+    if not os.path.isfile(docker_exe):
+        return False
+    cached = _podman_cli_cache.get(resolved)
+    if cached is not None:
+        return cached
+    try:
+        version = subprocess.run(
+            [docker_exe, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+            stdin=subprocess.DEVNULL,
+        )
+        is_podman = "podman" in (
+            (version.stdout or "") + "\n" + (version.stderr or "")
+        ).lower()
+    except (OSError, subprocess.TimeoutExpired):
+        is_podman = False
+    _podman_cli_cache[resolved] = is_podman
+    return is_podman
+
+
+def docker_endpoint_is_remote(docker_exe: str) -> bool:
+    """Classify the effective Docker daemon endpoint.
+
+    Bind sources are resolved on the daemon host, so an SSH/TCP daemon must
+    never receive Hermes' local cache/credential auto-mounts. An explicit
+    ``DOCKER_CONTEXT`` wins over ``DOCKER_HOST``, matching Docker CLI
+    precedence. Unknown named contexts fail closed as remote.
+    """
+    runtime_name = os.path.basename(os.path.realpath(docker_exe)).lower()
+    if _docker_cli_is_podman(docker_exe):
+        # Podman has no ``docker context`` command. Its documented remote
+        # selectors enable remote mode explicitly; without either selector
+        # the Linux CLI talks to its local runtime.
+        container_host = (os.getenv("CONTAINER_HOST") or "").strip()
+        if container_host:
+            return _docker_endpoint_value_is_remote(container_host)
+        return runtime_name.startswith("podman-remote") or bool(
+            (os.getenv("CONTAINER_CONNECTION") or "").strip()
+        )
+
+    context = (os.getenv("DOCKER_CONTEXT") or "").strip()
+    explicit_host = (os.getenv("DOCKER_HOST") or "").strip()
+    if not context and explicit_host:
+        return _docker_endpoint_value_is_remote(explicit_host)
+    if not context:
+        try:
+            shown = subprocess.run(
+                [docker_exe, "context", "show"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+                stdin=subprocess.DEVNULL,
+            )
+            if shown.returncode != 0:
+                return True
+            context = shown.stdout.strip()
+        except (OSError, subprocess.TimeoutExpired):
+            return True
+    if not context or context == "default":
+        return False
+
+    try:
+        inspected = subprocess.run(
+            [
+                docker_exe,
+                "context",
+                "inspect",
+                context,
+                "--format",
+                "{{.Endpoints.docker.Host}}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+            stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return True
+    if inspected.returncode != 0:
+        return True
+    endpoint = inspected.stdout.strip()
+    return True if not endpoint else _docker_endpoint_value_is_remote(endpoint)
+
+
 # Security flags applied to every container.
 # The container itself is the security boundary (isolated from host).
 # We drop all capabilities then add back the minimum needed:
@@ -369,7 +513,7 @@ _DEFAULT_PIDS_LIMIT = "256"
 _DEFAULT_SHM_SIZE = "1g"
 
 
-def _extra_args_set_shm_size(extra_args: list) -> bool:
+def _extra_args_set_shm_size(extra_args: list | None) -> bool:
     """True when user-supplied docker_extra_args already set ``--shm-size``.
 
     In that case we skip our default so the user's value is unambiguous
@@ -880,14 +1024,14 @@ class DockerEnvironment(BaseEnvironment):
         disk: int = 0,
         persistent_filesystem: bool = False,
         task_id: str = "default",
-        volumes: list = None,
+        volumes: list | None = None,
         forward_env: list[str] | None = None,
         env: dict | None = None,
         network: bool = True,
         host_cwd: Optional[str] = None,
         auto_mount_cwd: bool = False,
         run_as_host_user: bool = False,
-        extra_args: list = None,
+        extra_args: list | None = None,
         persist_across_processes: bool = True,
         shm_size: str = _DEFAULT_SHM_SIZE,
     ):
@@ -905,6 +1049,7 @@ class DockerEnvironment(BaseEnvironment):
         self._env = _normalize_env_dict(env)
         self._init_unset_passthrough_names: tuple[str, ...] = ()
         self._container_id: Optional[str] = None
+        self._container_generation = 0
         self._labels: dict[str, str] = {}
         self._image: str = ""
         self._container_name: str = ""
@@ -918,6 +1063,10 @@ class DockerEnvironment(BaseEnvironment):
 
         # Fail fast if Docker is not available.
         _ensure_docker_available()
+        self._docker_exe = find_docker() or "docker"
+        self._remote_endpoint = docker_endpoint_is_remote(self._docker_exe)
+        active_profile = _get_active_profile_name()
+        profile_name = _sanitize_label_value(active_profile)
 
         # Build resource limit args (gated by cgroup availability probe so
         # they degrade gracefully on hosts without controller delegation,
@@ -963,6 +1112,11 @@ class DockerEnvironment(BaseEnvironment):
             if not vol:
                 continue
             if ":" in vol:
+                if self._remote_endpoint and _volume_spec_uses_host_path(vol):
+                    raise RuntimeError(
+                        "docker_volumes contains a host bind path, but the Docker "
+                        "daemon is remote; use a named volume or the artifact bridge"
+                    )
                 volume_args.extend(["-v", vol])
                 if ":/workspace" in vol:
                     workspace_explicitly_mounted = True
@@ -972,29 +1126,48 @@ class DockerEnvironment(BaseEnvironment):
         host_cwd_abs = os.path.abspath(os.path.expanduser(host_cwd)) if host_cwd else ""
         bind_host_cwd = (
             auto_mount_cwd
+            and not self._remote_endpoint
             and bool(host_cwd_abs)
             and os.path.isdir(host_cwd_abs)
             and not workspace_explicitly_mounted
         )
-        if auto_mount_cwd and host_cwd and not os.path.isdir(host_cwd_abs):
+        if auto_mount_cwd and self._remote_endpoint:
+            logger.warning(
+                "Docker: skipping auto_mount_cwd for remote daemon; host paths "
+                "are not visible on the daemon host"
+            )
+        elif auto_mount_cwd and host_cwd and not os.path.isdir(host_cwd_abs):
             logger.debug("Skipping docker cwd mount: host_cwd is not a valid directory: %s", host_cwd)
 
         self._workspace_dir: Optional[str] = None
         self._home_dir: Optional[str] = None
         writable_args = []
         if self._persistent:
-            sandbox = get_sandbox_dir() / "docker" / task_id
-            self._home_dir = str(sandbox / "home")
-            os.makedirs(self._home_dir, exist_ok=True)
-            writable_args.extend([
-                "-v", f"{self._home_dir}:/root",
-            ])
-            if not bind_host_cwd and not workspace_explicitly_mounted:
-                self._workspace_dir = str(sandbox / "workspace")
-                os.makedirs(self._workspace_dir, exist_ok=True)
+            if self._remote_endpoint:
+                volume_key = hashlib.sha256(
+                    f"{task_id}\0{active_profile}".encode("utf-8")
+                ).hexdigest()[:16]
                 writable_args.extend([
-                    "-v", f"{self._workspace_dir}:/workspace",
+                    "--mount", f"type=volume,source=hermes-home-{volume_key},target=/root",
                 ])
+                if not workspace_explicitly_mounted:
+                    writable_args.extend([
+                        "--mount",
+                        f"type=volume,source=hermes-workspace-{volume_key},target=/workspace",
+                    ])
+            else:
+                sandbox = get_sandbox_dir() / "docker" / task_id
+                self._home_dir = str(sandbox / "home")
+                os.makedirs(self._home_dir, exist_ok=True)
+                writable_args.extend([
+                    "-v", f"{self._home_dir}:/root",
+                ])
+                if not bind_host_cwd and not workspace_explicitly_mounted:
+                    self._workspace_dir = str(sandbox / "workspace")
+                    os.makedirs(self._workspace_dir, exist_ok=True)
+                    writable_args.extend([
+                        "-v", f"{self._workspace_dir}:/workspace",
+                    ])
         else:
             if not bind_host_cwd and not workspace_explicitly_mounted:
                 writable_args.extend([
@@ -1020,7 +1193,12 @@ class DockerEnvironment(BaseEnvironment):
                 get_cache_directory_mounts,
             )
 
-            for mount_entry in get_credential_file_mounts():
+            if self._remote_endpoint:
+                logger.info(
+                    "Docker: remote daemon detected; cache, skill, and credential "
+                    "files will use the artifact bridge instead of bind mounts"
+                )
+            for mount_entry in ([] if self._remote_endpoint else get_credential_file_mounts()):
                 src = Path(mount_entry["host_path"])
                 if src.is_dir():
                     # Docker-in-Docker: Docker auto-created the source path as
@@ -1049,7 +1227,7 @@ class DockerEnvironment(BaseEnvironment):
 
             # Mount skill directories (local + external) so skill
             # scripts/templates are available inside the container.
-            for skills_mount in get_skills_directory_mount():
+            for skills_mount in ([] if self._remote_endpoint else get_skills_directory_mount()):
                 src = Path(skills_mount["host_path"])
                 if not src.is_dir():
                     logger.warning(
@@ -1071,7 +1249,7 @@ class DockerEnvironment(BaseEnvironment):
             # screenshots) so the agent can access uploaded files and other
             # cached media from inside the container.  Read-only — the
             # container reads these but the host gateway manages writes.
-            for cache_mount in get_cache_directory_mounts():
+            for cache_mount in ([] if self._remote_endpoint else get_cache_directory_mounts()):
                 src = Path(cache_mount["host_path"])
                 if not src.is_dir():
                     logger.warning(
@@ -1098,6 +1276,11 @@ class DockerEnvironment(BaseEnvironment):
         egress_volume_args, egress_env_overrides, egress_host_args = (
             _egress_proxy_args_for_docker()
         )
+        if self._remote_endpoint and egress_volume_args:
+            raise RuntimeError(
+                "Docker egress proxy uses host bind mounts and cannot be applied "
+                "to a remote Docker daemon"
+            )
         egress_label = _egress_reuse_fingerprint(
             egress_volume_args, egress_env_overrides, egress_host_args,
         )
@@ -1286,7 +1469,13 @@ class DockerEnvironment(BaseEnvironment):
         # owned by that user on the host instead of by root. Skip cleanly on
         # platforms without POSIX uid/gid (e.g. native Windows Docker).
         user_args: list[str] = []
-        if run_as_host_user:
+        effective_run_as_host_user = run_as_host_user and not self._remote_endpoint
+        if run_as_host_user and self._remote_endpoint:
+            logger.warning(
+                "Docker: ignoring docker_run_as_host_user for a remote daemon; "
+                "daemon-owned /root and /workspace volumes require the image user"
+            )
+        if effective_run_as_host_user:
             user_spec = _resolve_host_user_spec()
             if user_spec is not None:
                 user_args = ["--user", user_spec]
@@ -1300,14 +1489,10 @@ class DockerEnvironment(BaseEnvironment):
                 # Fall back to the full cap set — without --user, an image's
                 # init may still need s6-setuidgid/gosu/su to drop privileges.
 
-        # Resolve the docker executable once so it works even when
-        # /usr/local/bin is not in PATH (common on macOS gateway/service).
-        self._docker_exe = find_docker() or "docker"
-
         # Best-effort home for delivery-path security checks (remote_home):
         # containers run as root unless run_as_host_user remaps the uid, in
         # which case the in-container home is unknown.
-        if not (run_as_host_user and user_args):
+        if not (effective_run_as_host_user and user_args):
             self._remote_home = "/root"
 
         # s6-overlay images (e.g. hermes-agent:latest) already use /init as PID 1
@@ -1324,7 +1509,7 @@ class DockerEnvironment(BaseEnvironment):
                 image,
             )
         security_args = _build_security_args(
-            run_as_host_user and bool(user_args),
+            effective_run_as_host_user and bool(user_args),
             run_exec=image_uses_s6_init,
         )
 
@@ -1337,6 +1522,11 @@ class DockerEnvironment(BaseEnvironment):
                 logger.warning("Ignoring non-string docker_extra_args entry: %r", arg)
                 continue
             validated_extra.append(arg)
+        if self._remote_endpoint and _extra_args_use_host_bind(validated_extra):
+            raise RuntimeError(
+                "docker_extra_args contains a host bind mount, but the Docker "
+                "daemon is remote; use a named volume or the artifact bridge"
+            )
         if egress_env_overrides:
             _extra_collisions = _extra_args_egress_collisions(
                 validated_extra, _critical_egress_names,
@@ -1367,6 +1557,20 @@ class DockerEnvironment(BaseEnvironment):
             + validated_extra
         )
         logger.info("Docker run_args: %s", all_run_args)
+        mount_fingerprint = hashlib.sha256(
+            json.dumps(
+                {
+                    "remote_endpoint": self._remote_endpoint,
+                    "security_args": security_args,
+                    "user_args": user_args,
+                    "writable_args": writable_args,
+                    "volume_args": volume_args,
+                    "extra_args": validated_extra,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()[:16]
 
         # Start the container directly via `docker run -d`.
         container_name = f"hermes-{uuid.uuid4().hex[:8]}"
@@ -1377,13 +1581,17 @@ class DockerEnvironment(BaseEnvironment):
         # Values are limited to the safe character set defined by
         # _sanitize_label_value(); the active Hermes profile is captured at
         # container-start time and never changes for the container's lifetime.
-        profile_name = _sanitize_label_value(_get_active_profile_name())
         task_label = _sanitize_label_value(task_id)
+        task_key = _identity_label_value(task_id)
+        profile_key = _identity_label_value(active_profile)
         label_args = [
             "--label", "hermes-agent=1",
             "--label", f"hermes-task-id={task_label}",
             "--label", f"hermes-profile={profile_name}",
+            "--label", f"{_TASK_KEY_LABEL_KEY}={task_key}",
+            "--label", f"{_PROFILE_KEY_LABEL_KEY}={profile_key}",
             "--label", f"{_EGRESS_LABEL_KEY}={egress_label}",
+            "--label", f"{_MOUNTS_LABEL_KEY}={mount_fingerprint}",
         ]
         # Save args for container recreation on "No such container" recovery.
         self._image = image
@@ -1395,7 +1603,10 @@ class DockerEnvironment(BaseEnvironment):
             "hermes-agent": "1",
             "hermes-task-id": task_label,
             "hermes-profile": profile_name,
+            _TASK_KEY_LABEL_KEY: task_key,
+            _PROFILE_KEY_LABEL_KEY: profile_key,
             _EGRESS_LABEL_KEY: egress_label,
+            _MOUNTS_LABEL_KEY: mount_fingerprint,
         }
 
         # Cross-process container reuse (issue #20561 — docs claim "ONE long-lived
@@ -1411,8 +1622,11 @@ class DockerEnvironment(BaseEnvironment):
         # would silently bypass the credential firewall.
         reused = False
         if persist_across_processes:
+            self._remove_stale_config_containers(
+                task_label, profile_name, egress_label, mount_fingerprint
+            )
             existing = self._find_reusable_container(
-                task_label, profile_name, egress_label,
+                task_label, profile_name, egress_label, mount_fingerprint,
             )
             if existing is not None:
                 container_id, state = existing
@@ -1526,11 +1740,16 @@ class DockerEnvironment(BaseEnvironment):
             self._container_id = result.stdout.strip()
             logger.info("Started container %s (%s)", container_name, self._container_id[:12])
 
+        # A generation identifies the exact container attachment represented
+        # by this environment, whether it was newly created or reused.
+        self._container_generation += 1
+
         # Build the init-time env forwarding args used to seed the snapshot.
         self._init_env_args = self._build_init_env_args()
 
         # Initialize session snapshot inside the container
         self.init_session()
+        self._stage_remote_auto_inputs()
 
     def _build_init_env_args(self) -> list[str]:
         """Build -e KEY=VALUE args for injecting host env vars into init_session.
@@ -1549,6 +1768,50 @@ class DockerEnvironment(BaseEnvironment):
         for key in sorted(exec_env):
             args.extend(["-e", f"{key}={exec_env[key]}"])
         return args
+
+    @property
+    def container_generation(self) -> int:
+        """Monotonic identity snapshot for artifact/lifecycle consumers."""
+        return self._container_generation
+
+    @property
+    def remote_endpoint(self) -> bool:
+        """Whether bind sources resolve on a different daemon host."""
+        return self._remote_endpoint
+
+    def _stage_remote_auto_inputs(self) -> None:
+        """Mirror declared credentials and skills when bind mounts are invalid."""
+        if not getattr(self, "_remote_endpoint", False):
+            return
+
+        from tools.credential_files import (
+            get_credential_file_mounts,
+            iter_skills_files,
+        )
+        from tools.environments.artifact_bridge import (
+            ArtifactBridge,
+            ArtifactTransferError,
+        )
+
+        entries = {
+            entry["container_path"]: entry["host_path"]
+            for entry in [*get_credential_file_mounts(), *iter_skills_files()]
+        }
+        for container_path, host_path in entries.items():
+            source = Path(host_path)
+            if not source.is_file():
+                continue
+            try:
+                ArtifactBridge(
+                    self,
+                    cache_dir=source.parent,
+                    host_roots=(source.parent,),
+                    container_roots=(posixpath.dirname(container_path) or "/",),
+                ).push(source, container_path)
+            except (ArtifactTransferError, OSError, ValueError) as exc:
+                raise RuntimeError(
+                    f"Docker remote input staging failed for {container_path}: {exc}"
+                ) from exc
 
     def _build_passthrough_env(self) -> dict[str, str]:
         """Resolve forwarded host variables through the active profile scope."""
@@ -1668,53 +1931,456 @@ class DockerEnvironment(BaseEnvironment):
                 return os.path.join(host_root, normalized[len(prefix):].lstrip("/"))
         return None
 
-    def fetch_file(self, container_path: str, local_dest: str) -> None:
+    def fetch_file(
+        self,
+        remote_path: str,
+        local_dest: str,
+        max_bytes: int | None = None,
+    ) -> None:
         """Copy a file out of the container to *local_dest* on the host.
 
         Persistent /root and /workspace are bind mounts, so those paths copy
         straight from the host-side view when it exists. Everything else
         streams through ``docker cp`` (the Archive API). ``-L`` dereferences
         symlinks inside the container so the copy can never land as a
-        host-side symlink.
+        host-side symlink. If the archive API cannot see a tmpfs/userspace
+        mount, a raw ``docker exec tar`` stream is used before the capped
+        base64 compatibility fallback.
         """
-        host_path = self._host_path_for(container_path)
+        host_path = self._host_path_for(remote_path)
         if host_path and os.path.isfile(host_path):
-            shutil.copy2(host_path, local_dest)
+            with open(host_path, "rb") as source, open(local_dest, "wb") as destination:
+                remaining = None if max_bytes is None else max_bytes + 1
+                while remaining is None or remaining > 0:
+                    amount = (
+                        1024 * 1024
+                        if remaining is None
+                        else min(1024 * 1024, remaining)
+                    )
+                    chunk = source.read(amount)
+                    if not chunk:
+                        break
+                    destination.write(chunk)
+                    if remaining is not None:
+                        remaining -= len(chunk)
+            if max_bytes is not None and os.path.getsize(local_dest) > max_bytes:
+                self._remove_local_transfer_target(local_dest)
+                raise FileFetchError(
+                    f"{remote_path!r} exceeds the {max_bytes}-byte transfer limit"
+                )
             return
 
         if not self._container_id:
             raise FileFetchError("Docker container not started")
-        try:
-            result = subprocess.run(
-                [self._docker_exe, "cp", "-L",
-                 f"{self._container_id}:{container_path}", local_dest],
-                capture_output=True,
-                text=True,
-                timeout=_FETCH_TIMEOUT_SECONDS,
-                stdin=subprocess.DEVNULL,
-            )
-        except subprocess.TimeoutExpired:
-            raise FileFetchError(f"docker cp of {container_path!r} timed out")
-        if result.returncode != 0:
+        result = None
+        cp_error: FileFetchError | None = None
+        if max_bytes is not None:
+            try:
+                self._fetch_file_with_cp_archive(
+                    remote_path, local_dest, max_bytes=max_bytes
+                )
+                return
+            except FileFetchError as exc:
+                cp_error = exc
+        else:
+            try:
+                result = subprocess.run(
+                    [self._docker_exe, "cp", "-L",
+                     f"{self._container_id}:{remote_path}", local_dest],
+                    capture_output=True,
+                    text=True,
+                    timeout=_FETCH_TIMEOUT_SECONDS,
+                    stdin=subprocess.DEVNULL,
+                )
+            except subprocess.TimeoutExpired:
+                result = None
+        if cp_error is not None or result is None or result.returncode != 0:
             # The archive API reads the container's ROOTFS LAYERS, not the
             # mounts stacked on top of them: a file on a tmpfs (/root and
             # /workspace are tmpfs whenever container_persistent is false) is
             # reported as "Could not find the file" even though the container
             # sees it, and a userspace runtime like gVisor widens the gap.
             # The exec channel reads the container's real view, so fall back
-            # to the base64 transport instead of declaring the file missing.
+            # to raw tar instead of declaring the file missing.
+            if cp_error is not None:
+                detail = str(cp_error)
+            else:
+                detail = "timed out" if result is None else result.stderr.strip()
             logger.info(
-                "docker cp of %r failed (%s) — falling back to the exec "
-                "transport (tmpfs / userspace-runtime paths are invisible to "
-                "the archive API)",
-                container_path, result.stderr.strip(),
+                "docker cp of %r failed (%s) — falling back to raw exec-tar",
+                remote_path, detail,
             )
-            super().fetch_file(container_path, local_dest)
-            return
+            self._remove_local_transfer_target(local_dest)
+            try:
+                if max_bytes is None:
+                    self._fetch_file_with_tar(remote_path, local_dest)
+                else:
+                    self._fetch_file_with_tar(
+                        remote_path, local_dest, max_bytes=max_bytes
+                    )
+                return
+            except FileFetchError as tar_error:
+                size = self.fetch_file_size(remote_path)
+                fallback_limit = self._base64_transfer_limit_bytes
+                if max_bytes is not None:
+                    fallback_limit = min(fallback_limit, max_bytes)
+                if size is None or size > fallback_limit:
+                    raise tar_error
+                logger.info(
+                    "exec-tar pull of %r failed — using capped base64 fallback",
+                    remote_path,
+                )
+                super().fetch_file(
+                    remote_path, local_dest, max_bytes=fallback_limit
+                )
+                return
         if not os.path.isfile(local_dest):
             # docker cp of a directory materializes a directory — reject it.
             shutil.rmtree(local_dest, ignore_errors=True)
-            raise FileFetchError(f"{container_path!r} is not a regular file")
+            raise FileFetchError(f"{remote_path!r} is not a regular file")
+
+    @staticmethod
+    def _remove_local_transfer_target(path: str) -> None:
+        target = Path(path)
+        try:
+            if target.is_dir() and not target.is_symlink():
+                shutil.rmtree(target)
+            else:
+                target.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def _fetch_file_with_cp_archive(
+        self,
+        container_path: str,
+        local_dest: str,
+        *,
+        max_bytes: int,
+    ) -> None:
+        """Pull one bounded file through Docker's Archive API."""
+        if not self._container_id:
+            raise FileFetchError("Docker container not started")
+        normalized = posixpath.normpath(container_path)
+        if not normalized.startswith("/") or normalized == "/":
+            raise FileFetchError(
+                f"invalid container artifact path: {container_path!r}"
+            )
+        self._fetch_file_from_archive_command(
+            [
+                self._docker_exe,
+                "cp",
+                "-L",
+                f"{self._container_id}:{normalized}",
+                "-",
+            ],
+            container_path,
+            local_dest,
+            max_bytes=max_bytes,
+            transport="docker cp",
+        )
+
+    def _fetch_file_from_archive_command(
+        self,
+        command: list[str],
+        container_path: str,
+        local_dest: str,
+        *,
+        max_bytes: int,
+        transport: str,
+    ) -> None:
+        """Extract one regular file from a bounded streaming tar command."""
+        basename = posixpath.basename(posixpath.normpath(container_path))
+        process = None
+        timeout_timer = None
+        try:
+            with tempfile.TemporaryFile() as stderr:
+                process = subprocess.Popen(
+                    command,
+                    stdout=subprocess.PIPE,
+                    stderr=stderr,
+                    stdin=subprocess.DEVNULL,
+                )
+                if process.stdout is None:
+                    raise FileFetchError(f"{transport} pull produced no stream")
+                timeout_timer = threading.Timer(
+                    _FETCH_TIMEOUT_SECONDS,
+                    lambda: process.kill() if process.poll() is None else None,
+                )
+                timeout_timer.daemon = True
+                timeout_timer.start()
+                with process.stdout:
+                    with tarfile.open(fileobj=process.stdout, mode="r|*") as stream:
+                        members = iter(stream)
+                        member = next(members, None)
+                        if member is None:
+                            raise FileFetchError(
+                                f"{transport} pull of {container_path!r} returned no entries"
+                            )
+                        if (
+                            posixpath.basename(posixpath.normpath(member.name))
+                            != basename
+                            or not member.isfile()
+                        ):
+                            raise FileFetchError(
+                                f"{container_path!r} is not a regular file"
+                            )
+                        if member.size > max_bytes:
+                            raise FileFetchError(
+                                f"{container_path!r} exceeds the "
+                                f"{max_bytes}-byte transfer limit"
+                            )
+                        source = stream.extractfile(member)
+                        if source is None:
+                            raise FileFetchError(
+                                f"{transport} pull of {container_path!r} "
+                                "produced no payload"
+                            )
+                        with open(local_dest, "wb") as destination:
+                            shutil.copyfileobj(
+                                source, destination, length=1024 * 1024
+                            )
+                        if next(members, None) is not None:
+                            raise FileFetchError(
+                                f"{transport} pull of {container_path!r} "
+                                "returned multiple entries"
+                            )
+                returncode = process.wait(timeout=_FETCH_TIMEOUT_SECONDS)
+                if returncode != 0:
+                    stderr.seek(0)
+                    detail = stderr.read().decode("utf-8", "replace").strip()
+                    raise FileFetchError(
+                        f"{transport} pull of {container_path!r} failed: {detail}"
+                    )
+        except subprocess.TimeoutExpired as exc:
+            self._remove_local_transfer_target(local_dest)
+            raise FileFetchError(
+                f"{transport} pull of {container_path!r} timed out"
+            ) from exc
+        except FileFetchError:
+            self._remove_local_transfer_target(local_dest)
+            raise
+        except (OSError, tarfile.TarError) as exc:
+            self._remove_local_transfer_target(local_dest)
+            raise FileFetchError(
+                f"{transport} pull of {container_path!r} failed: {exc}"
+            ) from exc
+        finally:
+            if timeout_timer is not None:
+                timeout_timer.cancel()
+            if process is not None and process.poll() is None:
+                process.kill()
+                process.wait()
+
+    def _fetch_file_with_tar(
+        self,
+        container_path: str,
+        local_dest: str,
+        max_bytes: int | None = None,
+    ) -> None:
+        """Pull one file through raw tar bytes with a header-level size cap."""
+        if not self._container_id:
+            raise FileFetchError("Docker container not started")
+        normalized = posixpath.normpath(container_path)
+        if not normalized.startswith("/") or normalized == "/":
+            raise FileFetchError(f"invalid container artifact path: {container_path!r}")
+        parent = posixpath.dirname(normalized)
+        basename = posixpath.basename(normalized)
+        command = [
+            self._docker_exe,
+            "exec",
+            self._container_id,
+            "tar",
+            "-cf",
+            "-",
+            "-C",
+            parent,
+            f"./{basename}",
+        ]
+        if max_bytes is None:
+            try:
+                with tempfile.TemporaryFile() as archive:
+                    result = subprocess.run(
+                        command,
+                        stdout=archive,
+                        stderr=subprocess.PIPE,
+                        timeout=_FETCH_TIMEOUT_SECONDS,
+                        stdin=subprocess.DEVNULL,
+                    )
+                    if result.returncode != 0:
+                        detail = (result.stderr or b"").decode(
+                            "utf-8", "replace"
+                        ).strip()
+                        raise FileFetchError(
+                            f"exec-tar pull of {container_path!r} failed: {detail}"
+                        )
+                    archive.seek(0)
+                    with tarfile.open(fileobj=archive, mode="r:*") as stream:
+                        members = stream.getmembers()
+                        if len(members) != 1:
+                            raise FileFetchError(
+                                f"exec-tar pull of {container_path!r} returned "
+                                f"{len(members)} entries"
+                            )
+                        member = members[0]
+                        member_name = posixpath.normpath(member.name)
+                        if member_name != basename or not member.isfile():
+                            raise FileFetchError(
+                                f"{container_path!r} is not a regular file"
+                            )
+                        source = stream.extractfile(member)
+                        if source is None:
+                            raise FileFetchError(
+                                f"exec-tar pull of {container_path!r} produced no payload"
+                            )
+                        with open(local_dest, "wb") as destination:
+                            shutil.copyfileobj(
+                                source, destination, length=1024 * 1024
+                            )
+                return
+            except subprocess.TimeoutExpired as exc:
+                self._remove_local_transfer_target(local_dest)
+                raise FileFetchError(
+                    f"exec-tar pull of {container_path!r} timed out"
+                ) from exc
+            except (OSError, tarfile.TarError) as exc:
+                self._remove_local_transfer_target(local_dest)
+                raise FileFetchError(
+                    f"exec-tar pull of {container_path!r} failed: {exc}"
+                ) from exc
+
+        self._fetch_file_from_archive_command(
+            command,
+            container_path,
+            local_dest,
+            max_bytes=max_bytes,
+            transport="exec-tar",
+        )
+
+    def put_file(self, local_source: str, remote_dest: str) -> None:
+        """Push one file through docker cp, raw exec-tar, then capped base64."""
+        if not self._container_id:
+            raise FileFetchError("Docker container not started")
+        source = Path(local_source)
+        if not source.is_file():
+            raise FileFetchError(f"{local_source!r} is not a regular file")
+        digest = hashlib.sha256()
+        with source.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        expected = (source.stat().st_size, digest.hexdigest())
+        try:
+            result = subprocess.run(
+                [
+                    self._docker_exe,
+                    "cp",
+                    "-L",
+                    str(source),
+                    f"{self._container_id}:{remote_dest}",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=_FETCH_TIMEOUT_SECONDS,
+                stdin=subprocess.DEVNULL,
+            )
+        except subprocess.TimeoutExpired:
+            result = None
+        if result is not None and result.returncode == 0:
+            if self.fetch_file_metadata(remote_dest) == expected:
+                return
+            detail = "destination verification failed after a successful copy"
+        else:
+            detail = "timed out" if result is None else result.stderr.strip()
+
+        logger.info(
+            "docker cp push to %r failed (%s) — falling back to raw exec-tar",
+            remote_dest, detail,
+        )
+        self._remove_remote_transfer_target(remote_dest)
+        try:
+            self._put_file_with_tar(str(source), remote_dest)
+            return
+        except FileFetchError as tar_error:
+            if source.stat().st_size > self._base64_transfer_limit_bytes:
+                raise tar_error
+            logger.info(
+                "exec-tar push to %r failed — using capped base64 fallback",
+                remote_dest,
+            )
+            super().put_file(str(source), remote_dest)
+
+    def _remove_remote_transfer_target(self, remote_path: str) -> None:
+        if not self._container_id:
+            return
+        try:
+            subprocess.run(
+                [
+                    self._docker_exe,
+                    "exec",
+                    self._container_id,
+                    "rm",
+                    "-f",
+                    "--",
+                    remote_path,
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=30,
+                stdin=subprocess.DEVNULL,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+    def _put_file_with_tar(self, local_source: str, remote_dest: str) -> None:
+        """Push one file through raw tar bytes without buffering it in RAM."""
+        if not self._container_id:
+            raise FileFetchError("Docker container not started")
+        normalized = posixpath.normpath(remote_dest)
+        if not normalized.startswith("/") or normalized == "/":
+            raise FileFetchError(f"invalid container artifact path: {remote_dest!r}")
+        parent = posixpath.dirname(normalized)
+        basename = posixpath.basename(normalized)
+        source = Path(local_source)
+        try:
+            source_stat = source.stat()
+            with tempfile.TemporaryFile() as archive:
+                with tarfile.open(fileobj=archive, mode="w") as stream:
+                    member = tarfile.TarInfo(basename)
+                    member.size = source_stat.st_size
+                    member.mode = source_stat.st_mode & 0o777
+                    member.mtime = int(source_stat.st_mtime)
+                    with source.open("rb") as payload:
+                        stream.addfile(member, payload)
+                archive.seek(0)
+                result = subprocess.run(
+                    [
+                        self._docker_exe,
+                        "exec",
+                        "-i",
+                        self._container_id,
+                        "tar",
+                        "-xf",
+                        "-",
+                        "-C",
+                        parent,
+                    ],
+                    stdin=archive,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=_FETCH_TIMEOUT_SECONDS,
+                )
+            if result.returncode != 0:
+                detail = (result.stderr or b"").decode("utf-8", "replace").strip()
+                raise FileFetchError(
+                    f"exec-tar push to {remote_dest!r} failed: {detail}"
+                )
+        except subprocess.TimeoutExpired as exc:
+            raise FileFetchError(
+                f"exec-tar push to {remote_dest!r} timed out"
+            ) from exc
+        except (OSError, tarfile.TarError) as exc:
+            raise FileFetchError(
+                f"exec-tar push to {remote_dest!r} failed: {exc}"
+            ) from exc
 
     # ------------------------------------------------------------------
     # "No such container" recovery (issue #36266)
@@ -1749,6 +2415,7 @@ class DockerEnvironment(BaseEnvironment):
         profile_label = self._labels.get("hermes-profile", "")
         existing = self._find_reusable_container(
             task_label, profile_label, self._labels.get(_EGRESS_LABEL_KEY, "off"),
+            self._labels.get(_MOUNTS_LABEL_KEY, ""),
         )
         if existing is not None:
             cid, state = existing
@@ -1804,9 +2471,11 @@ class DockerEnvironment(BaseEnvironment):
                 return False
 
         # 3. Re-initialize session snapshot in the (re)created container.
+        self._container_generation += 1
         try:
             self._snapshot_ready = False
             self.init_session()
+            self._stage_remote_auto_inputs()
         except Exception as e:
             logger.error("Recovery: init_session failed in new container: %s", e)
             return False
@@ -1908,11 +2577,127 @@ class DockerEnvironment(BaseEnvironment):
         mode = result.stdout.strip()
         return mode or None
 
+    def _remove_stale_config_containers(
+        self,
+        task_label: str,
+        profile_label: str,
+        egress_label: str,
+        mounts_label: str,
+    ) -> None:
+        """Remove same-owner containers with immutable config mismatches."""
+        fmt = (
+            '{{.ID}}\t{{.Label "'
+            + _MOUNTS_LABEL_KEY
+            + '"}}\t{{.Label "'
+            + _EGRESS_LABEL_KEY
+            + '"}}\t{{.Label "'
+            + _TASK_KEY_LABEL_KEY
+            + '"}}\t{{.Label "'
+            + _PROFILE_KEY_LABEL_KEY
+            + '"}}'
+        )
+        task_key = self._labels.get(_TASK_KEY_LABEL_KEY, "")
+        profile_key = self._labels.get(_PROFILE_KEY_LABEL_KEY, "")
+        try:
+            result = subprocess.run(
+                [
+                    self._docker_exe,
+                    "ps",
+                    "-a",
+                    "--filter",
+                    "label=hermes-agent=1",
+                    "--filter",
+                    f"label=hermes-task-id={task_label}",
+                    "--filter",
+                    f"label=hermes-profile={profile_label}",
+                    "--format",
+                    fmt,
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=10,
+                check=False,
+                stdin=subprocess.DEVNULL,
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            logger.warning("Could not inspect stale Docker containers: %s", exc)
+            return
+        if result.returncode != 0:
+            logger.warning(
+                "Could not inspect stale Docker containers: %s",
+                result.stderr.strip(),
+            )
+            return
+
+        for line in result.stdout.splitlines():
+            parts = line.split("\t")
+            if len(parts) != 5:
+                continue
+            (
+                container_id,
+                actual_mounts,
+                actual_egress,
+                actual_task_key,
+                actual_profile_key,
+            ) = parts
+            missing_labels = {"", "<no value>"}
+            task_key_missing = actual_task_key in missing_labels
+            profile_key_missing = actual_profile_key in missing_labels
+            if task_key_missing != profile_key_missing:
+                logger.warning(
+                    "Ignoring Docker container %s with incomplete identity labels",
+                    container_id[:12],
+                )
+                continue
+            legacy_identity = task_key_missing and profile_key_missing
+            if legacy_identity:
+                raise RuntimeError(
+                    "found a legacy Hermes Docker container whose exact task/profile "
+                    f"identity cannot be verified ({container_id[:12]}). Remove or "
+                    "reset that container before retrying; Hermes will not reuse, "
+                    "replace, or race an identity-unknown container."
+                )
+            if not legacy_identity and (
+                actual_task_key != task_key or actual_profile_key != profile_key
+            ):
+                # Sanitized legacy labels can collide. Never remove a container
+                # whose exact identity labels belong to another task/profile.
+                continue
+            egress_matches = (
+                actual_egress in {"", "off"}
+                if egress_label == "off"
+                else actual_egress == egress_label
+            )
+            if actual_mounts == mounts_label and egress_matches:
+                continue
+            removed = subprocess.run(
+                [self._docker_exe, "rm", "-f", container_id],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=30,
+                check=False,
+                stdin=subprocess.DEVNULL,
+            )
+            if removed.returncode != 0:
+                raise RuntimeError(
+                    "could not remove stale Docker container "
+                    f"{container_id[:12]}: {removed.stderr.strip()}"
+                )
+            logger.info(
+                "Removed stale Docker container %s after identity/config change",
+                container_id[:12],
+            )
+
     def _find_reusable_container(
         self,
         task_label: str,
         profile_label: str,
         egress_label: str,
+        mounts_label: str,
     ) -> Optional[tuple[str, str]]:
         """Look for an existing container labeled for this (task, profile).
 
@@ -1931,7 +2716,18 @@ class DockerEnvironment(BaseEnvironment):
                 "--filter", "label=hermes-agent=1",
                 "--filter", f"label=hermes-task-id={task_label}",
                 "--filter", f"label=hermes-profile={profile_label}",
+                "--filter", f"label={_MOUNTS_LABEL_KEY}={mounts_label}",
             ]
+            task_key = self._labels.get(_TASK_KEY_LABEL_KEY, "")
+            profile_key = self._labels.get(_PROFILE_KEY_LABEL_KEY, "")
+            if task_key:
+                filters.extend(
+                    ["--filter", f"label={_TASK_KEY_LABEL_KEY}={task_key}"]
+                )
+            if profile_key:
+                filters.extend(
+                    ["--filter", f"label={_PROFILE_KEY_LABEL_KEY}={profile_key}"]
+                )
             if egress_label != "off":
                 filters.extend(["--filter", f"label={_EGRESS_LABEL_KEY}={egress_label}"])
                 fmt = "{{.ID}}\t{{.State}}"

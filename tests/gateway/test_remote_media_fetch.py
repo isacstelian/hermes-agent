@@ -8,15 +8,21 @@ and a failed fetch still produces the user-facing notice.
 """
 
 import asyncio
+import hashlib
+import shlex
+from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
 from gateway.media_fetch import (
     MEDIA_FETCH_MAX_BYTES_ENV,
+    acquire_media_delivery_lease,
     fetch_remote_media,
     media_fetch_max_bytes,
     remote_path_is_denied,
+    stage_inbound_media,
 )
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
@@ -32,10 +38,12 @@ from tools.environments.base import FileFetchError
 class _FakeRemoteEnv:
     """Duck-typed environment serving files from an in-memory dict."""
 
-    def __init__(self, files=None, home="/root", links=None):
+    def __init__(self, files=None, home="/root", links=None, remote_endpoint=True):
         self.files = files or {}
         self.links = links or {}
         self._remote_home = home
+        self.remote_endpoint = remote_endpoint
+        self.container_generation = 1
         self.fetched = []
 
     @property
@@ -49,13 +57,42 @@ class _FakeRemoteEnv:
         data = self.files.get(remote_path)
         return None if data is None else len(data)
 
-    def fetch_file(self, remote_path, local_dest):
+    def fetch_file_metadata(self, remote_path):
+        data = self.files.get(remote_path)
+        if data is None:
+            return None
+        return len(data), hashlib.sha256(data).hexdigest()
+
+    def fetch_file(self, remote_path, local_dest, max_bytes=None):
         data = self.files.get(remote_path)
         if data is None:
             raise FileFetchError(f"{remote_path!r} not found")
+        if max_bytes is not None and len(data) > max_bytes:
+            raise FileFetchError("artifact exceeds transfer limit")
         self.fetched.append(remote_path)
         with open(local_dest, "wb") as f:
             f.write(data)
+
+    def put_file(self, local_source, remote_dest):
+        with open(local_source, "rb") as stream:
+            self.files[remote_dest] = stream.read()
+
+    def execute(self, command, **_kwargs):
+        argv = shlex.split(command)
+        if argv[:3] == ["mkdir", "-p", "--"]:
+            return {"returncode": 0, "output": ""}
+        if argv[:3] == ["mv", "-f", "--"]:
+            source, destination = argv[3:5]
+            self.files[destination] = self.files.pop(source)
+            return {"returncode": 0, "output": ""}
+        if argv[:2] == ["ln", "--"]:
+            source, destination = argv[2:4]
+            self.files[destination] = self.files[source]
+            return {"returncode": 0, "output": ""}
+        if argv[:3] == ["rm", "-f", "--"]:
+            self.files.pop(argv[3], None)
+            return {"returncode": 0, "output": ""}
+        return {"returncode": 1, "output": "unsupported command"}
 
 
 @pytest.fixture()
@@ -119,8 +156,10 @@ class TestFetchRemoteMedia:
         local, reason = fetch_remote_media("/root/raport.xlsx", "session-1")
 
         assert reason is None
-        assert local and open(local, "rb").read() == b"xlsx bytes"
-        assert env.fetched == ["/root/raport.xlsx"]
+        assert local and Path(local).read_bytes() == b"xlsx bytes"
+        assert len(env.fetched) == 1
+        assert env.fetched[0].startswith("/root/.raport.xlsx.hermes-artifact-")
+        assert env.fetched[0].endswith(".snapshot")
         assert "raport.xlsx" in local
 
     def test_missing_in_backend_reports_reason(self, remote_backend):
@@ -162,6 +201,17 @@ class TestFetchRemoteMedia:
         assert "delivery limit" in reason
         assert env.fetched == []
 
+    def test_platform_limit_overrides_global_fetch_default(self, remote_backend):
+        env = remote_backend(_FakeRemoteEnv({"/root/big.zip": b"x" * 2048}))
+
+        local, reason = fetch_remote_media(
+            "/root/big.zip", "session-1", max_bytes=1024
+        )
+
+        assert local is None
+        assert "1.0 KB delivery limit" in reason
+        assert env.fetched == []
+
     def test_no_active_session_reports_reason(self, tmp_path, monkeypatch):
         monkeypatch.setenv("TERMINAL_ENV", "docker")
         monkeypatch.setattr("tools.terminal_tool.get_active_env", lambda task_id: None)
@@ -170,6 +220,25 @@ class TestFetchRemoteMedia:
 
         assert local is None
         assert "no active docker terminal session" in reason
+
+    def test_session_miss_does_not_fall_back_to_foreign_default_env(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+        monkeypatch.setattr(
+            "gateway.platforms.base.DOCUMENT_CACHE_DIR", tmp_path / "doc_cache"
+        )
+        foreign = _FakeRemoteEnv({"/root/raport.xlsx": b"foreign session"})
+        monkeypatch.setattr(
+            "tools.terminal_tool.get_active_env",
+            lambda task_id: foreign if task_id == "default" else None,
+        )
+
+        local, reason = fetch_remote_media("/root/raport.xlsx", "session-1")
+
+        assert local is None
+        assert "no active docker terminal session" in reason
+        assert foreign.fetched == []
 
     def test_local_backend_does_not_fetch(self, monkeypatch):
         monkeypatch.setenv("TERMINAL_ENV", "local")
@@ -188,6 +257,112 @@ class TestFetchRemoteMedia:
         assert media_fetch_max_bytes() == 50 * 1024 * 1024
 
 
+class TestMediaDeliveryLease:
+    def test_remote_backend_acquires_before_environment_exists(self, monkeypatch):
+        sentinel = object()
+        seen = []
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+        monkeypatch.setattr(
+            "tools.terminal_tool.acquire_environment_lease",
+            lambda task_id: seen.append(task_id) or sentinel,
+        )
+
+        assert acquire_media_delivery_lease("session-1") is sentinel
+        assert seen == ["session-1"]
+
+    def test_local_backend_does_not_acquire(self, monkeypatch):
+        monkeypatch.setenv("TERMINAL_ENV", "local")
+        resolved = []
+
+        assert acquire_media_delivery_lease(
+            task_id_factory=lambda: resolved.append(True) or "session-1"
+        ) is None
+        assert resolved == []
+
+
+class TestInboundMediaStaging:
+    @pytest.fixture()
+    def cache_mount(self, tmp_path, monkeypatch):
+        host_cache = tmp_path / "documents"
+        host_cache.mkdir()
+        container_cache = "/root/.hermes/cache/documents"
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+        monkeypatch.setattr(
+            "tools.credential_files.get_cache_directory_mounts",
+            lambda **_kwargs: [{
+                "host_path": str(host_cache),
+                "container_path": container_cache,
+            }],
+        )
+        return host_cache, container_cache
+
+    @pytest.mark.parametrize("agent_visible", [False, True])
+    def test_pushes_direct_and_replied_document_paths(
+        self, cache_mount, monkeypatch, agent_visible
+    ):
+        host_cache, container_cache = cache_mount
+        document = host_cache / "Audit Creste cu Magic.pdf"
+        document.write_bytes(b"%PDF-1.7\ntelegram attachment")
+        env = _FakeRemoteEnv()
+        monkeypatch.setattr("tools.terminal_tool.ensure_task_env", lambda task_id: env)
+        input_path = (
+            f"{container_cache}/{document.name}" if agent_visible else str(document)
+        )
+
+        failures = stage_inbound_media([input_path], "session-1")
+
+        assert failures == []
+        assert env.files[f"{container_cache}/{document.name}"] == document.read_bytes()
+
+    def test_local_daemon_relies_on_bind_mount(self, cache_mount, monkeypatch):
+        host_cache, _container_cache = cache_mount
+        document = host_cache / "report.pdf"
+        document.write_bytes(b"%PDF")
+        env = _FakeRemoteEnv(remote_endpoint=False)
+        monkeypatch.setattr("tools.terminal_tool.ensure_task_env", lambda task_id: env)
+
+        assert stage_inbound_media([str(document)], "session-1") == []
+        assert env.files == {}
+
+    def test_missing_remote_environment_is_reported(self, cache_mount, monkeypatch):
+        host_cache, _container_cache = cache_mount
+        document = host_cache / "report.pdf"
+        document.write_bytes(b"%PDF")
+        monkeypatch.setattr("tools.terminal_tool.ensure_task_env", lambda task_id: None)
+
+        failures = stage_inbound_media([str(document)], "session-1")
+
+        assert failures == [("report.pdf", "remote Docker environment unavailable")]
+
+    @pytest.mark.asyncio
+    async def test_gateway_stages_event_media_before_agent_run(self, monkeypatch):
+        from gateway.run import GatewayRunner
+
+        runner = object.__new__(GatewayRunner)
+        runner.config = SimpleNamespace(multiplex_profiles=False)
+        runner._prepare_inbound_message_text = AsyncMock(return_value="read attachment")
+        runner._agent_task_id_for_source = lambda source: "agent-session"
+        staged = []
+        monkeypatch.setattr(
+            "gateway.media_fetch.stage_inbound_media",
+            lambda paths, task_id: staged.append((paths, task_id)) or [],
+        )
+        source = SessionSource(platform=Platform.TELEGRAM, chat_id="123")
+        event = MessageEvent(
+            text="read it",
+            source=source,
+            media_urls=["/root/.hermes/cache/documents/Audit.pdf"],
+        )
+
+        prepared = await runner._prepare_profile_scoped_inbound_message_text(
+            event=event, source=source, history=[]
+        )
+
+        assert prepared == "read attachment"
+        assert staged == [([event.media_urls[0]], "agent-session")]
+
+
+
 class TestFilterUsesTheFetch:
     """The incident shape: MEDIA:/root/raport.xlsx from a sandboxed agent."""
 
@@ -202,7 +377,22 @@ class TestFilterUsesTheFetch:
         assert len(safe) == 1
         path, is_voice = safe[0]
         assert is_voice is False
-        assert open(path, "rb").read() == b"xlsx"
+        assert Path(path).read_bytes() == b"xlsx"
+
+    @pytest.mark.parametrize("name", ["Caddyfile", "script.py", "data.weirdext"])
+    def test_explicit_media_is_extension_agnostic(self, remote_backend, name):
+        remote_path = f"/workspace/{name}"
+        remote_backend(_FakeRemoteEnv({remote_path: b"artifact"}))
+
+        media, cleaned = BasePlatformAdapter.extract_media(f"done\nMEDIA:{remote_path}")
+        safe, dropped = BasePlatformAdapter.filter_media_delivery_paths_with_drops(
+            media, "session-1"
+        )
+
+        assert cleaned.strip() == "done"
+        assert dropped == []
+        assert len(safe) == 1
+        assert Path(safe[0][0]).read_bytes() == b"artifact"
 
     def test_failed_fetch_still_reports_the_drop(self, remote_backend):
         remote_backend(_FakeRemoteEnv({}))
@@ -337,5 +527,71 @@ class TestSandboxLookupUsesTheAgentSessionId:
         )
 
         assert len(adapter.documents) == 1, adapter.sent
-        assert open(adapter.documents[0], "rb").read() == b"lucrator,total\n"
+        assert Path(adapter.documents[0]).read_bytes() == b"lucrator,total\n"
         assert all("Couldn't deliver" not in s for s in adapter.sent), adapter.sent
+
+    @pytest.mark.asyncio
+    async def test_session_rotation_keeps_pre_rotation_artifact_environment(
+        self, tmp_path, monkeypatch
+    ):
+        old_session = "session-before-compression"
+        current_session = [old_session]
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+        monkeypatch.setattr(
+            "gateway.platforms.base.DOCUMENT_CACHE_DIR", tmp_path / "doc_cache"
+        )
+        env = _FakeRemoteEnv({"/root/report.pdf": b"%PDF-old-session"})
+        monkeypatch.setattr(
+            "tools.terminal_tool.get_active_env",
+            lambda task_id: env if task_id == old_session else None,
+        )
+        adapter = _SessionKeyedAdapter(old_session)
+        adapter._session_store = SimpleNamespace(
+            peek_session_id=lambda _key: current_session[0]
+        )
+        adapter._keep_typing = _hold_typing
+
+        async def handler(_event):
+            current_session[0] = "session-after-compression"
+            return "MEDIA:/root/report.pdf"
+
+        adapter.set_message_handler(handler)
+        event = MessageEvent(
+            text="raport",
+            source=SessionSource(platform=Platform.TELEGRAM, chat_id="111"),
+        )
+
+        await adapter._process_message_background(
+            event, build_session_key(event.source)
+        )
+
+        assert len(adapter.documents) == 1, adapter.sent
+        assert Path(adapter.documents[0]).read_bytes() == b"%PDF-old-session"
+
+    @pytest.mark.asyncio
+    async def test_adapter_holds_environment_lease_through_delivery(self, monkeypatch):
+        session_id = "session-with-artifact"
+        acquired = []
+        released = []
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+        monkeypatch.setattr(
+            "tools.terminal_tool.acquire_environment_lease",
+            lambda task_id: acquired.append(task_id)
+            or SimpleNamespace(release=lambda: released.append(task_id)),
+        )
+        adapter = _SessionKeyedAdapter(session_id)
+        adapter._keep_typing = _hold_typing
+        adapter.set_message_handler(lambda _event: asyncio.sleep(0, result="done"))
+        event = MessageEvent(
+            text="run",
+            source=SessionSource(
+                platform=Platform.TELEGRAM, chat_id="111", chat_type="dm"
+            ),
+        )
+
+        await adapter._process_message_background(
+            event, build_session_key(event.source)
+        )
+
+        assert acquired == [session_id]
+        assert released == [session_id]
