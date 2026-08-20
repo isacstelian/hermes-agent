@@ -32,6 +32,20 @@ def test_default_context_is_local_without_inspection(monkeypatch):
     assert docker_env.docker_endpoint_is_remote("docker") is False
 
 
+def test_explicit_context_overrides_docker_host(monkeypatch):
+    monkeypatch.setenv("DOCKER_HOST", "unix:///var/run/docker.sock")
+    monkeypatch.setenv("DOCKER_CONTEXT", "remote-board")
+    monkeypatch.setattr(
+        docker_env.subprocess,
+        "run",
+        lambda cmd, **kwargs: subprocess.CompletedProcess(
+            cmd, 0, stdout="ssh://board-host\n", stderr=""
+        ),
+    )
+
+    assert docker_env.docker_endpoint_is_remote("docker") is True
+
+
 @pytest.mark.parametrize(
     ("endpoint", "remote"),
     [

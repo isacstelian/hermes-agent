@@ -1446,7 +1446,13 @@ class BaseEnvironment(ABC):
         quoted = shlex.quote(remote_path)
         result = self.execute(
             f"test -f {quoted} && size=$(wc -c < {quoted}) && "
-            f"digest=$(sha256sum {quoted} 2>/dev/null | awk '{{print $1}}') && "
+            "if command -v sha256sum >/dev/null 2>&1; then "
+            f"digest=$(sha256sum {quoted} 2>/dev/null | awk '{{print $1}}'); "
+            "elif command -v shasum >/dev/null 2>&1; then "
+            f"digest=$(shasum -a 256 {quoted} 2>/dev/null | awk '{{print $1}}'); "
+            "elif command -v openssl >/dev/null 2>&1; then "
+            f"digest=$(openssl dgst -sha256 {quoted} 2>/dev/null | awk '{{print $NF}}'); "
+            "else exit 127; fi && "
             "printf '%s %s\\n' \"$size\" \"$digest\"",
             rewrite_compound_background=False,
         )
@@ -1480,7 +1486,12 @@ class BaseEnvironment(ABC):
                 return line
         return None
 
-    def fetch_file(self, remote_path: str, local_dest: str) -> None:
+    def fetch_file(
+        self,
+        remote_path: str,
+        local_dest: str,
+        max_bytes: int | None = None,
+    ) -> None:
         """Copy *remote_path* out of the backend to *local_dest* on the host.
 
         Raises :class:`FileFetchError` on any failure. Default transport is
@@ -1493,9 +1504,19 @@ class BaseEnvironment(ABC):
         """
         marker = f"__HERMES_FETCH_{uuid.uuid4().hex[:12]}__"
         quoted = shlex.quote(remote_path)
+        if max_bytes is not None:
+            if max_bytes < 0:
+                raise FileFetchError("transfer limit must be non-negative")
+            block_size = 64 * 1024
+            block_count = ((max_bytes + 1) + block_size - 1) // block_size
+            payload_command = (
+                f"dd if={quoted} bs={block_size} count={block_count} 2>/dev/null | base64"
+            )
+        else:
+            payload_command = f"base64 < {quoted} 2>/dev/null"
         result = self.execute(
             f"[ -f {quoted} ] && echo {marker} && "
-            f"base64 < {quoted} 2>/dev/null && echo {marker}",
+            f"{payload_command} && echo {marker}",
             timeout=_FETCH_TIMEOUT_SECONDS,
             rewrite_compound_background=False,
         )
@@ -1516,6 +1537,10 @@ class BaseEnvironment(ABC):
             raise FileFetchError(
                 f"transfer of {remote_path!r} was corrupted in transit: {exc}"
             ) from exc
+        if max_bytes is not None and len(data) > max_bytes:
+            raise FileFetchError(
+                f"{remote_path!r} exceeds the {max_bytes}-byte transfer limit"
+            )
         Path(local_dest).write_bytes(data)
 
     def put_file(self, local_source: str, remote_dest: str) -> None:

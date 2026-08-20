@@ -31,7 +31,9 @@ class ArtifactEnvironment(Protocol):
 
     def fetch_file_metadata(self, remote_path: str) -> tuple[int, str] | None: ...
 
-    def fetch_file(self, remote_path: str, local_dest: str) -> None: ...
+    def fetch_file(
+        self, remote_path: str, local_dest: str, max_bytes: int | None = None
+    ) -> None: ...
 
     def put_file(self, local_source: str, remote_dest: str) -> None: ...
 
@@ -130,6 +132,56 @@ class ArtifactBridge:
             raise ArtifactSecurityError(f"host artifact is not a regular file: {path!s}")
         return resolved
 
+    def _snapshot_host_source(self, source: Path) -> Path:
+        """Copy one already-validated host file through a stable descriptor."""
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            source_fd = os.open(source, flags)
+        except OSError as exc:
+            raise ArtifactSecurityError(
+                f"host artifact changed or became unavailable: {source!s}"
+            ) from exc
+        snapshot = self._cache_dir / (
+            f".hermes-host-artifact-{uuid.uuid4().hex}.tmp"
+        )
+        destination_fd = -1
+        completed = False
+        try:
+            opened = os.fstat(source_fd)
+            current = os.lstat(source)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or not stat.S_ISREG(current.st_mode)
+                or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)
+            ):
+                raise ArtifactSecurityError(
+                    f"host artifact changed after validation: {source!s}"
+                )
+            destination_fd = os.open(
+                snapshot,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            with os.fdopen(source_fd, "rb", closefd=False) as reader, os.fdopen(
+                destination_fd, "wb", closefd=False
+            ) as writer:
+                for chunk in iter(lambda: reader.read(1024 * 1024), b""):
+                    writer.write(chunk)
+            completed = True
+            return snapshot
+        except ArtifactSecurityError:
+            raise
+        except OSError as exc:
+            raise ArtifactSecurityError(
+                f"host artifact changed or became unavailable: {source!s}"
+            ) from exc
+        finally:
+            os.close(source_fd)
+            if destination_fd >= 0:
+                os.close(destination_fd)
+            if not completed:
+                snapshot.unlink(missing_ok=True)
+
     def _guard_host_destination(self, path: Path) -> Path:
         try:
             resolved = path.expanduser().resolve(strict=False)
@@ -216,66 +268,105 @@ class ArtifactBridge:
         container_path: str,
         *,
         destination: str | Path | None = None,
+        max_bytes: int | None = None,
     ) -> Path:
         """Pull a regular file into the host cache and return its final path."""
         self._assert_generation()
         requested = self._guard_container_lexical(container_path)
         source = self._guard_container_resolved(requested)
         self._assert_generation()
-        before = self._environment.fetch_file_metadata(source)
+        source_snapshot = posixpath.join(
+            posixpath.dirname(source) or "/",
+            f".{posixpath.basename(source)}.hermes-artifact-{uuid.uuid4().hex}.snapshot",
+        )
+        linked = self._environment.execute(
+            f"ln -- {shlex.quote(source)} {shlex.quote(source_snapshot)}",
+            rewrite_compound_background=False,
+        )
         self._assert_generation()
-        if before is None:
+        if int(linked.get("returncode") or 0) != 0:
             raise ArtifactTransferError(
-                f"container artifact is missing or not a regular file: {container_path}"
+                f"could not snapshot container artifact: {container_path!r}"
             )
-
-        if destination is None:
-            name = posixpath.basename(requested) or "artifact"
-            destination_path = self._cache_dir / f"{uuid.uuid4().hex}-{name}"
-        else:
-            destination_path = Path(destination)
-        destination_path = self._guard_host_destination(destination_path)
-        destination_path.parent.mkdir(parents=True, exist_ok=True)
-        destination_path = self._guard_host_destination(destination_path)
-
-        temp_path = destination_path.parent / (
-            f".{destination_path.name}.hermes-artifact-{uuid.uuid4().hex}.tmp"
-        )
-        descriptor = os.open(
-            temp_path,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-            0o600,
-        )
-        os.close(descriptor)
         try:
-            self._environment.fetch_file(source, str(temp_path))
+            source_snapshot = self._guard_container_resolved(source_snapshot)
+            before = self._environment.fetch_file_metadata(source_snapshot)
             self._assert_generation()
-            actual = _sha256(temp_path)
-            after = self._environment.fetch_file_metadata(source)
-            self._assert_generation()
-            if after is None or before != after or not self._verified(actual, before):
+            if before is None:
                 raise ArtifactTransferError(
-                    f"artifact verification failed while pulling {container_path!r}"
+                    f"container artifact is missing or not a regular file: {container_path}"
                 )
-            os.replace(temp_path, destination_path)
-            return destination_path
-        except ArtifactTransferError:
-            raise
-        except Exception as exc:
-            raise ArtifactTransferError(
-                f"could not pull container artifact {container_path!r}: {exc}"
-            ) from exc
+            if max_bytes is not None and before[0] > max_bytes:
+                raise ArtifactTransferError(
+                    f"container artifact exceeds the {max_bytes}-byte transfer limit"
+                )
+
+            if destination is None:
+                name = posixpath.basename(requested) or "artifact"
+                destination_path = self._cache_dir / f"{uuid.uuid4().hex}-{name}"
+            else:
+                destination_path = Path(destination)
+            destination_path = self._guard_host_destination(destination_path)
+            destination_path.parent.mkdir(parents=True, exist_ok=True)
+            destination_path = self._guard_host_destination(destination_path)
+
+            temp_path = destination_path.parent / (
+                f".{destination_path.name}.hermes-artifact-{uuid.uuid4().hex}.tmp"
+            )
+            descriptor = os.open(
+                temp_path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            os.close(descriptor)
+            try:
+                if max_bytes is None:
+                    self._environment.fetch_file(source_snapshot, str(temp_path))
+                else:
+                    self._environment.fetch_file(
+                        source_snapshot, str(temp_path), max_bytes=max_bytes
+                    )
+                self._assert_generation()
+                actual = _sha256(temp_path)
+                after = self._environment.fetch_file_metadata(source_snapshot)
+                self._assert_generation()
+                if (
+                    after is None
+                    or before != after
+                    or not self._verified(actual, before)
+                    or (max_bytes is not None and actual[0] > max_bytes)
+                ):
+                    raise ArtifactTransferError(
+                        f"artifact verification failed while pulling {container_path!r}"
+                    )
+                os.replace(temp_path, destination_path)
+                return destination_path
+            except ArtifactTransferError:
+                raise
+            except Exception as exc:
+                raise ArtifactTransferError(
+                    f"could not pull container artifact {container_path!r}: {exc}"
+                ) from exc
+            finally:
+                try:
+                    temp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
         finally:
             try:
-                temp_path.unlink(missing_ok=True)
-            except OSError:
+                self._environment.execute(
+                    f"rm -f -- {shlex.quote(source_snapshot)}",
+                    rewrite_compound_background=False,
+                )
+            except Exception:
                 pass
 
     def push(self, host_path: str | Path, container_path: str) -> None:
         """Push one host file and atomically publish it inside the environment."""
         self._assert_generation()
         source = self._guard_host_source(host_path)
-        expected = _sha256(source)
+        source_snapshot = self._snapshot_host_source(source)
+        expected = _sha256(source_snapshot)
         destination = self._guard_container_lexical(container_path)
         parent = self._ensure_container_directory(
             posixpath.dirname(destination) or "/"
@@ -288,7 +379,7 @@ class ArtifactBridge:
             f".{posixpath.basename(destination)}.hermes-artifact-{uuid.uuid4().hex}.tmp",
         )
         try:
-            self._environment.put_file(str(source), temp_path)
+            self._environment.put_file(str(source_snapshot), temp_path)
             self._assert_generation()
             uploaded = self._environment.fetch_file_metadata(temp_path)
             self._assert_generation()
@@ -318,6 +409,7 @@ class ArtifactBridge:
                 f"could not push host artifact {host_path!s}: {exc}"
             ) from exc
         finally:
+            source_snapshot.unlink(missing_ok=True)
             try:
                 self._environment.execute(
                     f"rm -f -- {shlex.quote(temp_path)}",

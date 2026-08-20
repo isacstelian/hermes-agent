@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import uuid
 from pathlib import Path
 from typing import Optional
@@ -367,15 +368,14 @@ def docker_endpoint_is_remote(docker_exe: str) -> bool:
     """Classify the effective Docker daemon endpoint.
 
     Bind sources are resolved on the daemon host, so an SSH/TCP daemon must
-    never receive Hermes' local cache/credential auto-mounts. ``DOCKER_HOST``
-    wins; otherwise inspect the selected Docker context. Unknown named
-    contexts fail closed as remote.
+    never receive Hermes' local cache/credential auto-mounts. An explicit
+    ``DOCKER_CONTEXT`` wins over ``DOCKER_HOST``, matching Docker CLI
+    precedence. Unknown named contexts fail closed as remote.
     """
-    explicit_host = (os.getenv("DOCKER_HOST") or "").strip()
-    if explicit_host:
-        return _docker_endpoint_value_is_remote(explicit_host)
-
     context = (os.getenv("DOCKER_CONTEXT") or "").strip()
+    explicit_host = (os.getenv("DOCKER_HOST") or "").strip()
+    if not context and explicit_host:
+        return _docker_endpoint_value_is_remote(explicit_host)
     if not context:
         try:
             shown = subprocess.run(
@@ -1016,6 +1016,8 @@ class DockerEnvironment(BaseEnvironment):
         _ensure_docker_available()
         self._docker_exe = find_docker() or "docker"
         self._remote_endpoint = docker_endpoint_is_remote(self._docker_exe)
+        active_profile = _get_active_profile_name()
+        profile_name = _sanitize_label_value(active_profile)
 
         # Build resource limit args (gated by cgroup availability probe so
         # they degrade gracefully on hosts without controller delegation,
@@ -1093,7 +1095,9 @@ class DockerEnvironment(BaseEnvironment):
         writable_args = []
         if self._persistent:
             if self._remote_endpoint:
-                volume_key = hashlib.sha256(task_id.encode("utf-8")).hexdigest()[:16]
+                volume_key = hashlib.sha256(
+                    f"{task_id}\0{active_profile}".encode("utf-8")
+                ).hexdigest()[:16]
                 writable_args.extend([
                     "--mount", f"type=volume,source=hermes-home-{volume_key},target=/root",
                 ])
@@ -1416,7 +1420,13 @@ class DockerEnvironment(BaseEnvironment):
         # owned by that user on the host instead of by root. Skip cleanly on
         # platforms without POSIX uid/gid (e.g. native Windows Docker).
         user_args: list[str] = []
-        if run_as_host_user:
+        effective_run_as_host_user = run_as_host_user and not self._remote_endpoint
+        if run_as_host_user and self._remote_endpoint:
+            logger.warning(
+                "Docker: ignoring docker_run_as_host_user for a remote daemon; "
+                "daemon-owned /root and /workspace volumes require the image user"
+            )
+        if effective_run_as_host_user:
             user_spec = _resolve_host_user_spec()
             if user_spec is not None:
                 user_args = ["--user", user_spec]
@@ -1433,7 +1443,7 @@ class DockerEnvironment(BaseEnvironment):
         # Best-effort home for delivery-path security checks (remote_home):
         # containers run as root unless run_as_host_user remaps the uid, in
         # which case the in-container home is unknown.
-        if not (run_as_host_user and user_args):
+        if not (effective_run_as_host_user and user_args):
             self._remote_home = "/root"
 
         # s6-overlay images (e.g. hermes-agent:latest) already use /init as PID 1
@@ -1450,7 +1460,7 @@ class DockerEnvironment(BaseEnvironment):
                 image,
             )
         security_args = _build_security_args(
-            run_as_host_user and bool(user_args),
+            effective_run_as_host_user and bool(user_args),
             run_exec=image_uses_s6_init,
         )
 
@@ -1502,6 +1512,8 @@ class DockerEnvironment(BaseEnvironment):
             json.dumps(
                 {
                     "remote_endpoint": self._remote_endpoint,
+                    "security_args": security_args,
+                    "user_args": user_args,
                     "writable_args": writable_args,
                     "volume_args": volume_args,
                     "extra_args": validated_extra,
@@ -1520,7 +1532,6 @@ class DockerEnvironment(BaseEnvironment):
         # Values are limited to the safe character set defined by
         # _sanitize_label_value(); the active Hermes profile is captured at
         # container-start time and never changes for the container's lifetime.
-        profile_name = _sanitize_label_value(_get_active_profile_name())
         task_label = _sanitize_label_value(task_id)
         label_args = [
             "--label", "hermes-agent=1",
@@ -1556,6 +1567,9 @@ class DockerEnvironment(BaseEnvironment):
         # would silently bypass the credential firewall.
         reused = False
         if persist_across_processes:
+            self._remove_stale_config_containers(
+                task_label, profile_name, egress_label, mount_fingerprint
+            )
             existing = self._find_reusable_container(
                 task_label, profile_name, egress_label, mount_fingerprint,
             )
@@ -1862,7 +1876,12 @@ class DockerEnvironment(BaseEnvironment):
                 return os.path.join(host_root, normalized[len(prefix):].lstrip("/"))
         return None
 
-    def fetch_file(self, remote_path: str, local_dest: str) -> None:
+    def fetch_file(
+        self,
+        remote_path: str,
+        local_dest: str,
+        max_bytes: int | None = None,
+    ) -> None:
         """Copy a file out of the container to *local_dest* on the host.
 
         Persistent /root and /workspace are bind mounts, so those paths copy
@@ -1875,22 +1894,42 @@ class DockerEnvironment(BaseEnvironment):
         """
         host_path = self._host_path_for(remote_path)
         if host_path and os.path.isfile(host_path):
-            shutil.copy2(host_path, local_dest)
+            with open(host_path, "rb") as source, open(local_dest, "wb") as destination:
+                remaining = None if max_bytes is None else max_bytes + 1
+                while remaining is None or remaining > 0:
+                    amount = (
+                        1024 * 1024
+                        if remaining is None
+                        else min(1024 * 1024, remaining)
+                    )
+                    chunk = source.read(amount)
+                    if not chunk:
+                        break
+                    destination.write(chunk)
+                    if remaining is not None:
+                        remaining -= len(chunk)
+            if max_bytes is not None and os.path.getsize(local_dest) > max_bytes:
+                self._remove_local_transfer_target(local_dest)
+                raise FileFetchError(
+                    f"{remote_path!r} exceeds the {max_bytes}-byte transfer limit"
+                )
             return
 
         if not self._container_id:
             raise FileFetchError("Docker container not started")
-        try:
-            result = subprocess.run(
-                [self._docker_exe, "cp", "-L",
-                 f"{self._container_id}:{remote_path}", local_dest],
-                capture_output=True,
-                text=True,
-                timeout=_FETCH_TIMEOUT_SECONDS,
-                stdin=subprocess.DEVNULL,
-            )
-        except subprocess.TimeoutExpired:
-            result = None
+        result = None
+        if max_bytes is None:
+            try:
+                result = subprocess.run(
+                    [self._docker_exe, "cp", "-L",
+                     f"{self._container_id}:{remote_path}", local_dest],
+                    capture_output=True,
+                    text=True,
+                    timeout=_FETCH_TIMEOUT_SECONDS,
+                    stdin=subprocess.DEVNULL,
+                )
+            except subprocess.TimeoutExpired:
+                result = None
         if result is None or result.returncode != 0:
             # The archive API reads the container's ROOTFS LAYERS, not the
             # mounts stacked on top of them: a file on a tmpfs (/root and
@@ -1906,17 +1945,27 @@ class DockerEnvironment(BaseEnvironment):
             )
             self._remove_local_transfer_target(local_dest)
             try:
-                self._fetch_file_with_tar(remote_path, local_dest)
+                if max_bytes is None:
+                    self._fetch_file_with_tar(remote_path, local_dest)
+                else:
+                    self._fetch_file_with_tar(
+                        remote_path, local_dest, max_bytes=max_bytes
+                    )
                 return
             except FileFetchError as tar_error:
                 size = self.fetch_file_size(remote_path)
-                if size is None or size > self._base64_transfer_limit_bytes:
+                fallback_limit = self._base64_transfer_limit_bytes
+                if max_bytes is not None:
+                    fallback_limit = min(fallback_limit, max_bytes)
+                if size is None or size > fallback_limit:
                     raise tar_error
                 logger.info(
                     "exec-tar pull of %r failed — using capped base64 fallback",
                     remote_path,
                 )
-                super().fetch_file(remote_path, local_dest)
+                super().fetch_file(
+                    remote_path, local_dest, max_bytes=fallback_limit
+                )
                 return
         if not os.path.isfile(local_dest):
             # docker cp of a directory materializes a directory — reject it.
@@ -1934,8 +1983,13 @@ class DockerEnvironment(BaseEnvironment):
         except OSError:
             pass
 
-    def _fetch_file_with_tar(self, container_path: str, local_dest: str) -> None:
-        """Pull one file through raw tar bytes without buffering it in RAM."""
+    def _fetch_file_with_tar(
+        self,
+        container_path: str,
+        local_dest: str,
+        max_bytes: int | None = None,
+    ) -> None:
+        """Pull one file through raw tar bytes with a header-level size cap."""
         if not self._container_id:
             raise FileFetchError("Docker container not started")
         normalized = posixpath.normpath(container_path)
@@ -1954,33 +2008,90 @@ class DockerEnvironment(BaseEnvironment):
             parent,
             f"./{basename}",
         ]
+        if max_bytes is None:
+            try:
+                with tempfile.TemporaryFile() as archive:
+                    result = subprocess.run(
+                        command,
+                        stdout=archive,
+                        stderr=subprocess.PIPE,
+                        timeout=_FETCH_TIMEOUT_SECONDS,
+                        stdin=subprocess.DEVNULL,
+                    )
+                    if result.returncode != 0:
+                        detail = (result.stderr or b"").decode(
+                            "utf-8", "replace"
+                        ).strip()
+                        raise FileFetchError(
+                            f"exec-tar pull of {container_path!r} failed: {detail}"
+                        )
+                    archive.seek(0)
+                    with tarfile.open(fileobj=archive, mode="r:*") as stream:
+                        members = stream.getmembers()
+                        if len(members) != 1:
+                            raise FileFetchError(
+                                f"exec-tar pull of {container_path!r} returned "
+                                f"{len(members)} entries"
+                            )
+                        member = members[0]
+                        member_name = posixpath.normpath(member.name)
+                        if member_name != basename or not member.isfile():
+                            raise FileFetchError(
+                                f"{container_path!r} is not a regular file"
+                            )
+                        source = stream.extractfile(member)
+                        if source is None:
+                            raise FileFetchError(
+                                f"exec-tar pull of {container_path!r} produced no payload"
+                            )
+                        with open(local_dest, "wb") as destination:
+                            shutil.copyfileobj(
+                                source, destination, length=1024 * 1024
+                            )
+                return
+            except subprocess.TimeoutExpired as exc:
+                self._remove_local_transfer_target(local_dest)
+                raise FileFetchError(
+                    f"exec-tar pull of {container_path!r} timed out"
+                ) from exc
+            except (OSError, tarfile.TarError) as exc:
+                self._remove_local_transfer_target(local_dest)
+                raise FileFetchError(
+                    f"exec-tar pull of {container_path!r} failed: {exc}"
+                ) from exc
+
+        process = None
+        timeout_timer = None
         try:
-            with tempfile.TemporaryFile() as archive:
-                result = subprocess.run(
+            with tempfile.TemporaryFile() as stderr:
+                process = subprocess.Popen(
                     command,
-                    stdout=archive,
-                    stderr=subprocess.PIPE,
-                    timeout=_FETCH_TIMEOUT_SECONDS,
+                    stdout=subprocess.PIPE,
+                    stderr=stderr,
                     stdin=subprocess.DEVNULL,
                 )
-                if result.returncode != 0:
-                    detail = (result.stderr or b"").decode("utf-8", "replace").strip()
-                    raise FileFetchError(
-                        f"exec-tar pull of {container_path!r} failed: {detail}"
-                    )
-                archive.seek(0)
-                with tarfile.open(fileobj=archive, mode="r:*") as stream:
-                    members = stream.getmembers()
-                    if len(members) != 1:
+                if process.stdout is None:
+                    raise FileFetchError("exec-tar pull produced no stream")
+                timeout_timer = threading.Timer(
+                    _FETCH_TIMEOUT_SECONDS,
+                    lambda: process.kill() if process.poll() is None else None,
+                )
+                timeout_timer.daemon = True
+                timeout_timer.start()
+                with tarfile.open(fileobj=process.stdout, mode="r|*") as stream:
+                    member = next(iter(stream), None)
+                    if member is None:
                         raise FileFetchError(
-                            f"exec-tar pull of {container_path!r} returned "
-                            f"{len(members)} entries"
+                            f"exec-tar pull of {container_path!r} returned no entries"
                         )
-                    member = members[0]
                     member_name = posixpath.normpath(member.name)
                     if member_name != basename or not member.isfile():
                         raise FileFetchError(
                             f"{container_path!r} is not a regular file"
+                        )
+                    if max_bytes is not None and member.size > max_bytes:
+                        raise FileFetchError(
+                            f"{container_path!r} exceeds the {max_bytes}-byte transfer limit"
                         )
                     source = stream.extractfile(member)
                     if source is None:
@@ -1989,16 +2100,36 @@ class DockerEnvironment(BaseEnvironment):
                         )
                     with open(local_dest, "wb") as destination:
                         shutil.copyfileobj(source, destination, length=1024 * 1024)
+                    if next(iter(stream), None) is not None:
+                        raise FileFetchError(
+                            f"exec-tar pull of {container_path!r} returned multiple entries"
+                        )
+                returncode = process.wait(timeout=_FETCH_TIMEOUT_SECONDS)
+                if returncode != 0:
+                    stderr.seek(0)
+                    detail = stderr.read().decode("utf-8", "replace").strip()
+                    raise FileFetchError(
+                        f"exec-tar pull of {container_path!r} failed: {detail}"
+                    )
         except subprocess.TimeoutExpired as exc:
             self._remove_local_transfer_target(local_dest)
             raise FileFetchError(
                 f"exec-tar pull of {container_path!r} timed out"
             ) from exc
+        except FileFetchError:
+            self._remove_local_transfer_target(local_dest)
+            raise
         except (OSError, tarfile.TarError) as exc:
             self._remove_local_transfer_target(local_dest)
             raise FileFetchError(
                 f"exec-tar pull of {container_path!r} failed: {exc}"
             ) from exc
+        finally:
+            if timeout_timer is not None:
+                timeout_timer.cancel()
+            if process is not None and process.poll() is None:
+                process.kill()
+                process.wait()
 
     def put_file(self, local_source: str, remote_dest: str) -> None:
         """Push one file through docker cp, raw exec-tar, then capped base64."""
@@ -2312,6 +2443,86 @@ class DockerEnvironment(BaseEnvironment):
             return None
         mode = result.stdout.strip()
         return mode or None
+
+    def _remove_stale_config_containers(
+        self,
+        task_label: str,
+        profile_label: str,
+        egress_label: str,
+        mounts_label: str,
+    ) -> None:
+        """Remove same-owner containers with immutable config mismatches."""
+        fmt = (
+            '{{.ID}}\t{{.Label "'
+            + _MOUNTS_LABEL_KEY
+            + '"}}\t{{.Label "'
+            + _EGRESS_LABEL_KEY
+            + '"}}'
+        )
+        try:
+            result = subprocess.run(
+                [
+                    self._docker_exe,
+                    "ps",
+                    "-a",
+                    "--filter",
+                    "label=hermes-agent=1",
+                    "--filter",
+                    f"label=hermes-task-id={task_label}",
+                    "--filter",
+                    f"label=hermes-profile={profile_label}",
+                    "--format",
+                    fmt,
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=10,
+                check=False,
+                stdin=subprocess.DEVNULL,
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            logger.warning("Could not inspect stale Docker containers: %s", exc)
+            return
+        if result.returncode != 0:
+            logger.warning(
+                "Could not inspect stale Docker containers: %s",
+                result.stderr.strip(),
+            )
+            return
+
+        for line in result.stdout.splitlines():
+            parts = line.split("\t")
+            if len(parts) != 3:
+                continue
+            container_id, actual_mounts, actual_egress = parts
+            egress_matches = (
+                actual_egress in {"", "off"}
+                if egress_label == "off"
+                else actual_egress == egress_label
+            )
+            if actual_mounts == mounts_label and egress_matches:
+                continue
+            removed = subprocess.run(
+                [self._docker_exe, "rm", "-f", container_id],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=30,
+                check=False,
+                stdin=subprocess.DEVNULL,
+            )
+            if removed.returncode != 0:
+                raise RuntimeError(
+                    "could not remove stale Docker container "
+                    f"{container_id[:12]}: {removed.stderr.strip()}"
+                )
+            logger.info(
+                "Removed stale Docker container %s after immutable config change",
+                container_id[:12],
+            )
 
     def _find_reusable_container(
         self,

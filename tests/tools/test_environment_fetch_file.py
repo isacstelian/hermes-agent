@@ -241,6 +241,38 @@ class TestDockerFetchFile:
 
         assert destination.read_bytes() == payload
 
+    def test_raw_tar_pull_rejects_member_above_transport_limit(self, tmp_path):
+        env = self._make_env()
+        archive = io.BytesIO()
+        with tarfile.open(fileobj=archive, mode="w") as stream:
+            info = tarfile.TarInfo("blob")
+            info.size = 5
+            stream.addfile(info, io.BytesIO(b"12345"))
+
+        class FakeProcess:
+            def __init__(self, *_args, **_kwargs):
+                self.stdout = io.BytesIO(archive.getvalue())
+                self.returncode = None
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout=None):
+                self.returncode = 0
+                return 0
+
+            def kill(self):
+                self.returncode = -9
+
+        destination = tmp_path / "blob"
+        with patch("tools.environments.docker.subprocess.Popen", FakeProcess):
+            with pytest.raises(FileFetchError, match="transfer limit"):
+                env._fetch_file_with_tar(
+                    "/workspace/blob", str(destination), max_bytes=4
+                )
+
+        assert not destination.exists()
+
     def test_docker_put_uses_cp_fast_path(self, tmp_path):
         env = self._make_env()
         source = tmp_path / "blob"

@@ -669,6 +669,40 @@ def test_remote_persistent_sandbox_uses_daemon_named_volumes(monkeypatch):
     assert ".hermes/sandboxes" not in rendered
 
 
+def test_remote_named_volumes_are_profile_scoped(monkeypatch):
+    monkeypatch.setenv("DOCKER_HOST", "ssh://sandbox-vps")
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(
+        docker_env.DockerEnvironment, "_stage_remote_auto_inputs", lambda self: None
+    )
+    profile = ["profile-a"]
+    monkeypatch.setattr(docker_env, "_get_active_profile_name", lambda: profile[0])
+    calls = _mock_subprocess_run(monkeypatch)
+
+    _make_dummy_env(persistent_filesystem=True, task_id="default")
+    profile[0] = "profile-b"
+    _make_dummy_env(persistent_filesystem=True, task_id="default")
+
+    runs = [cmd for cmd, _ in calls if cmd[1:2] == ["run"]]
+    first_mounts = {runs[0][i + 1] for i, token in enumerate(runs[0]) if token == "--mount"}
+    second_mounts = {runs[1][i + 1] for i, token in enumerate(runs[1]) if token == "--mount"}
+    assert first_mounts.isdisjoint(second_mounts)
+
+
+def test_remote_named_volumes_do_not_run_as_host_uid(monkeypatch):
+    monkeypatch.setenv("DOCKER_HOST", "ssh://sandbox-vps")
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(
+        docker_env.DockerEnvironment, "_stage_remote_auto_inputs", lambda self: None
+    )
+    calls = _mock_subprocess_run(monkeypatch)
+
+    _make_dummy_env(persistent_filesystem=True, run_as_host_user=True)
+
+    run_cmd = next(cmd for cmd, _ in calls if cmd[1:2] == ["run"])
+    assert "--user" not in run_cmd
+
+
 def test_remote_daemon_rejects_user_host_bind(monkeypatch):
     monkeypatch.setenv("DOCKER_HOST", "ssh://sandbox-vps")
     monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
@@ -753,6 +787,27 @@ def test_mount_config_change_invalidates_reuse_fingerprint(monkeypatch):
     second = _make_dummy_env(volumes=["board-output-v2:/output"])
 
     assert first._labels["hermes-mounts"] != second._labels["hermes-mounts"]
+
+
+def test_stale_immutable_config_container_is_removed(monkeypatch):
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+    env = _make_dummy_env(persist_across_processes=False)
+    calls.clear()
+
+    def _run(cmd, **kwargs):
+        calls.append((list(cmd), kwargs))
+        if cmd[1:3] == ["ps", "-a"]:
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout="old-cid\told-mounts\toff\n", stderr=""
+            )
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(docker_env.subprocess, "run", _run)
+
+    env._remove_stale_config_containers("task", "default", "off", "new-mounts")
+
+    assert any(cmd[1:4] == ["rm", "-f", "old-cid"] for cmd, _ in calls)
 
 
 # ── Cross-process container reuse (issue #20561) ──────────────────
@@ -859,7 +914,8 @@ def test_egress_enabled_does_not_reuse_pre_egress_container(monkeypatch):
             if sub == "ps":
                 # Simulate an old pre-egress container: without the egress label
                 # filter it would match; with the filter Docker returns no match.
-                assert any(str(part).startswith("label=hermes-egress=") for part in cmd)
+                if any(str(part).startswith("label=hermes-mounts=") for part in cmd):
+                    assert any(str(part).startswith("label=hermes-egress=") for part in cmd)
                 return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
             if sub == "run":
                 return subprocess.CompletedProcess(cmd, 0, stdout="fresh-cid\n", stderr="")

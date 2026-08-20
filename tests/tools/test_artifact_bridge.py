@@ -33,9 +33,12 @@ class _FakeEnvironment:
             return None
         return len(payload), hashlib.sha256(payload).hexdigest()
 
-    def fetch_file(self, path, destination):
+    def fetch_file(self, path, destination, max_bytes=None):
         self.fetch_destinations.append(Path(destination))
-        Path(destination).write_bytes(self.files[path])
+        payload = self.files[path]
+        if max_bytes is not None and len(payload) > max_bytes:
+            raise FileFetchError("artifact exceeds transfer limit")
+        Path(destination).write_bytes(payload)
 
     def put_file(self, source, destination):
         self.put_destinations.append(destination)
@@ -45,6 +48,10 @@ class _FakeEnvironment:
         self.commands.append(command)
         if command.startswith("mkdir -p "):
             self.realpaths[shlex.split(command)[-1]] = shlex.split(command)[-1]
+            return {"returncode": 0, "output": ""}
+        if command.startswith("ln -- "):
+            source, destination = shlex.split(command)[2:4]
+            self.files[destination] = self.files[source]
             return {"returncode": 0, "output": ""}
         if command.startswith("mv -f -- "):
             source, destination = command.removeprefix("mv -f -- ").split(" ", 1)
@@ -95,6 +102,32 @@ def test_pull_is_byte_agnostic_verified_and_atomically_published(tmp_path):
     assert len(env.fetch_destinations) == 1
     assert env.fetch_destinations[0] != destination
     assert not env.fetch_destinations[0].exists()
+
+
+def test_pull_snapshots_source_before_independent_transfer_steps(tmp_path):
+    class RacingEnvironment(_FakeEnvironment):
+        def execute(self, command, **kwargs):
+            result = super().execute(command, **kwargs)
+            if command.startswith("ln -- "):
+                self.files["/workspace/blob"] = b"SECRET-OUTSIDE-ROOT"
+            return result
+
+    env = RacingEnvironment({"/workspace/blob": b"safe-report"})
+    bridge, _inbox, _cache = _bridge(tmp_path, env)
+
+    destination = bridge.pull("/workspace/blob")
+
+    assert destination.read_bytes() == b"safe-report"
+
+
+def test_pull_enforces_limit_inside_transport(tmp_path):
+    env = _FakeEnvironment({"/workspace/blob": b"12345"})
+    bridge, _inbox, cache = _bridge(tmp_path, env)
+
+    with pytest.raises(ArtifactTransferError, match="limit"):
+        bridge.pull("/workspace/blob", max_bytes=4)
+
+    assert list(cache.iterdir()) == []
 
 
 def test_pull_rejects_container_symlink_escape(tmp_path):
@@ -176,6 +209,29 @@ def test_push_rejects_host_symlink_escape(tmp_path):
 
     with pytest.raises(ArtifactSecurityError, match="outside allowed host roots"):
         bridge.push(link, "/workspace/link.bin")
+
+    assert env.put_destinations == []
+
+
+def test_push_rejects_source_replaced_by_symlink_after_validation(tmp_path, monkeypatch):
+    env = _FakeEnvironment()
+    bridge, inbox, _cache = _bridge(tmp_path, env)
+    source = inbox / "payload.bin"
+    source.write_bytes(b"safe")
+    outside = tmp_path / "outside.bin"
+    outside.write_bytes(b"SECRET-OUTSIDE-HOST-ROOT")
+    original_guard = bridge._guard_host_source
+
+    def racing_guard(path):
+        resolved = original_guard(path)
+        resolved.unlink()
+        resolved.symlink_to(outside)
+        return resolved
+
+    monkeypatch.setattr(bridge, "_guard_host_source", racing_guard)
+
+    with pytest.raises(ArtifactSecurityError, match="changed|unavailable"):
+        bridge.push(source, "/workspace/payload.bin")
 
     assert env.put_destinations == []
 
@@ -274,6 +330,8 @@ def test_base_metadata_returns_size_and_sha256_from_one_probe():
 
     assert env.fetch_file_metadata("/workspace/blob") == (123, digest)
     assert len(env.calls) == 1
+    assert "shasum -a 256" in env.calls[0][0]
+    assert "openssl dgst -sha256" in env.calls[0][0]
 
 
 def test_base_put_file_has_explicit_last_resort_cap(tmp_path):
