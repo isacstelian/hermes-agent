@@ -2,6 +2,7 @@
 
 import hashlib
 import os
+import shlex
 from pathlib import Path
 
 import pytest
@@ -43,6 +44,7 @@ class _FakeEnvironment:
     def execute(self, command, **kwargs):
         self.commands.append(command)
         if command.startswith("mkdir -p "):
+            self.realpaths[shlex.split(command)[-1]] = shlex.split(command)[-1]
             return {"returncode": 0, "output": ""}
         if command.startswith("mv -f -- "):
             source, destination = command.removeprefix("mv -f -- ").split(" ", 1)
@@ -137,6 +139,31 @@ def test_push_uses_remote_temp_verifies_then_renames(tmp_path):
     assert env.put_destinations[0] != "/workspace/uploads/payload.bin"
     assert not any(".hermes-artifact-" in path for path in env.files)
     assert any(command.startswith("mv -f -- ") for command in env.commands)
+
+
+def test_push_creates_missing_allowed_root_below_safe_ancestor(tmp_path):
+    env = _FakeEnvironment(realpaths={
+        "/root/.hermes/cache/documents": None,
+        "/root/.hermes/cache": None,
+        "/root/.hermes": None,
+        "/root": "/root",
+    })
+    inbox = tmp_path / "inbox"
+    cache = tmp_path / "cache"
+    inbox.mkdir()
+    cache.mkdir()
+    source = inbox / "report.pdf"
+    source.write_bytes(b"%PDF")
+    bridge = ArtifactBridge(
+        env,
+        cache_dir=cache,
+        host_roots=(inbox,),
+        container_roots=("/root/.hermes/cache/documents",),
+    )
+
+    bridge.push(source, "/root/.hermes/cache/documents/report.pdf")
+
+    assert env.files["/root/.hermes/cache/documents/report.pdf"] == b"%PDF"
 
 
 def test_push_rejects_host_symlink_escape(tmp_path):

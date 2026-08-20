@@ -62,7 +62,10 @@ def _normalize_container_path(path: str) -> str:
 
 
 def _is_within_container(path: str, roots: tuple[str, ...]) -> bool:
-    return any(path == root or path.startswith(root + "/") for root in roots)
+    return any(
+        root == "/" or path == root or path.startswith(root + "/")
+        for root in roots
+    )
 
 
 class ArtifactBridge:
@@ -171,7 +174,14 @@ class ArtifactBridge:
             self._assert_generation()
             if resolved:
                 canonical = _normalize_container_path(resolved)
-                if not _is_within_container(canonical, self._container_roots):
+                is_safe_ancestor = canonical == probe and any(
+                    root.startswith(canonical.rstrip("/") + "/")
+                    for root in self._container_roots
+                )
+                if not (
+                    _is_within_container(canonical, self._container_roots)
+                    or is_safe_ancestor
+                ):
                     raise ArtifactSecurityError(
                         f"artifact is outside allowed container roots: {path}"
                     )
