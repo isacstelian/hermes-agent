@@ -328,6 +328,9 @@ class TestDockerFetchFile:
         env = self._make_env()
         source = tmp_path / "blob"
         source.write_bytes(b"payload")
+        env.fetch_file_metadata = Mock(
+            return_value=(7, "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5")
+        )
 
         with patch(
             "tools.environments.docker.subprocess.run",
@@ -338,6 +341,25 @@ class TestDockerFetchFile:
         assert run_mock.call_args.args[0] == [
             "docker", "cp", "-L", str(source), "cafebabe1234:/workspace/blob"
         ]
+
+    def test_docker_put_cp_success_but_missing_target_falls_back_to_tar(
+        self, tmp_path
+    ):
+        env = self._make_env()
+        source = tmp_path / "blob"
+        source.write_bytes(b"payload")
+        env.fetch_file_metadata = Mock(return_value=None)
+        env._put_file_with_tar = Mock()
+
+        with patch(
+            "tools.environments.docker.subprocess.run",
+            return_value=subprocess.CompletedProcess([], 0, stdout="", stderr=""),
+        ):
+            env.put_file(str(source), "/workspace/blob")
+
+        env._put_file_with_tar.assert_called_once_with(
+            str(source), "/workspace/blob"
+        )
 
     def test_docker_put_cp_failure_falls_back_to_raw_tar(self, tmp_path):
         env = self._make_env()

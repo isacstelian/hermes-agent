@@ -2263,6 +2263,11 @@ class DockerEnvironment(BaseEnvironment):
         source = Path(local_source)
         if not source.is_file():
             raise FileFetchError(f"{local_source!r} is not a regular file")
+        digest = hashlib.sha256()
+        with source.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        expected = (source.stat().st_size, digest.hexdigest())
         try:
             result = subprocess.run(
                 [
@@ -2280,9 +2285,12 @@ class DockerEnvironment(BaseEnvironment):
         except subprocess.TimeoutExpired:
             result = None
         if result is not None and result.returncode == 0:
-            return
+            if self.fetch_file_metadata(remote_dest) == expected:
+                return
+            detail = "destination verification failed after a successful copy"
+        else:
+            detail = "timed out" if result is None else result.stderr.strip()
 
-        detail = "timed out" if result is None else result.stderr.strip()
         logger.info(
             "docker cp push to %r failed (%s) — falling back to raw exec-tar",
             remote_dest, detail,
