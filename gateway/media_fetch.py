@@ -38,6 +38,26 @@ MEDIA_FETCH_MAX_BYTES_ENV = "HERMES_MEDIA_FETCH_MAX_BYTES"
 _MEDIA_FETCH_MAX_BYTES_DEFAULT = 50 * 1024 * 1024
 
 
+def acquire_media_delivery_lease(task_id: Optional[str]):
+    """Keep a remote task environment alive through attachment delivery.
+
+    The lease is acquired before the terminal environment necessarily exists;
+    this closes the turn-finalizer race with lazy sandbox creation. Callers
+    must release the returned object after media paths have been pulled into
+    the host cache. Local turns need no lease and return ``None``.
+    """
+    backend = (os.getenv("TERMINAL_ENV") or "local").strip().lower()
+    if not task_id:
+        return None
+    from agent.prompt_builder import _REMOTE_TERMINAL_BACKENDS
+
+    if backend not in _REMOTE_TERMINAL_BACKENDS:
+        return None
+    from tools.terminal_tool import acquire_environment_lease
+
+    return acquire_environment_lease(task_id)
+
+
 def media_fetch_max_bytes() -> int:
     """Return the configured remote-fetch size cap in bytes."""
     raw = os.environ.get(MEDIA_FETCH_MAX_BYTES_ENV, "").strip()
@@ -153,7 +173,9 @@ def _sanitize_basename(path: str) -> str:
 
 
 def fetch_remote_media(
-    path: str, task_id: Optional[str] = None
+    path: str,
+    task_id: Optional[str] = None,
+    max_bytes: Optional[int] = None,
 ) -> Tuple[Optional[str], Optional[str]]:
     """Fetch *path* from the active remote backend into the document cache.
 
@@ -199,7 +221,7 @@ def fetch_remote_media(
                 "the file is not in the agent sandbox (it was never created, "
                 "or it was written to a different path)"
             )
-        limit = media_fetch_max_bytes()
+        limit = max_bytes or media_fetch_max_bytes()
         if size > limit:
             return None, (
                 f"the file is {_format_size(size)}, above the "

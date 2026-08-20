@@ -1842,7 +1842,11 @@ def _log_media_delivery_drop(
         )
 
 
-def _maybe_fetch_remote_media(path: str, task_id: Optional[str] = None) -> Tuple[Optional[str], str]:
+def _maybe_fetch_remote_media(
+    path: str,
+    task_id: Optional[str] = None,
+    max_bytes: Optional[int] = None,
+) -> Tuple[Optional[str], str]:
     """Try to fetch a locally-missing MEDIA path out of the terminal backend.
 
     Returns ``(local_path, "")`` on success or ``(None, reason)``. Never
@@ -1851,7 +1855,7 @@ def _maybe_fetch_remote_media(path: str, task_id: Optional[str] = None) -> Tuple
     try:
         from gateway.media_fetch import fetch_remote_media
 
-        local_path, reason = fetch_remote_media(path, task_id)
+        local_path, reason = fetch_remote_media(path, task_id, max_bytes=max_bytes)
         return local_path, reason or ""
     except Exception as exc:  # noqa: BLE001 — delivery must survive a fetch bug
         logger.warning("Remote media fetch errored: %s", exc, exc_info=True)
@@ -2070,11 +2074,10 @@ MEDIA_TAG_CLEANUP_RE = re.compile(
 # unknown extension (.py, .log, .weirdext, ...) — are validated and delivered
 # via MEDIA_EXTENSIONLESS_TAG_RE. Every ``MEDIA:`` path is therefore
 # deliverable regardless of file type (#36060): known extensions extract
-# unconditionally via the anchored pattern above, everything else extracts
-# only after ``validate_media_delivery_path`` accepts it (exists on disk, not
-# under the credential/system denylist, strict-mode rules honored), so
-# prompt-injection paths that do not validate are left visible instead of
-# silently dropped.
+# unconditionally via the anchored pattern above, and everything else is
+# extracted as an explicit delivery request before host/backend validation.
+# This matters for container-only files, which cannot validate on the gateway
+# host until the artifact bridge has pulled them out of the sandbox.
 #
 # The path class uses a tempered-greedy token (``[^\s\n`"']+?`` followed by
 # a ``(?=...)`` lookahead) instead of the prior ``[^\s\n`"']+`` so a
@@ -2104,13 +2107,14 @@ MEDIA_EXTENSIONLESS_TAG_RE = re.compile(
 
 
 def _match_extensionless_path(scan_text: str, match: "re.Match") -> Optional[Tuple[str, int]]:
-    """Resolve an extensionless MEDIA tag match to a validated on-disk path.
+    """Resolve an extensionless MEDIA tag without requiring a host-side file.
 
     Tries the regex-captured path first. When that fails validation, the
     candidate is progressively extended forward across single spaces
     (validation-gated, bounded at 8 tokens, never past a newline or a
-    subsequent ``MEDIA:`` keyword) so unknown-extension paths containing
-    spaces deliver (#24032). Returns ``(safe_path, end_offset)`` where
+    subsequent ``MEDIA:`` keyword) so local unknown-extension paths containing
+    spaces deliver (#24032). Otherwise the explicit bare token is returned for
+    downstream host/backend validation. Returns ``(path, end_offset)`` where
     ``end_offset`` is the index in ``scan_text`` just past the matched path,
     or ``None`` when nothing validates.
     """
@@ -2142,7 +2146,7 @@ def _match_extensionless_path(scan_text: str, match: "re.Match") -> Optional[Tup
         if safe:
             return safe, start + tok_end
         pos = tok_end
-    return None
+    return path, match.end("path")
 
 
 def _merge_spans(spans: list) -> list:
@@ -4873,15 +4877,22 @@ class BasePlatformAdapter(ABC):
                     return session_key
         return session_key
 
+    def media_delivery_max_bytes(self) -> int:
+        """Return the platform's native attachment upload limit."""
+        from gateway.media_fetch import media_fetch_max_bytes
+
+        return media_fetch_max_bytes()
+
     @staticmethod
     def filter_media_delivery_paths(
         media_files,
         task_id: Optional[str] = None,
         task_id_factory: Optional[Callable[[], Optional[str]]] = None,
+        max_bytes: Optional[int] = None,
     ) -> List[Tuple[str, bool]]:
         """Drop unsafe MEDIA paths and normalize accepted paths."""
         return BasePlatformAdapter.filter_media_delivery_paths_with_drops(
-            media_files, task_id, task_id_factory
+            media_files, task_id, task_id_factory, max_bytes
         )[0]
 
     @staticmethod
@@ -4889,6 +4900,7 @@ class BasePlatformAdapter(ABC):
         media_files,
         task_id: Optional[str] = None,
         task_id_factory: Optional[Callable[[], Optional[str]]] = None,
+        max_bytes: Optional[int] = None,
     ) -> Tuple[List[Tuple[str, bool]], List[Tuple[str, str, str]]]:
         """Filter MEDIA paths, returning the accepted ones and the drops.
 
@@ -4924,7 +4936,23 @@ class BasePlatformAdapter(ABC):
                         task_id = task_id_factory()
                     except Exception:  # noqa: BLE001 — never break delivery
                         task_id = None
-                safe_path, fetch_reason = _maybe_fetch_remote_media(raw, task_id)
+                safe_path, fetch_reason = _maybe_fetch_remote_media(
+                    raw, task_id, max_bytes=max_bytes
+                )
+            if safe_path and max_bytes is not None:
+                try:
+                    size = os.path.getsize(safe_path)
+                except OSError:
+                    safe_path = None
+                    reason = MEDIA_DROP_MISSING
+                else:
+                    if size > max_bytes:
+                        safe_path = None
+                        reason = "oversize"
+                        fetch_reason = (
+                            f"the file is {size / (1024 * 1024):.1f} MB, above "
+                            f"the delivery limit of {max_bytes / (1024 * 1024):.1f} MB"
+                        )
             if safe_path:
                 safe_media.append((safe_path, bool(is_voice)))
             else:
@@ -5097,7 +5125,9 @@ class BasePlatformAdapter(ABC):
         # referenced twice in one response — e.g. a MEDIA tag inline AND in a
         # summary footer — is uploaded once, not twice (#29131).
         seen_paths: set = set()
-        for match in media_pattern.finditer(scan_content):
+        known_matches = list(media_pattern.finditer(scan_content))
+        known_spans = [match.span() for match in known_matches]
+        for match in known_matches:
             path = _normalize_media_tag_path(match.group("path"))
             if path:
                 # ``[[audio_as_voice]]`` is message-global, but it must only
@@ -5120,6 +5150,8 @@ class BasePlatformAdapter(ABC):
                     media.append((expanded, is_voice))
 
         for match in MEDIA_EXTENSIONLESS_TAG_RE.finditer(scan_content):
+            if any(match.start() < end and match.end() > start for start, end in known_spans):
+                continue
             path = _normalize_media_tag_path(match.group("path"))
             if not path or not _path_lacks_deliverable_extension(path):
                 continue
@@ -5145,6 +5177,8 @@ class BasePlatformAdapter(ABC):
             masked_cleaned = BasePlatformAdapter._mask_json_string_media(masked_cleaned)
             spans = [m.span() for m in media_pattern.finditer(masked_cleaned)]
             for match in MEDIA_EXTENSIONLESS_TAG_RE.finditer(masked_cleaned):
+                if any(match.start() < end and match.end() > start for start, end in spans):
+                    continue
                 path = _normalize_media_tag_path(match.group("path"))
                 if not path or not _path_lacks_deliverable_extension(path):
                     continue
@@ -6433,6 +6467,12 @@ class BasePlatformAdapter(ABC):
                 typing_task,
                 metadata=_thread_metadata,
             )
+
+        from gateway.media_fetch import acquire_media_delivery_lease
+
+        _artifact_lease = acquire_media_delivery_lease(
+            self.agent_task_id_for_session(session_key)
+        )
         
         try:
             await self._run_processing_hook("on_processing_start", event)
@@ -6487,6 +6527,7 @@ class BasePlatformAdapter(ABC):
                 media_files, _media_drops = self.filter_media_delivery_paths_with_drops(
                     media_files,
                     task_id_factory=lambda: self.agent_task_id_for_session(session_key),
+                    max_bytes=self.media_delivery_max_bytes(),
                 )
 
                 # Extract image URLs and send them as native platform attachments
@@ -7015,6 +7056,8 @@ class BasePlatformAdapter(ABC):
             if isinstance(e, (SystemExit, KeyboardInterrupt)):
                 raise
         finally:
+            if _artifact_lease is not None:
+                _artifact_lease.release()
             # Stop typing before any deferred callback work.  Post-delivery
             # callbacks may perform platform I/O; a stuck callback must not
             # leave the typing refresh task running indefinitely.

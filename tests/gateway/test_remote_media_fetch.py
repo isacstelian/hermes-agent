@@ -14,6 +14,7 @@ import pytest
 
 from gateway.media_fetch import (
     MEDIA_FETCH_MAX_BYTES_ENV,
+    acquire_media_delivery_lease,
     fetch_remote_media,
     media_fetch_max_bytes,
     remote_path_is_denied,
@@ -162,6 +163,17 @@ class TestFetchRemoteMedia:
         assert "delivery limit" in reason
         assert env.fetched == []
 
+    def test_platform_limit_overrides_global_fetch_default(self, remote_backend):
+        env = remote_backend(_FakeRemoteEnv({"/root/big.zip": b"x" * 2048}))
+
+        local, reason = fetch_remote_media(
+            "/root/big.zip", "session-1", max_bytes=1024
+        )
+
+        assert local is None
+        assert "1.0 KB delivery limit" in reason
+        assert env.fetched == []
+
     def test_no_active_session_reports_reason(self, tmp_path, monkeypatch):
         monkeypatch.setenv("TERMINAL_ENV", "docker")
         monkeypatch.setattr("tools.terminal_tool.get_active_env", lambda task_id: None)
@@ -188,6 +200,26 @@ class TestFetchRemoteMedia:
         assert media_fetch_max_bytes() == 50 * 1024 * 1024
 
 
+class TestMediaDeliveryLease:
+    def test_remote_backend_acquires_before_environment_exists(self, monkeypatch):
+        sentinel = object()
+        seen = []
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+        monkeypatch.setattr(
+            "tools.terminal_tool.acquire_environment_lease",
+            lambda task_id: seen.append(task_id) or sentinel,
+        )
+
+        assert acquire_media_delivery_lease("session-1") is sentinel
+        assert seen == ["session-1"]
+
+    def test_local_backend_does_not_acquire(self, monkeypatch):
+        monkeypatch.setenv("TERMINAL_ENV", "local")
+
+        assert acquire_media_delivery_lease("session-1") is None
+
+
+
 class TestFilterUsesTheFetch:
     """The incident shape: MEDIA:/root/raport.xlsx from a sandboxed agent."""
 
@@ -203,6 +235,21 @@ class TestFilterUsesTheFetch:
         path, is_voice = safe[0]
         assert is_voice is False
         assert open(path, "rb").read() == b"xlsx"
+
+    @pytest.mark.parametrize("name", ["Caddyfile", "script.py", "data.weirdext"])
+    def test_explicit_media_is_extension_agnostic(self, remote_backend, name):
+        remote_path = f"/workspace/{name}"
+        remote_backend(_FakeRemoteEnv({remote_path: b"artifact"}))
+
+        media, cleaned = BasePlatformAdapter.extract_media(f"done\nMEDIA:{remote_path}")
+        safe, dropped = BasePlatformAdapter.filter_media_delivery_paths_with_drops(
+            media, "session-1"
+        )
+
+        assert cleaned.strip() == "done"
+        assert dropped == []
+        assert len(safe) == 1
+        assert open(safe[0][0], "rb").read() == b"artifact"
 
     def test_failed_fetch_still_reports_the_drop(self, remote_backend):
         remote_backend(_FakeRemoteEnv({}))
@@ -339,3 +386,31 @@ class TestSandboxLookupUsesTheAgentSessionId:
         assert len(adapter.documents) == 1, adapter.sent
         assert open(adapter.documents[0], "rb").read() == b"lucrator,total\n"
         assert all("Couldn't deliver" not in s for s in adapter.sent), adapter.sent
+
+    @pytest.mark.asyncio
+    async def test_adapter_holds_environment_lease_through_delivery(self, monkeypatch):
+        session_id = "session-with-artifact"
+        acquired = []
+        released = []
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+        monkeypatch.setattr(
+            "tools.terminal_tool.acquire_environment_lease",
+            lambda task_id: acquired.append(task_id)
+            or SimpleNamespace(release=lambda: released.append(task_id)),
+        )
+        adapter = _SessionKeyedAdapter(session_id)
+        adapter._keep_typing = _hold_typing
+        adapter.set_message_handler(lambda _event: asyncio.sleep(0, result="done"))
+        event = MessageEvent(
+            text="run",
+            source=SessionSource(
+                platform=Platform.TELEGRAM, chat_id="111", chat_type="dm"
+            ),
+        )
+
+        await adapter._process_message_background(
+            event, build_session_key(event.source)
+        )
+
+        assert acquired == [session_id]
+        assert released == [session_id]

@@ -7992,6 +7992,15 @@ class TelegramAdapter(BasePlatformAdapter):
         try:
             if not os.path.exists(file_path):
                 return SendResult(success=False, error=self._missing_media_path_error("File", file_path))
+            max_bytes = self.media_delivery_max_bytes()
+            if os.path.getsize(file_path) > max_bytes:
+                return SendResult(
+                    success=False,
+                    error=(
+                        "File exceeds Telegram's outbound upload limit "
+                        f"of {max_bytes // (1024 * 1024)} MB"
+                    ),
+                )
 
             display_name = file_name or os.path.basename(file_path)
             _thread = self._metadata_thread_id(metadata)
@@ -8029,6 +8038,12 @@ class TelegramAdapter(BasePlatformAdapter):
                 self.name, _redact_telegram_error_text(e),
             )
             return await super().send_document(chat_id, file_path, caption, file_name, reply_to, metadata=metadata)
+
+    def media_delivery_max_bytes(self) -> int:
+        """Telegram public Bot API: 50 MB; self-hosted Bot API: 2 GB."""
+        if self.config.extra.get("base_url"):
+            return 2 * 1024 * 1024 * 1024
+        return 50 * 1024 * 1024
 
     async def send_video(
         self,

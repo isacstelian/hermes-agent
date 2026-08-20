@@ -383,16 +383,12 @@ class TestMediaExtensionAllowlistParity:
 
 
     def test_unknown_extension_not_black_holed_by_cleanup(self):
-        """A MEDIA: tag with an unknown extension is NOT stripped from the
-        body by the extension-anchored cleanup — and when the path does not
-        validate (nonexistent file here), it is not delivered either, so the
-        tag survives visibly instead of vanishing (the core of issue #34517).
-        Validated unknown-extension paths DO deliver — see
-        TestUniversalMediaEgress (#36060)."""
+        """Unknown extensions reach downstream validation like known ones."""
         from gateway.platforms.base import MEDIA_TAG_CLEANUP_RE
         text = "Saved to MEDIA:/tmp/data.weirdext done"
-        media, _ = BasePlatformAdapter.extract_media(text)
-        assert media == []  # nonexistent path fails validation, not delivered
+        media, cleaned = BasePlatformAdapter.extract_media(text)
+        assert media == [("/tmp/data.weirdext", False)]
+        assert "MEDIA:" not in cleaned
         stripped = MEDIA_TAG_CLEANUP_RE.sub("", text)
         assert "/tmp/data.weirdext" in stripped  # path preserved, not dropped
 
@@ -426,9 +422,8 @@ class TestUniversalMediaEgress:
     """#36060: every MEDIA: path is deliverable regardless of file type.
 
     Known extensions extract unconditionally (MEDIA_TAG_CLEANUP_RE); unknown
-    extensions and extension-less files extract via the validated pass —
-    delivered when validate_media_delivery_path accepts them, left visible
-    when it does not (nonexistent, denylisted).
+    extensions and extension-less files are also extracted unconditionally;
+    downstream delivery applies host/backend containment and existence checks.
     """
 
     def _patch_allow_root(self, monkeypatch, root):

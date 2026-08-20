@@ -21750,7 +21750,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             media_files, _media_drops = (
                 BasePlatformAdapter.filter_media_delivery_paths_with_drops(
-                    media_files, task_id, _resolve_fetch_task_id
+                    media_files,
+                    task_id,
+                    _resolve_fetch_task_id,
+                    adapter.media_delivery_max_bytes(),
                 )
             )
             # Do NOT deduplicate explicit MEDIA tags against prior turns here
@@ -21966,6 +21969,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         _thread_metadata = self._thread_metadata_for_source(source, event_message_id)
 
+        from gateway.media_fetch import acquire_media_delivery_lease
+
+        _artifact_lease = acquire_media_delivery_lease(task_id)
+
         try:
             user_config = _load_gateway_config()
             model, runtime_kwargs = self._resolve_session_agent_runtime(
@@ -22069,7 +22076,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 media_files, _media_drops = (
                     BasePlatformAdapter.filter_media_delivery_paths_with_drops(
-                        media_files, task_id
+                        media_files,
+                        task_id,
+                        max_bytes=adapter.media_delivery_max_bytes(),
                     )
                 )
                 images, text_content = adapter.extract_images(response)
@@ -22166,6 +22175,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
             except Exception:
                 pass
+        finally:
+            if _artifact_lease is not None:
+                _artifact_lease.release()
 
 
 
