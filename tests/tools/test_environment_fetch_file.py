@@ -509,6 +509,11 @@ class TestDockerFetchFile:
         assert (destination / "old.txt").read_text() == "old"
         assert (source / "new.txt").read_text() == "new"
 
+        first_publish = tmp_path / "first-publish"
+        assert env.publish_directory_atomic(str(source), str(first_publish)) is False
+        assert (first_publish / "new.txt").read_text() == "new"
+        assert not source.exists()
+
     def test_docker_archive_push_streams_one_tar(self, tmp_path):
         env = self._make_env()
         archive_path = tmp_path / "skills.tar"
