@@ -760,6 +760,8 @@ def test_remote_daemon_rejects_extra_arg_bind(monkeypatch):
 
 
 def test_remote_auto_inputs_use_verified_artifact_bridge(monkeypatch, tmp_path):
+    profile_home = tmp_path / "profile"
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
     credential = tmp_path / "token.json"
     credential.write_bytes(b'{"token":"scoped"}')
     skill = tmp_path / "skills" / "report" / "SKILL.md"
@@ -785,6 +787,7 @@ def test_remote_auto_inputs_use_verified_artifact_bridge(monkeypatch, tmp_path):
     class _Bridge:
         def __init__(self, env, **kwargs):
             assert env is remote_env
+            assert kwargs["cache_dir"] == profile_home / "cache" / "artifact-bridge"
             assert kwargs["host_roots"]
             assert kwargs["container_roots"]
 

@@ -1793,6 +1793,11 @@ class DockerEnvironment(BaseEnvironment):
             ArtifactTransferError,
         )
 
+        bridge_cache = (
+            Path(os.getenv("HERMES_HOME", str(Path.home() / ".hermes"))).expanduser()
+            / "cache"
+            / "artifact-bridge"
+        )
         entries = {
             entry["container_path"]: entry["host_path"]
             for entry in [*get_credential_file_mounts(), *iter_skills_files()]
@@ -1804,7 +1809,7 @@ class DockerEnvironment(BaseEnvironment):
             try:
                 ArtifactBridge(
                     self,
-                    cache_dir=source.parent,
+                    cache_dir=bridge_cache,
                     host_roots=(source.parent,),
                     container_roots=(posixpath.dirname(container_path) or "/",),
                 ).push(source, container_path)
