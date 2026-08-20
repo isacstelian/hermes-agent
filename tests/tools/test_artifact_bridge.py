@@ -2,7 +2,6 @@
 
 import hashlib
 import os
-import re
 import shlex
 import tarfile
 from pathlib import Path
@@ -25,6 +24,7 @@ class _FakeEnvironment:
         self.fetch_destinations = []
         self.put_destinations = []
         self.archive_destinations = []
+        self.directory_publications = []
         self.commands = []
         self.metadata_calls = []
         self.metadata_many_calls = []
@@ -70,6 +70,36 @@ class _FakeEnvironment:
                     assert payload is not None
                     self.files[f"{destination}/{member.name}"] = payload.read()
 
+    def publish_directory_atomic(self, source, destination):
+        self.directory_publications.append((source, destination))
+        had_previous = any(
+            path == destination or path.startswith(destination + "/")
+            for path in self.files
+        )
+        source_files = {
+            destination + path.removeprefix(source): payload
+            for path, payload in self.files.items()
+            if path == source or path.startswith(source + "/")
+        }
+        destination_files = {
+            source + path.removeprefix(destination): payload
+            for path, payload in self.files.items()
+            if path == destination or path.startswith(destination + "/")
+        }
+        for path in list(self.files):
+            if (
+                path == source
+                or path.startswith(source + "/")
+                or path == destination
+                or path.startswith(destination + "/")
+            ):
+                self.files.pop(path)
+        self.files.update(source_files)
+        if had_previous:
+            self.files.update(destination_files)
+        self.realpaths[destination] = destination
+        return had_previous
+
     def execute(self, command, **kwargs):
         self.commands.append(command)
         if command.startswith("mkdir -p "):
@@ -88,52 +118,6 @@ class _FakeEnvironment:
             return {"returncode": 0, "output": ""}
         if command.startswith("rm -f -- "):
             self.files.pop(command.removeprefix("rm -f -- "), None)
-            return {"returncode": 0, "output": ""}
-        if command.startswith("if test -e ") and "; if mv -- " in command:
-            moves = re.findall(r"mv -- ([^ ;]+) ([^ ;]+)", command)
-            destination, backup = moves[0]
-            staging, published = moves[1]
-            previous = {
-                backup + path.removeprefix(destination): payload
-                for path, payload in self.files.items()
-                if path == destination or path.startswith(destination + "/")
-            }
-            staged = {
-                published + path.removeprefix(staging): payload
-                for path, payload in self.files.items()
-                if path == staging or path.startswith(staging + "/")
-            }
-            for path in list(self.files):
-                if (
-                    path == staging
-                    or path.startswith(staging + "/")
-                    or path == destination
-                    or path.startswith(destination + "/")
-                ):
-                    self.files.pop(path)
-            self.files.update(previous)
-            self.files.update(staged)
-            self.realpaths[published] = published
-            return {"returncode": 0, "output": ""}
-        if command.startswith("rm -rf -- ") and "; if test -e " in command:
-            destination = shlex.split(command.split(";", 1)[0])[-1]
-            backup, restored = re.findall(
-                r"mv -- ([^ ;]+) ([^ ;]+)", command
-            )[-1]
-            restored_files = {
-                restored + path.removeprefix(backup): payload
-                for path, payload in self.files.items()
-                if path == backup or path.startswith(backup + "/")
-            }
-            for path in list(self.files):
-                if (
-                    path == destination
-                    or path.startswith(destination + "/")
-                    or path == backup
-                    or path.startswith(backup + "/")
-                ):
-                    self.files.pop(path)
-            self.files.update(restored_files)
             return {"returncode": 0, "output": ""}
         if command.startswith("rm -rf -- "):
             prefixes = shlex.split(command)[3:]
@@ -292,6 +276,7 @@ def test_push_tree_532_files_has_constant_transport_call_budget(tmp_path):
     assert all(len(paths) == 532 for paths in env.metadata_many_calls)
     assert env.put_destinations == []
     assert env.metadata_calls == []
+    assert len(env.directory_publications) == 1
     assert {path: env.files[path] for path in expected} == expected
     assert list(cache.iterdir()) == []
 
@@ -340,6 +325,67 @@ def test_push_tree_final_hash_mismatch_rolls_back_previous_tree(tmp_path):
         bridge.push_tree(tree, "/workspace/skills")
 
     assert env.files == {old_path: b"old"}
+    assert len(env.directory_publications) == 2
+    assert list(cache.iterdir()) == []
+
+
+def test_push_tree_interruption_after_atomic_exchange_keeps_complete_trees(tmp_path):
+    class InterruptedEnvironment(_FakeEnvironment):
+        def publish_directory_atomic(self, source, destination):
+            result = super().publish_directory_atomic(source, destination)
+            raise ArtifactTransferError("interrupted after atomic exchange")
+
+    old_path = "/workspace/skills/existing.bin"
+    env = InterruptedEnvironment({old_path: b"old"})
+    bridge, inbox, cache = _bridge(tmp_path, env)
+    tree = inbox / "skills"
+    tree.mkdir()
+    (tree / "new.bin").write_bytes(b"new")
+
+    with pytest.raises(ArtifactTransferError, match="interrupted"):
+        bridge.push_tree(tree, "/workspace/skills")
+
+    assert env.files["/workspace/skills/new.bin"] == b"new"
+    retained_old = [
+        payload
+        for path, payload in env.files.items()
+        if "hermes-tree" in path and path.endswith("/existing.bin")
+    ]
+    assert retained_old == [b"old"]
+    assert list(cache.iterdir()) == []
+
+
+def test_push_tree_failed_atomic_rollback_retains_both_complete_trees(tmp_path):
+    class FailedRollbackEnvironment(_FakeEnvironment):
+        def fetch_file_metadata_many(self, paths):
+            result = super().fetch_file_metadata_many(paths)
+            if len(self.metadata_many_calls) == 2:
+                first = next(iter(result))
+                result[first] = (0, "0" * 64)
+            return result
+
+        def publish_directory_atomic(self, source, destination):
+            if self.directory_publications:
+                raise ArtifactTransferError("rollback interrupted")
+            return super().publish_directory_atomic(source, destination)
+
+    old_path = "/workspace/skills/existing.bin"
+    env = FailedRollbackEnvironment({old_path: b"old"})
+    bridge, inbox, cache = _bridge(tmp_path, env)
+    tree = inbox / "skills"
+    tree.mkdir()
+    (tree / "new.bin").write_bytes(b"new")
+
+    with pytest.raises(ArtifactTransferError, match="rollback failed"):
+        bridge.push_tree(tree, "/workspace/skills")
+
+    assert env.files["/workspace/skills/new.bin"] == b"new"
+    retained_old = [
+        payload
+        for path, payload in env.files.items()
+        if "hermes-tree" in path and path.endswith("/existing.bin")
+    ]
+    assert retained_old == [b"old"]
     assert list(cache.iterdir()) == []
 
 

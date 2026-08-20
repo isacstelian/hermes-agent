@@ -1,7 +1,6 @@
 import hashlib
 import logging
 import os
-import re
 import shlex
 from io import BytesIO, StringIO
 from pathlib import Path
@@ -866,6 +865,20 @@ def test_remote_auto_inputs_stage_from_read_only_source_directory(monkeypatch, t
 
     remote_env.put_archive = put_archive
 
+    def publish_directory_atomic(source, destination):
+        staged = {
+            destination + path.removeprefix(source): payload
+            for path, payload in list(files.items())
+            if path == source or path.startswith(source + "/")
+        }
+        for path in list(files):
+            if path == source or path.startswith(source + "/"):
+                files.pop(path, None)
+        files.update(staged)
+        return False
+
+    remote_env.publish_directory_atomic = publish_directory_atomic
+
     def execute(command, **_kwargs):
         if command.startswith("mkdir -p -- "):
             return {"returncode": 0, "output": ""}
@@ -877,31 +890,6 @@ def test_remote_auto_inputs_stage_from_read_only_source_directory(monkeypatch, t
             return {"returncode": 0, "output": ""}
         if command.startswith("rm -f -- "):
             files.pop(command.removeprefix("rm -f -- "), None)
-            return {"returncode": 0, "output": ""}
-        if command.startswith("if test -e ") and "; if mv -- " in command:
-            moves = re.findall(r"mv -- ([^ ;]+) ([^ ;]+)", command)
-            destination, backup = moves[0]
-            staging, published = moves[1]
-            previous = {
-                backup + path.removeprefix(destination): payload
-                for path, payload in list(files.items())
-                if path == destination or path.startswith(destination + "/")
-            }
-            staged = {
-                published + path.removeprefix(staging): payload
-                for path, payload in list(files.items())
-                if path == staging or path.startswith(staging + "/")
-            }
-            for path in list(files):
-                if (
-                    path == staging
-                    or path.startswith(staging + "/")
-                    or path == destination
-                    or path.startswith(destination + "/")
-                ):
-                    files.pop(path, None)
-            files.update(previous)
-            files.update(staged)
             return {"returncode": 0, "output": ""}
         if command.startswith("rm -rf -- "):
             for prefix in shlex.split(command)[3:]:

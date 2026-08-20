@@ -2486,6 +2486,64 @@ class DockerEnvironment(BaseEnvironment):
                 f"archive push to {remote_dir!r} failed: {exc}"
             ) from exc
 
+    def publish_directory_atomic(self, source: str, destination: str) -> bool:
+        """Atomically publish or exchange two container directories."""
+        source = posixpath.normpath(source)
+        destination = posixpath.normpath(destination)
+        if (
+            not source.startswith("/")
+            or not destination.startswith("/")
+            or source == destination
+        ):
+            raise FileFetchError("invalid atomic directory publication paths")
+        marker = f"__HERMES_DIRECTORY_{uuid.uuid4().hex[:12]}__"
+        script = (
+            "import ctypes, os, sys\n"
+            "source, destination = sys.argv[1:3]\n"
+            "if os.path.lexists(destination):\n"
+            "    libc = ctypes.CDLL(None, use_errno=True)\n"
+            "    renameat2 = getattr(libc, 'renameat2', None)\n"
+            "    if renameat2 is None:\n"
+            "        raise OSError('renameat2 is unavailable')\n"
+            "    renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, "
+            "ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]\n"
+            "    result = renameat2(-100, os.fsencode(source), -100, "
+            "os.fsencode(destination), 2)\n"
+            "    if result != 0:\n"
+            "        error = ctypes.get_errno()\n"
+            "        raise OSError(error, os.strerror(error))\n"
+            f"    print('{marker}EXCHANGED')\n"
+            "else:\n"
+            "    os.rename(source, destination)\n"
+            f"    print('{marker}MOVED')\n"
+        )
+        command = (
+            "if command -v python3 >/dev/null 2>&1; then python_bin=python3; "
+            "elif command -v python >/dev/null 2>&1; then python_bin=python; "
+            "else exit 127; fi; "
+            f"\"$python_bin\" -c {shlex.quote(script)} "
+            f"{shlex.quote(source)} {shlex.quote(destination)}"
+        )
+        result = self.execute(
+            command,
+            timeout=_FETCH_TIMEOUT_SECONDS,
+            rewrite_compound_background=False,
+        )
+        if int(result.get("returncode") or 0) != 0:
+            raise FileFetchError(
+                f"atomic directory publication failed for {destination!r}"
+            )
+        outcomes = [
+            line.removeprefix(marker)
+            for line in (result.get("output") or "").splitlines()
+            if line.startswith(marker)
+        ]
+        if outcomes == ["EXCHANGED"]:
+            return True
+        if outcomes == ["MOVED"]:
+            return False
+        raise FileFetchError("atomic directory publication returned invalid output")
+
     def _remove_remote_transfer_target(self, remote_path: str) -> None:
         if not self._container_id:
             return

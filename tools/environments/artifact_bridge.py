@@ -45,6 +45,8 @@ class ArtifactEnvironment(Protocol):
 
     def put_archive(self, local_archive: str, remote_dir: str) -> None: ...
 
+    def publish_directory_atomic(self, source: str, destination: str) -> bool: ...
+
     def execute(self, command: str, **kwargs) -> dict: ...
 
 
@@ -471,10 +473,6 @@ class ArtifactBridge:
             parent,
             f".{posixpath.basename(destination)}.hermes-tree-{uuid.uuid4().hex}.tmp",
         )
-        backup = posixpath.join(
-            parent,
-            f".{posixpath.basename(destination)}.hermes-tree-{uuid.uuid4().hex}.bak",
-        )
         archive_path = self._cache_dir / (
             f".hermes-host-tree-{uuid.uuid4().hex}.tar.tmp"
         )
@@ -482,20 +480,8 @@ class ArtifactBridge:
         expected_relative: dict[str, tuple[int, str]] = {}
         published_live = False
         verified_live = False
-
-        def rollback_publication() -> None:
-            rollback = self._environment.execute(
-                f"rm -rf -- {shlex.quote(destination)}; "
-                f"if test -e {shlex.quote(backup)} || "
-                f"test -L {shlex.quote(backup)}; then "
-                f"mv -- {shlex.quote(backup)} {shlex.quote(destination)}; fi",
-                rewrite_compound_background=False,
-            )
-            if int(rollback.get("returncode") or 0) != 0:
-                raise ArtifactTransferError(
-                    "artifact tree transfer failed and rollback failed "
-                    f"for {container_dir!r}"
-                )
+        safe_to_cleanup_staging = True
+        had_previous = False
 
         try:
             with tarfile.open(archive_path, mode="w") as archive:
@@ -575,22 +561,11 @@ class ArtifactBridge:
                     f"artifact tree verification failed while pushing {host_dir!s}"
                 )
             self._assert_generation()
-            published = self._environment.execute(
-                f"if test -e {shlex.quote(destination)} || "
-                f"test -L {shlex.quote(destination)}; then "
-                f"mv -- {shlex.quote(destination)} {shlex.quote(backup)} || exit $?; "
-                "fi; "
-                f"if mv -- {shlex.quote(staging)} {shlex.quote(destination)}; then "
-                ":; else status=$?; "
-                f"if test -e {shlex.quote(backup)} || test -L {shlex.quote(backup)}; "
-                f"then mv -- {shlex.quote(backup)} {shlex.quote(destination)}; fi; "
-                "exit $status; fi",
-                rewrite_compound_background=False,
+            safe_to_cleanup_staging = False
+            had_previous = self._environment.publish_directory_atomic(
+                staging, destination
             )
-            if int(published.get("returncode") or 0) != 0:
-                raise ArtifactTransferError(
-                    f"could not publish container artifact tree: {container_dir}"
-                )
+            safe_to_cleanup_staging = True
             published_live = True
             self._assert_generation()
             final = self._environment.fetch_file_metadata_many(expected)
@@ -600,19 +575,19 @@ class ArtifactBridge:
                     f"artifact tree verification failed after publishing {container_dir!r}"
                 )
             verified_live = True
-            removed = self._environment.execute(
-                f"rm -rf -- {shlex.quote(backup)}",
-                rewrite_compound_background=False,
-            )
-            if int(removed.get("returncode") or 0) != 0:
-                raise ArtifactTransferError(
-                    f"could not remove container artifact tree backup: {container_dir}"
-                )
         except ArtifactTransferError as exc:
             if published_live and not verified_live:
                 try:
-                    rollback_publication()
-                except ArtifactTransferError as rollback_error:
+                    safe_to_cleanup_staging = False
+                    restored_previous = self._environment.publish_directory_atomic(
+                        destination, staging
+                    )
+                    if restored_previous != had_previous:
+                        raise ArtifactTransferError(
+                            "artifact tree rollback state did not match publication"
+                        )
+                    safe_to_cleanup_staging = True
+                except Exception as rollback_error:
                     raise ArtifactTransferError(
                         "artifact tree transfer failed and rollback failed "
                         f"for {container_dir!r}"
@@ -621,8 +596,16 @@ class ArtifactBridge:
         except Exception as exc:
             if published_live and not verified_live:
                 try:
-                    rollback_publication()
-                except ArtifactTransferError as rollback_error:
+                    safe_to_cleanup_staging = False
+                    restored_previous = self._environment.publish_directory_atomic(
+                        destination, staging
+                    )
+                    if restored_previous != had_previous:
+                        raise ArtifactTransferError(
+                            "artifact tree rollback state did not match publication"
+                        )
+                    safe_to_cleanup_staging = True
+                except Exception as rollback_error:
                     raise ArtifactTransferError(
                         "artifact tree transfer failed and rollback failed "
                         f"for {container_dir!r}"
@@ -632,10 +615,11 @@ class ArtifactBridge:
             ) from exc
         finally:
             archive_path.unlink(missing_ok=True)
-            try:
-                self._environment.execute(
-                    f"rm -rf -- {shlex.quote(staging)}",
-                    rewrite_compound_background=False,
-                )
-            except Exception:
-                pass
+            if safe_to_cleanup_staging:
+                try:
+                    self._environment.execute(
+                        f"rm -rf -- {shlex.quote(staging)}",
+                        rewrite_compound_background=False,
+                    )
+                except Exception:
+                    pass

@@ -81,6 +81,28 @@ def test_real_ssh_daemon_round_trips_docx_and_large_pdf(tmp_path, monkeypatch):
         )
         assert env.fetch_file_metadata("/workspace/inbound.docx") == expected_docx
 
+        existing = env.execute(
+            "mkdir -p /workspace/skills && printf old > /workspace/skills/old.txt",
+            rewrite_compound_background=False,
+        )
+        assert existing["returncode"] == 0, existing
+        skills = tmp_path / "skills"
+        skills.mkdir()
+        expected_skills = {}
+        for index in range(532):
+            path = skills / f"skill-{index:03d}.txt"
+            payload = f"remote-skill-{index}".encode()
+            path.write_bytes(payload)
+            expected_skills[f"/workspace/skills/{path.name}"] = (
+                len(payload),
+                hashlib.sha256(payload).hexdigest(),
+            )
+
+        bridge.push_tree(skills, "/workspace/skills")
+
+        assert env.fetch_file_metadata_many(expected_skills) == expected_skills
+        assert env.fetch_file_metadata("/workspace/skills/old.txt") is None
+
         payload_size = 9 * 1024 * 1024
         script = (
             "from pathlib import Path; "

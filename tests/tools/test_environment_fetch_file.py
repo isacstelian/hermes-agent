@@ -482,6 +482,33 @@ class TestDockerFetchFile:
         assert result["returncode"] == 1
         env._recreate_container.assert_not_called()
 
+    def test_docker_directory_publication_uses_atomic_exchange(self, tmp_path):
+        env = self._make_env()
+        source = tmp_path / "staging"
+        destination = tmp_path / "live"
+        source.mkdir()
+        destination.mkdir()
+        (source / "new.txt").write_text("new")
+        (destination / "old.txt").write_text("old")
+
+        def shell_execute(command, **_kwargs):
+            result = subprocess.run(
+                ["bash", "-c", command],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            return {"returncode": result.returncode, "output": result.stdout + result.stderr}
+
+        env.execute = shell_execute
+
+        assert env.publish_directory_atomic(str(source), str(destination)) is True
+        assert (destination / "new.txt").read_text() == "new"
+        assert (source / "old.txt").read_text() == "old"
+        assert env.publish_directory_atomic(str(destination), str(source)) is True
+        assert (destination / "old.txt").read_text() == "old"
+        assert (source / "new.txt").read_text() == "new"
+
     def test_docker_archive_push_streams_one_tar(self, tmp_path):
         env = self._make_env()
         archive_path = tmp_path / "skills.tar"
