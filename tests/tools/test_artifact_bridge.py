@@ -3,6 +3,7 @@
 import hashlib
 import os
 import shlex
+import tarfile
 from pathlib import Path
 
 import pytest
@@ -22,6 +23,7 @@ class _FakeEnvironment:
         self.realpaths = dict(realpaths or {})
         self.fetch_destinations = []
         self.put_destinations = []
+        self.archive_destinations = []
         self.commands = []
 
     def fetch_realpath(self, path):
@@ -32,6 +34,9 @@ class _FakeEnvironment:
         if payload is None:
             return None
         return len(payload), hashlib.sha256(payload).hexdigest()
+
+    def fetch_file_metadata_many(self, paths):
+        return {path: self.fetch_file_metadata(path) for path in paths}
 
     def fetch_file(self, path, destination, max_bytes=None):
         self.fetch_destinations.append(Path(destination))
@@ -44,9 +49,21 @@ class _FakeEnvironment:
         self.put_destinations.append(destination)
         self.files[destination] = Path(source).read_bytes()
 
+    def put_archive(self, source, destination):
+        self.archive_destinations.append(destination)
+        with tarfile.open(source, "r") as archive:
+            for member in archive.getmembers():
+                if member.isfile():
+                    payload = archive.extractfile(member)
+                    assert payload is not None
+                    self.files[f"{destination}/{member.name}"] = payload.read()
+
     def execute(self, command, **kwargs):
         self.commands.append(command)
         if command.startswith("mkdir -p "):
+            self.realpaths[shlex.split(command)[-1]] = shlex.split(command)[-1]
+            return {"returncode": 0, "output": ""}
+        if command.startswith("mkdir -m 700 -- "):
             self.realpaths[shlex.split(command)[-1]] = shlex.split(command)[-1]
             return {"returncode": 0, "output": ""}
         if command.startswith("ln -- "):
@@ -59,6 +76,29 @@ class _FakeEnvironment:
             return {"returncode": 0, "output": ""}
         if command.startswith("rm -f -- "):
             self.files.pop(command.removeprefix("rm -f -- "), None)
+            return {"returncode": 0, "output": ""}
+        if command.startswith("rm -rf -- ") and " && mv -- " in command:
+            remove, move = command.split(" && mv -- ", 1)
+            destination = shlex.split(remove)[-1]
+            staging, published = shlex.split(move)
+            staged = {
+                published + path.removeprefix(staging): payload
+                for path, payload in self.files.items()
+                if path.startswith(staging + "/")
+            }
+            for path in list(self.files):
+                if path.startswith(staging + "/") or path.startswith(
+                    destination + "/"
+                ):
+                    self.files.pop(path)
+            self.files.update(staged)
+            self.realpaths[published] = published
+            return {"returncode": 0, "output": ""}
+        if command.startswith("rm -rf -- "):
+            prefix = shlex.split(command)[-1]
+            for path in list(self.files):
+                if path == prefix or path.startswith(prefix + "/"):
+                    self.files.pop(path)
             return {"returncode": 0, "output": ""}
         raise AssertionError(f"unexpected command: {command}")
 
@@ -172,6 +212,38 @@ def test_push_uses_remote_temp_verifies_then_renames(tmp_path):
     assert env.put_destinations[0] != "/workspace/uploads/payload.bin"
     assert not any(".hermes-artifact-" in path for path in env.files)
     assert any(command.startswith("mv -f -- ") for command in env.commands)
+
+
+def test_push_tree_batches_files_and_atomically_publishes(tmp_path):
+    env = _FakeEnvironment()
+    bridge, inbox, cache = _bridge(tmp_path, env)
+    tree = inbox / "skills"
+    (tree / "report" / "scripts").mkdir(parents=True)
+    (tree / "report" / "SKILL.md").write_text("# Report")
+    (tree / "report" / "scripts" / "run.py").write_bytes(b"print('ok')")
+
+    bridge.push_tree(tree, "/workspace/skills")
+
+    assert len(env.archive_destinations) == 1
+    assert env.files["/workspace/skills/report/SKILL.md"] == b"# Report"
+    assert env.files["/workspace/skills/report/scripts/run.py"] == b"print('ok')"
+    assert not any("hermes-tree" in path for path in env.files)
+    assert list(cache.iterdir()) == []
+
+
+def test_push_tree_rejects_symlinks_before_transport(tmp_path):
+    env = _FakeEnvironment()
+    bridge, inbox, _cache = _bridge(tmp_path, env)
+    tree = inbox / "skills"
+    tree.mkdir()
+    outside = tmp_path / "secret"
+    outside.write_text("secret")
+    (tree / "link").symlink_to(outside)
+
+    with pytest.raises(ArtifactSecurityError, match="symlink"):
+        bridge.push_tree(tree, "/workspace/skills")
+
+    assert env.archive_destinations == []
 
 
 def test_push_creates_missing_allowed_root_below_safe_ancestor(tmp_path):

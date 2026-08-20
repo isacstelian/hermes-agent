@@ -11,6 +11,7 @@ import os
 import posixpath
 import shlex
 import stat
+import tarfile
 import uuid
 from pathlib import Path
 from typing import Iterable, Protocol
@@ -31,11 +32,17 @@ class ArtifactEnvironment(Protocol):
 
     def fetch_file_metadata(self, remote_path: str) -> tuple[int, str] | None: ...
 
+    def fetch_file_metadata_many(
+        self, remote_paths: Iterable[str]
+    ) -> dict[str, tuple[int, str] | None]: ...
+
     def fetch_file(
         self, remote_path: str, local_dest: str, max_bytes: int | None = None
     ) -> None: ...
 
     def put_file(self, local_source: str, remote_dest: str) -> None: ...
+
+    def put_archive(self, local_archive: str, remote_dir: str) -> None: ...
 
     def execute(self, command: str, **kwargs) -> dict: ...
 
@@ -413,6 +420,139 @@ class ArtifactBridge:
             try:
                 self._environment.execute(
                     f"rm -f -- {shlex.quote(temp_path)}",
+                    rewrite_compound_background=False,
+                )
+            except Exception:
+                pass
+
+    def push_tree(self, host_dir: str | Path, container_dir: str) -> None:
+        """Publish one host directory with a single verified archive transfer."""
+        self._assert_generation()
+        source_root = Path(host_dir).expanduser().resolve(strict=True)
+        if not source_root.is_dir() or not _is_within_host(
+            source_root, self._host_roots
+        ):
+            raise ArtifactSecurityError(
+                f"host artifact tree is outside allowed host roots: {host_dir!s}"
+            )
+        destination = self._guard_container_lexical(container_dir)
+        parent = self._ensure_container_directory(
+            posixpath.dirname(destination) or "/"
+        )
+        destination = posixpath.join(parent, posixpath.basename(destination))
+        staging = posixpath.join(
+            parent,
+            f".{posixpath.basename(destination)}.hermes-tree-{uuid.uuid4().hex}.tmp",
+        )
+        archive_path = self._cache_dir / (
+            f".hermes-host-tree-{uuid.uuid4().hex}.tar.tmp"
+        )
+        expected: dict[str, tuple[int, str]] = {}
+        expected_relative: dict[str, tuple[int, str]] = {}
+        try:
+            with tarfile.open(archive_path, mode="w") as archive:
+                for root, dirnames, filenames in os.walk(source_root):
+                    root_path = Path(root)
+                    for dirname in dirnames:
+                        if (root_path / dirname).is_symlink():
+                            raise ArtifactSecurityError(
+                                f"host artifact tree contains a symlink: "
+                                f"{root_path / dirname!s}"
+                            )
+                    for filename in filenames:
+                        source = root_path / filename
+                        if source.is_symlink():
+                            raise ArtifactSecurityError(
+                                f"host artifact tree contains a symlink: {source!s}"
+                            )
+                        source = self._guard_host_source(source)
+                        relative = source.relative_to(source_root).as_posix()
+                        if any(ord(char) < 32 for char in relative):
+                            raise ArtifactSecurityError(
+                                "host artifact tree paths cannot contain control characters"
+                            )
+                        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                        descriptor = os.open(source, flags)
+                        try:
+                            opened = os.fstat(descriptor)
+                            current = os.lstat(source)
+                            if (
+                                not stat.S_ISREG(opened.st_mode)
+                                or not stat.S_ISREG(current.st_mode)
+                                or (opened.st_dev, opened.st_ino)
+                                != (current.st_dev, current.st_ino)
+                            ):
+                                raise ArtifactSecurityError(
+                                    f"host artifact changed after validation: {source!s}"
+                                )
+                            digest = hashlib.sha256()
+                            with os.fdopen(descriptor, "rb", closefd=False) as payload:
+                                for chunk in iter(
+                                    lambda: payload.read(1024 * 1024), b""
+                                ):
+                                    digest.update(chunk)
+                                payload.seek(0)
+                                member = tarfile.TarInfo(relative)
+                                member.size = opened.st_size
+                                member.mode = opened.st_mode & 0o777
+                                member.mtime = int(opened.st_mtime)
+                                archive.addfile(member, payload)
+                            metadata = (
+                                opened.st_size,
+                                digest.hexdigest(),
+                            )
+                            expected_relative[relative] = metadata
+                            expected[posixpath.join(destination, relative)] = metadata
+                        finally:
+                            os.close(descriptor)
+
+            created = self._environment.execute(
+                f"mkdir -m 700 -- {shlex.quote(staging)}",
+                rewrite_compound_background=False,
+            )
+            if int(created.get("returncode") or 0) != 0:
+                raise ArtifactTransferError(
+                    f"could not create container tree staging directory: {container_dir}"
+                )
+            self._environment.put_archive(str(archive_path), staging)
+            self._assert_generation()
+            staging_expected = {
+                posixpath.join(staging, relative): metadata
+                for relative, metadata in expected_relative.items()
+            }
+            actual = self._environment.fetch_file_metadata_many(staging_expected)
+            self._assert_generation()
+            if actual != staging_expected:
+                raise ArtifactTransferError(
+                    f"artifact tree verification failed while pushing {host_dir!s}"
+                )
+            published = self._environment.execute(
+                f"rm -rf -- {shlex.quote(destination)} && "
+                f"mv -- {shlex.quote(staging)} {shlex.quote(destination)}",
+                rewrite_compound_background=False,
+            )
+            if int(published.get("returncode") or 0) != 0:
+                raise ArtifactTransferError(
+                    f"could not publish container artifact tree: {container_dir}"
+                )
+            self._assert_generation()
+            final = self._environment.fetch_file_metadata_many(expected)
+            self._assert_generation()
+            if final != expected:
+                raise ArtifactTransferError(
+                    f"artifact tree verification failed after publishing {container_dir!r}"
+                )
+        except ArtifactTransferError:
+            raise
+        except Exception as exc:
+            raise ArtifactTransferError(
+                f"could not push host artifact tree {host_dir!s}: {exc}"
+            ) from exc
+        finally:
+            archive_path.unlink(missing_ok=True)
+            try:
+                self._environment.execute(
+                    f"rm -rf -- {shlex.quote(staging)}",
                     rewrite_compound_background=False,
                 )
             except Exception:

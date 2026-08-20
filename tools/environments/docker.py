@@ -20,7 +20,7 @@ import tempfile
 import threading
 import uuid
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, Optional
 
 from hermes_constants import get_hermes_home
 from tools.environments.base import (
@@ -1787,7 +1787,7 @@ class DockerEnvironment(BaseEnvironment):
 
         from tools.credential_files import (
             get_credential_file_mounts,
-            iter_skills_files,
+            get_skills_directory_mount,
         )
         from tools.environments.artifact_bridge import (
             ArtifactBridge,
@@ -1796,7 +1796,7 @@ class DockerEnvironment(BaseEnvironment):
         bridge_cache = get_hermes_home() / "cache" / "artifact-bridge"
         entries = {
             entry["container_path"]: entry["host_path"]
-            for entry in [*get_credential_file_mounts(), *iter_skills_files()]
+            for entry in get_credential_file_mounts()
         }
         for container_path, host_path in entries.items():
             source = Path(host_path)
@@ -1809,6 +1809,25 @@ class DockerEnvironment(BaseEnvironment):
                     host_roots=(source.parent,),
                     container_roots=(posixpath.dirname(container_path) or "/",),
                 ).push(source, container_path)
+            except (ArtifactTransferError, OSError, ValueError) as exc:
+                raise RuntimeError(
+                    f"Docker remote input staging failed for {container_path}: {exc}"
+                ) from exc
+
+        for entry in get_skills_directory_mount():
+            source = Path(entry["host_path"])
+            container_path = entry["container_path"]
+            if not source.is_dir():
+                continue
+            try:
+                ArtifactBridge(
+                    self,
+                    cache_dir=bridge_cache,
+                    host_roots=(source,),
+                    container_roots=(
+                        posixpath.dirname(container_path) or "/",
+                    ),
+                ).push_tree(source, container_path)
             except (ArtifactTransferError, OSError, ValueError) as exc:
                 raise RuntimeError(
                     f"Docker remote input staging failed for {container_path}: {exc}"
@@ -1931,6 +1950,72 @@ class DockerEnvironment(BaseEnvironment):
             if normalized == prefix or normalized.startswith(prefix + "/"):
                 return os.path.join(host_root, normalized[len(prefix):].lstrip("/"))
         return None
+
+    def fetch_file_metadata_many(
+        self, remote_paths: Iterable[str]
+    ) -> dict[str, tuple[int, str] | None]:
+        """Hash many container files through one Docker exec round trip."""
+        paths = list(dict.fromkeys(remote_paths))
+        if not paths:
+            return {}
+        if any(
+            not isinstance(path, str)
+            or not path.startswith("/")
+            or any(ord(char) < 32 for char in path)
+            for path in paths
+        ):
+            raise FileFetchError("invalid path in container metadata batch")
+        marker = f"__HERMES_META_{uuid.uuid4().hex[:12]}__"
+        command = (
+            "if command -v sha256sum >/dev/null 2>&1; then hasher=sha256sum; "
+            "elif command -v shasum >/dev/null 2>&1; then hasher=shasum; "
+            "elif command -v openssl >/dev/null 2>&1; then hasher=openssl; "
+            "else exit 127; fi\n"
+            "index=0\n"
+            "while IFS= read -r path; do\n"
+            "  if test -f \"$path\"; then\n"
+            "    size=$(wc -c < \"$path\") || exit 1\n"
+            "    if test \"$hasher\" = sha256sum; then "
+            "digest=$(sha256sum \"$path\" 2>/dev/null | awk '{print $1}'); "
+            "elif test \"$hasher\" = shasum; then "
+            "digest=$(shasum -a 256 \"$path\" 2>/dev/null | awk '{print $1}'); "
+            "else digest=$(openssl dgst -sha256 \"$path\" 2>/dev/null | "
+            "awk '{print $NF}'); fi || exit 1\n"
+            f"    printf '{marker}%s %s %s\\n' \"$index\" \"$size\" \"$digest\"\n"
+            "  else\n"
+            f"    printf '{marker}%s MISSING\\n' \"$index\"\n"
+            "  fi\n"
+            "  index=$((index + 1))\n"
+            "done"
+        )
+        result = self.execute(
+            command,
+            stdin_data="\n".join(paths) + "\n",
+            timeout=_FETCH_TIMEOUT_SECONDS,
+            rewrite_compound_background=False,
+        )
+        if int(result.get("returncode") or 0) != 0:
+            raise FileFetchError("container metadata batch failed")
+        metadata: dict[str, tuple[int, str] | None] = {
+            path: None for path in paths
+        }
+        pattern = re.compile(
+            rf"^{re.escape(marker)}([0-9]+) ([0-9]+) ([0-9a-fA-F]{{64}})$"
+        )
+        missing = re.compile(rf"^{re.escape(marker)}([0-9]+) MISSING$")
+        for line in (result.get("output") or "").splitlines():
+            match = pattern.fullmatch(line.strip())
+            if match:
+                index = int(match.group(1))
+                if index < len(paths):
+                    metadata[paths[index]] = (
+                        int(match.group(2)), match.group(3).lower()
+                    )
+                continue
+            match = missing.fullmatch(line.strip())
+            if match and int(match.group(1)) >= len(paths):
+                raise FileFetchError("invalid container metadata batch response")
+        return metadata
 
     def fetch_file(
         self,
@@ -2308,6 +2393,60 @@ class DockerEnvironment(BaseEnvironment):
                 remote_dest,
             )
             super().put_file(str(source), remote_dest)
+
+    def put_archive(self, local_archive: str, remote_dir: str) -> None:
+        """Extract one trusted host-built tar archive through one Docker exec."""
+        if not self._container_id:
+            raise FileFetchError("Docker container not started")
+        archive = Path(local_archive)
+        normalized = posixpath.normpath(remote_dir)
+        if not archive.is_file() or not normalized.startswith("/"):
+            raise FileFetchError("invalid archive transfer source or destination")
+        try:
+            with archive.open("rb") as payload:
+                with tarfile.open(fileobj=payload, mode="r:*") as stream:
+                    for member in stream.getmembers():
+                        member_path = posixpath.normpath(member.name)
+                        if (
+                            not member.isfile()
+                            or member_path in ("", ".", "..")
+                            or member_path.startswith("../")
+                            or member_path.startswith("/")
+                        ):
+                            raise FileFetchError(
+                                "archive push contains an unsafe member"
+                            )
+                payload.seek(0)
+                result = subprocess.run(
+                    [
+                        self._docker_exe,
+                        "exec",
+                        "-i",
+                        self._container_id,
+                        "tar",
+                        "-xf",
+                        "-",
+                        "-C",
+                        normalized,
+                    ],
+                    stdin=payload,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=_FETCH_TIMEOUT_SECONDS,
+                )
+            if result.returncode != 0:
+                detail = (result.stderr or b"").decode("utf-8", "replace").strip()
+                raise FileFetchError(
+                    f"archive push to {remote_dir!r} failed: {detail}"
+                )
+        except subprocess.TimeoutExpired as exc:
+            raise FileFetchError(
+                f"archive push to {remote_dir!r} timed out"
+            ) from exc
+        except OSError as exc:
+            raise FileFetchError(
+                f"archive push to {remote_dir!r} failed: {exc}"
+            ) from exc
 
     def _remove_remote_transfer_target(self, remote_path: str) -> None:
         if not self._container_id:
