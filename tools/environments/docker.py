@@ -393,10 +393,11 @@ def docker_endpoint_is_remote(docker_exe: str) -> bool:
                 check=False,
                 stdin=subprocess.DEVNULL,
             )
-            if shown.returncode == 0:
-                context = shown.stdout.strip()
+            if shown.returncode != 0:
+                return True
+            context = shown.stdout.strip()
         except (OSError, subprocess.TimeoutExpired):
-            context = ""
+            return True
     if not context or context == "default":
         return False
 
@@ -2533,6 +2534,13 @@ class DockerEnvironment(BaseEnvironment):
                 )
                 continue
             legacy_identity = task_key_missing and profile_key_missing
+            if legacy_identity:
+                raise RuntimeError(
+                    "found a legacy Hermes Docker container whose exact task/profile "
+                    f"identity cannot be verified ({container_id[:12]}). Remove or "
+                    "reset that container before retrying; Hermes will not reuse, "
+                    "replace, or race an identity-unknown container."
+                )
             if not legacy_identity and (
                 actual_task_key != task_key or actual_profile_key != profile_key
             ):
@@ -2544,11 +2552,7 @@ class DockerEnvironment(BaseEnvironment):
                 if egress_label == "off"
                 else actual_egress == egress_label
             )
-            if (
-                not legacy_identity
-                and actual_mounts == mounts_label
-                and egress_matches
-            ):
+            if actual_mounts == mounts_label and egress_matches:
                 continue
             removed = subprocess.run(
                 [self._docker_exe, "rm", "-f", container_id],

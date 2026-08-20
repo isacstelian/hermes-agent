@@ -217,9 +217,9 @@ def _active_remote_environment(task_id: Optional[str] = None):
     session exists — with an ephemeral sandbox the artifact is gone with it,
     so this is a real "cannot deliver", not something to retry.
 
-    The gateway keys terminal environments by session id, but a shared-
-    container deployment collapses every session onto ``"default"``, so try
-    the session's own id first and fall back.
+    The gateway keys terminal environments by session id. ``get_active_env``
+    already collapses that id onto ``"default"`` in shared-container mode;
+    an explicit session miss must not fall back to another session's sandbox.
     """
     backend = (os.getenv("TERMINAL_ENV") or "local").strip().lower()
     from agent.prompt_builder import _REMOTE_TERMINAL_BACKENDS
@@ -229,8 +229,7 @@ def _active_remote_environment(task_id: Optional[str] = None):
     try:
         from tools.terminal_tool import get_active_env
 
-        env = get_active_env(task_id) if task_id else None
-        return backend, env or get_active_env("default")
+        return backend, get_active_env(task_id or "default")
     except Exception as exc:
         logger.debug("Remote media fetch: could not resolve active env: %s", exc)
         return backend, None

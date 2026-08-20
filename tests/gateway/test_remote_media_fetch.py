@@ -221,6 +221,25 @@ class TestFetchRemoteMedia:
         assert local is None
         assert "no active docker terminal session" in reason
 
+    def test_session_miss_does_not_fall_back_to_foreign_default_env(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+        monkeypatch.setattr(
+            "gateway.platforms.base.DOCUMENT_CACHE_DIR", tmp_path / "doc_cache"
+        )
+        foreign = _FakeRemoteEnv({"/root/raport.xlsx": b"foreign session"})
+        monkeypatch.setattr(
+            "tools.terminal_tool.get_active_env",
+            lambda task_id: foreign if task_id == "default" else None,
+        )
+
+        local, reason = fetch_remote_media("/root/raport.xlsx", "session-1")
+
+        assert local is None
+        assert "no active docker terminal session" in reason
+        assert foreign.fetched == []
+
     def test_local_backend_does_not_fetch(self, monkeypatch):
         monkeypatch.setenv("TERMINAL_ENV", "local")
 

@@ -81,3 +81,31 @@ def test_uninspectable_named_context_fails_closed(monkeypatch):
     )
 
     assert docker_env.docker_endpoint_is_remote("docker") is True
+
+
+def test_current_context_probe_nonzero_fails_closed(monkeypatch):
+    monkeypatch.delenv("DOCKER_HOST", raising=False)
+    monkeypatch.delenv("DOCKER_CONTEXT", raising=False)
+    monkeypatch.setattr(
+        docker_env.subprocess,
+        "run",
+        lambda cmd, **kwargs: subprocess.CompletedProcess(
+            cmd, 1, stdout="", stderr="daemon unavailable"
+        ),
+    )
+
+    assert docker_env.docker_endpoint_is_remote("docker") is True
+
+
+def test_current_context_probe_timeout_fails_closed(monkeypatch):
+    monkeypatch.delenv("DOCKER_HOST", raising=False)
+    monkeypatch.delenv("DOCKER_CONTEXT", raising=False)
+    monkeypatch.setattr(
+        docker_env.subprocess,
+        "run",
+        lambda cmd, **kwargs: (_ for _ in ()).throw(
+            subprocess.TimeoutExpired(cmd, 10)
+        ),
+    )
+
+    assert docker_env.docker_endpoint_is_remote("docker") is True

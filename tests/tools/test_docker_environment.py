@@ -853,12 +853,13 @@ def test_stale_immutable_config_container_is_removed(monkeypatch):
     assert any(cmd[1:4] == ["rm", "-f", "old-cid"] for cmd, _ in calls)
 
 
-def test_pre_identity_label_container_is_removed_during_upgrade(monkeypatch):
-    """A persistent container from before identity labels must not survive an
-    upgrade and race a fresh container for ports or writable mounts."""
+def test_pre_identity_label_container_blocks_unsafe_upgrade(monkeypatch):
+    """An identity-unknown container must not be removed, reused, or raced."""
     monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
     calls = _mock_subprocess_run(monkeypatch)
-    env = _make_dummy_env(persist_across_processes=False)
+    env = _make_dummy_env(
+        task_id="session/tenant", persist_across_processes=False
+    )
     calls.clear()
 
     def _run(cmd, **kwargs):
@@ -874,12 +875,15 @@ def test_pre_identity_label_container_is_removed_during_upgrade(monkeypatch):
 
     monkeypatch.setattr(docker_env.subprocess, "run", _run)
 
-    env._remove_stale_config_containers("task", "default", "off", "new-mounts")
+    with pytest.raises(RuntimeError, match="exact task/profile identity"):
+        env._remove_stale_config_containers(
+            "session_tenant", "default", "off", "new-mounts"
+        )
 
     ps_cmd = next(cmd for cmd, _ in calls if cmd[1:3] == ["ps", "-a"])
     assert not any("hermes-task-key=" in part for part in ps_cmd)
     assert not any("hermes-profile-key=" in part for part in ps_cmd)
-    assert any(cmd[1:4] == ["rm", "-f", "legacy-cid"] for cmd, _ in calls)
+    assert not any(cmd[1:4] == ["rm", "-f", "legacy-cid"] for cmd, _ in calls)
 
 
 def test_stale_cleanup_preserves_exact_identity_collision(monkeypatch):
