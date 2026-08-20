@@ -1,6 +1,8 @@
+import hashlib
 import logging
 import os
 from io import BytesIO, StringIO
+from pathlib import Path
 import subprocess
 import tarfile
 
@@ -760,8 +762,11 @@ def test_remote_daemon_rejects_extra_arg_bind(monkeypatch):
 
 
 def test_remote_auto_inputs_use_verified_artifact_bridge(monkeypatch, tmp_path):
-    profile_home = tmp_path / "profile"
-    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    process_home = tmp_path / "process-profile"
+    profile_home = tmp_path / "scoped-profile"
+    monkeypatch.setenv("HERMES_HOME", str(process_home))
     credential = tmp_path / "token.json"
     credential.write_bytes(b'{"token":"scoped"}')
     skill = tmp_path / "skills" / "report" / "SKILL.md"
@@ -798,12 +803,74 @@ def test_remote_auto_inputs_use_verified_artifact_bridge(monkeypatch, tmp_path):
     remote_env = docker_env.DockerEnvironment.__new__(docker_env.DockerEnvironment)
     remote_env._remote_endpoint = True
 
-    remote_env._stage_remote_auto_inputs()
+    token = set_hermes_home_override(profile_home)
+    try:
+        remote_env._stage_remote_auto_inputs()
+    finally:
+        reset_hermes_home_override(token)
 
     assert pushed == [
         (str(credential), "/root/.hermes/token.json"),
         (str(skill), "/root/.hermes/skills/report/SKILL.md"),
     ]
+
+
+def test_remote_auto_inputs_stage_from_read_only_source_directory(monkeypatch, tmp_path):
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    profile_home = tmp_path / "profile"
+    source_dir = tmp_path / "read-only-skill"
+    source_dir.mkdir()
+    skill = source_dir / "SKILL.md"
+    skill.write_text("# Read only")
+
+    monkeypatch.setattr(
+        "tools.credential_files.get_credential_file_mounts", lambda: []
+    )
+    monkeypatch.setattr(
+        "tools.credential_files.iter_skills_files",
+        lambda: [{
+            "host_path": str(skill),
+            "container_path": "/root/.hermes/skills/read-only/SKILL.md",
+        }],
+    )
+
+    files = {}
+    remote_env = docker_env.DockerEnvironment.__new__(docker_env.DockerEnvironment)
+    remote_env._remote_endpoint = True
+    remote_env._container_generation = 1
+    remote_env.fetch_realpath = lambda path: path
+    remote_env.fetch_file_metadata = lambda path: (
+        (len(files[path]), hashlib.sha256(files[path]).hexdigest())
+        if path in files else None
+    )
+    remote_env.put_file = lambda source, destination: files.__setitem__(
+        destination, Path(source).read_bytes()
+    )
+
+    def execute(command, **_kwargs):
+        if command.startswith("mkdir -p -- "):
+            return {"returncode": 0, "output": ""}
+        if command.startswith("mv -f -- "):
+            source, destination = command.removeprefix("mv -f -- ").split(" ", 1)
+            files[destination] = files.pop(source)
+            return {"returncode": 0, "output": ""}
+        if command.startswith("rm -f -- "):
+            files.pop(command.removeprefix("rm -f -- "), None)
+            return {"returncode": 0, "output": ""}
+        raise AssertionError(f"unexpected command: {command}")
+
+    remote_env.execute = execute
+    token = set_hermes_home_override(profile_home)
+    source_dir.chmod(0o500)
+    try:
+        remote_env._stage_remote_auto_inputs()
+    finally:
+        source_dir.chmod(0o700)
+        reset_hermes_home_override(token)
+
+    assert files["/root/.hermes/skills/read-only/SKILL.md"] == b"# Read only"
+    assert list((profile_home / "cache" / "artifact-bridge").iterdir()) == []
 
 
 def test_reuse_query_requires_mount_fingerprint(monkeypatch):
