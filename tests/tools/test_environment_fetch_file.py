@@ -12,6 +12,7 @@ import hashlib
 import io
 import re
 import subprocess
+import sys
 import tarfile
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -427,6 +428,10 @@ class TestDockerFetchFile:
         }
         assert "eval" not in calls[0][0]
 
+    @pytest.mark.skipif(
+        sys.platform != "linux",
+        reason="simulates commands executed inside a Linux Docker container",
+    )
     def test_docker_metadata_batch_hashes_532_real_files(self, tmp_path):
         env = self._make_env()
         payloads = {}
@@ -482,6 +487,10 @@ class TestDockerFetchFile:
         assert result["returncode"] == 1
         env._recreate_container.assert_not_called()
 
+    @pytest.mark.skipif(
+        sys.platform != "linux",
+        reason="renameat2 directory exchange is a Linux container primitive",
+    )
     def test_docker_directory_publication_uses_atomic_exchange(self, tmp_path):
         env = self._make_env()
         source = tmp_path / "staging"
