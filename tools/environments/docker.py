@@ -22,6 +22,7 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
+from hermes_constants import get_hermes_home
 from tools.environments.base import (
     _FETCH_TIMEOUT_SECONDS,
     BaseEnvironment,
@@ -1792,7 +1793,7 @@ class DockerEnvironment(BaseEnvironment):
             ArtifactBridge,
             ArtifactTransferError,
         )
-
+        bridge_cache = get_hermes_home() / "cache" / "artifact-bridge"
         entries = {
             entry["container_path"]: entry["host_path"]
             for entry in [*get_credential_file_mounts(), *iter_skills_files()]
@@ -1804,7 +1805,7 @@ class DockerEnvironment(BaseEnvironment):
             try:
                 ArtifactBridge(
                     self,
-                    cache_dir=source.parent,
+                    cache_dir=bridge_cache,
                     host_roots=(source.parent,),
                     container_roots=(posixpath.dirname(container_path) or "/",),
                 ).push(source, container_path)
