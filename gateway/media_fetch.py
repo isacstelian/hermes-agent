@@ -27,7 +27,7 @@ import os
 import posixpath
 import uuid
 from pathlib import Path, PurePosixPath
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +38,10 @@ MEDIA_FETCH_MAX_BYTES_ENV = "HERMES_MEDIA_FETCH_MAX_BYTES"
 _MEDIA_FETCH_MAX_BYTES_DEFAULT = 50 * 1024 * 1024
 
 
-def acquire_media_delivery_lease(task_id: Optional[str]):
+def acquire_media_delivery_lease(
+    task_id: Optional[str] = None,
+    task_id_factory: Optional[Callable[[], Optional[str]]] = None,
+):
     """Keep a remote task environment alive through attachment delivery.
 
     The lease is acquired before the terminal environment necessarily exists;
@@ -47,11 +50,13 @@ def acquire_media_delivery_lease(task_id: Optional[str]):
     the host cache. Local turns need no lease and return ``None``.
     """
     backend = (os.getenv("TERMINAL_ENV") or "local").strip().lower()
-    if not task_id:
-        return None
     from agent.prompt_builder import _REMOTE_TERMINAL_BACKENDS
 
     if backend not in _REMOTE_TERMINAL_BACKENDS:
+        return None
+    if not task_id and task_id_factory is not None:
+        task_id = task_id_factory()
+    if not task_id:
         return None
     from tools.terminal_tool import acquire_environment_lease
 

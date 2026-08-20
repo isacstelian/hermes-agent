@@ -6471,7 +6471,7 @@ class BasePlatformAdapter(ABC):
         from gateway.media_fetch import acquire_media_delivery_lease
 
         _artifact_lease = acquire_media_delivery_lease(
-            self.agent_task_id_for_session(session_key)
+            task_id_factory=lambda: self.agent_task_id_for_session(session_key)
         )
         
         try:
@@ -6524,11 +6524,22 @@ class BasePlatformAdapter(ABC):
 
                 # Extract MEDIA:<path> tags (from TTS tool) before other processing
                 media_files, response = self.extract_media(response)
-                media_files, _media_drops = self.filter_media_delivery_paths_with_drops(
-                    media_files,
-                    task_id_factory=lambda: self.agent_task_id_for_session(session_key),
-                    max_bytes=self.media_delivery_max_bytes(),
-                )
+                _media_filter = self.filter_media_delivery_paths_with_drops
+                try:
+                    _filter_params = inspect.signature(_media_filter).parameters.values()
+                    _filter_accepts_limit = any(
+                        param.name == "max_bytes"
+                        or param.kind == inspect.Parameter.VAR_KEYWORD
+                        for param in _filter_params
+                    )
+                except (TypeError, ValueError):
+                    _filter_accepts_limit = True
+                _filter_kwargs: dict[str, Any] = {
+                    "task_id_factory": lambda: self.agent_task_id_for_session(session_key),
+                }
+                if _filter_accepts_limit:
+                    _filter_kwargs["max_bytes"] = self.media_delivery_max_bytes()
+                media_files, _media_drops = _media_filter(media_files, **_filter_kwargs)
 
                 # Extract image URLs and send them as native platform attachments
                 images, text_content = self.extract_images(response)

@@ -21761,12 +21761,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 resolver = getattr(self, "_agent_task_id_for_source", None)
                 return resolver(event.source) if callable(resolver) else None
 
+            _limit_resolver = getattr(adapter, "media_delivery_max_bytes", None)
+            _delivery_limit = (
+                _limit_resolver() if callable(_limit_resolver) else None
+            )
             media_files, _media_drops = (
                 BasePlatformAdapter.filter_media_delivery_paths_with_drops(
                     media_files,
                     task_id,
                     _resolve_fetch_task_id,
-                    adapter.media_delivery_max_bytes(),
+                    _delivery_limit,
                 )
             )
             # Do NOT deduplicate explicit MEDIA tags against prior turns here
@@ -22098,11 +22102,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     BasePlatformAdapter,
                     format_media_drop_notice,
                 )
+                _limit_resolver = getattr(adapter, "media_delivery_max_bytes", None)
+                _delivery_limit = (
+                    _limit_resolver() if callable(_limit_resolver) else None
+                )
                 media_files, _media_drops = (
                     BasePlatformAdapter.filter_media_delivery_paths_with_drops(
                         media_files,
                         task_id,
-                        max_bytes=adapter.media_delivery_max_bytes(),
+                        max_bytes=_delivery_limit,
                     )
                 )
                 images, text_content = adapter.extract_images(response)

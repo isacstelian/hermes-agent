@@ -244,8 +244,12 @@ class TestMediaDeliveryLease:
 
     def test_local_backend_does_not_acquire(self, monkeypatch):
         monkeypatch.setenv("TERMINAL_ENV", "local")
+        resolved = []
 
-        assert acquire_media_delivery_lease("session-1") is None
+        assert acquire_media_delivery_lease(
+            task_id_factory=lambda: resolved.append(True) or "session-1"
+        ) is None
+        assert resolved == []
 
 
 class TestInboundMediaStaging:
