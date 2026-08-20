@@ -19,8 +19,9 @@ import tarfile
 import tempfile
 import threading
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, Optional
 
 from hermes_constants import get_hermes_home
 from tools.environments.base import (
@@ -1051,6 +1052,7 @@ class DockerEnvironment(BaseEnvironment):
         self._init_unset_passthrough_names: tuple[str, ...] = ()
         self._container_id: Optional[str] = None
         self._container_generation = 0
+        self._artifact_transfer_lock = threading.RLock()
         self._labels: dict[str, str] = {}
         self._image: str = ""
         self._container_name: str = ""
@@ -1780,6 +1782,30 @@ class DockerEnvironment(BaseEnvironment):
         """Whether bind sources resolve on a different daemon host."""
         return self._remote_endpoint
 
+    @contextmanager
+    def artifact_session(self, expected_generation: int | None):
+        """Disable transparent recreation during one verified transfer."""
+        lock = getattr(self, "_artifact_transfer_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._artifact_transfer_lock = lock
+        active = getattr(self, "_artifact_session_state", None)
+        if active is None:
+            active = threading.local()
+            self._artifact_session_state = active
+        with lock:
+            previous = getattr(active, "expected_generation", None)
+            if (
+                expected_generation is not None
+                and self._container_generation != expected_generation
+            ):
+                raise FileFetchError("Docker container generation changed")
+            active.expected_generation = expected_generation
+            try:
+                yield
+            finally:
+                active.expected_generation = previous
+
     def _stage_remote_auto_inputs(self) -> None:
         """Mirror declared credentials and skills when bind mounts are invalid."""
         if not getattr(self, "_remote_endpoint", False):
@@ -1787,7 +1813,7 @@ class DockerEnvironment(BaseEnvironment):
 
         from tools.credential_files import (
             get_credential_file_mounts,
-            iter_skills_files,
+            get_skills_directory_mount,
         )
         from tools.environments.artifact_bridge import (
             ArtifactBridge,
@@ -1796,7 +1822,7 @@ class DockerEnvironment(BaseEnvironment):
         bridge_cache = get_hermes_home() / "cache" / "artifact-bridge"
         entries = {
             entry["container_path"]: entry["host_path"]
-            for entry in [*get_credential_file_mounts(), *iter_skills_files()]
+            for entry in get_credential_file_mounts()
         }
         for container_path, host_path in entries.items():
             source = Path(host_path)
@@ -1809,6 +1835,25 @@ class DockerEnvironment(BaseEnvironment):
                     host_roots=(source.parent,),
                     container_roots=(posixpath.dirname(container_path) or "/",),
                 ).push(source, container_path)
+            except (ArtifactTransferError, OSError, ValueError) as exc:
+                raise RuntimeError(
+                    f"Docker remote input staging failed for {container_path}: {exc}"
+                ) from exc
+
+        for entry in get_skills_directory_mount():
+            source = Path(entry["host_path"])
+            container_path = entry["container_path"]
+            if not source.is_dir():
+                continue
+            try:
+                ArtifactBridge(
+                    self,
+                    cache_dir=bridge_cache,
+                    host_roots=(source,),
+                    container_roots=(
+                        posixpath.dirname(container_path) or "/",
+                    ),
+                ).push_tree(source, container_path)
             except (ArtifactTransferError, OSError, ValueError) as exc:
                 raise RuntimeError(
                     f"Docker remote input staging failed for {container_path}: {exc}"
@@ -1931,6 +1976,84 @@ class DockerEnvironment(BaseEnvironment):
             if normalized == prefix or normalized.startswith(prefix + "/"):
                 return os.path.join(host_root, normalized[len(prefix):].lstrip("/"))
         return None
+
+    def fetch_file_metadata_many(
+        self, remote_paths: Iterable[str]
+    ) -> dict[str, tuple[int, str] | None]:
+        """Hash many container files through one Docker exec round trip."""
+        paths = list(dict.fromkeys(remote_paths))
+        if not paths:
+            return {}
+        if any(
+            not isinstance(path, str)
+            or not path.startswith("/")
+            or any(ord(char) < 32 for char in path)
+            for path in paths
+        ):
+            raise FileFetchError("invalid path in container metadata batch")
+        marker = f"__HERMES_META_{uuid.uuid4().hex[:12]}__"
+        command = (
+            "manifest=$(mktemp) && indexes=$(mktemp) && sizes=$(mktemp) && "
+            "digests=$(mktemp) || exit 1\n"
+            "trap 'rm -f -- \"$manifest\" \"$indexes\" \"$sizes\" "
+            "\"$digests\"' EXIT\n"
+            "index=0\n"
+            "while IFS= read -r path; do\n"
+            "  if test -f \"$path\"; then\n"
+            "    printf '%s\\0' \"$path\" >> \"$manifest\" || exit 1\n"
+            "    printf '%s\\n' \"$index\" >> \"$indexes\" || exit 1\n"
+            "  else\n"
+            f"    printf '{marker}%s MISSING\\n' \"$index\"\n"
+            "  fi\n"
+            "  index=$((index + 1))\n"
+            "done\n"
+            "if test -s \"$manifest\"; then\n"
+            "  xargs -0 stat -c '%s' -- < \"$manifest\" > \"$sizes\" || exit 1\n"
+            "  if command -v sha256sum >/dev/null 2>&1; then\n"
+            "    xargs -0 sha256sum -- < \"$manifest\" | "
+            "awk '{print $1}' > \"$digests\"\n"
+            "  elif command -v shasum >/dev/null 2>&1; then\n"
+            "    xargs -0 shasum -a 256 -- < \"$manifest\" | "
+            "awk '{print $1}' > \"$digests\"\n"
+            "  elif command -v openssl >/dev/null 2>&1; then\n"
+            "    xargs -0 openssl dgst -sha256 -- < \"$manifest\" | "
+            "awk '{print $NF}' > \"$digests\"\n"
+            "  else exit 127; fi\n"
+            "  test \"${PIPESTATUS[0]}\" -eq 0 || exit 1\n"
+            f"  paste \"$indexes\" \"$sizes\" \"$digests\" | "
+            f"while IFS='\t' read -r item_index size digest; do "
+            f"printf '{marker}%s %s %s\\n' \"$item_index\" \"$size\" "
+            "\"$digest\"; done\n"
+            "fi"
+        )
+        result = self.execute(
+            command,
+            stdin_data="\n".join(paths) + "\n",
+            timeout=_FETCH_TIMEOUT_SECONDS,
+            rewrite_compound_background=False,
+        )
+        if int(result.get("returncode") or 0) != 0:
+            raise FileFetchError("container metadata batch failed")
+        metadata: dict[str, tuple[int, str] | None] = {
+            path: None for path in paths
+        }
+        pattern = re.compile(
+            rf"^{re.escape(marker)}([0-9]+) ([0-9]+) ([0-9a-fA-F]{{64}})$"
+        )
+        missing = re.compile(rf"^{re.escape(marker)}([0-9]+) MISSING$")
+        for line in (result.get("output") or "").splitlines():
+            match = pattern.fullmatch(line.strip())
+            if match:
+                index = int(match.group(1))
+                if index < len(paths):
+                    metadata[paths[index]] = (
+                        int(match.group(2)), match.group(3).lower()
+                    )
+                continue
+            match = missing.fullmatch(line.strip())
+            if match and int(match.group(1)) >= len(paths):
+                raise FileFetchError("invalid container metadata batch response")
+        return metadata
 
     def fetch_file(
         self,
@@ -2309,6 +2432,118 @@ class DockerEnvironment(BaseEnvironment):
             )
             super().put_file(str(source), remote_dest)
 
+    def put_archive(self, local_archive: str, remote_dir: str) -> None:
+        """Extract one trusted host-built tar archive through one Docker exec."""
+        if not self._container_id:
+            raise FileFetchError("Docker container not started")
+        archive = Path(local_archive)
+        normalized = posixpath.normpath(remote_dir)
+        if not archive.is_file() or not normalized.startswith("/"):
+            raise FileFetchError("invalid archive transfer source or destination")
+        try:
+            with archive.open("rb") as payload:
+                with tarfile.open(fileobj=payload, mode="r:*") as stream:
+                    for member in stream.getmembers():
+                        member_path = posixpath.normpath(member.name)
+                        if (
+                            not member.isfile()
+                            or member_path in ("", ".", "..")
+                            or member_path.startswith("../")
+                            or member_path.startswith("/")
+                        ):
+                            raise FileFetchError(
+                                "archive push contains an unsafe member"
+                            )
+                payload.seek(0)
+                result = subprocess.run(
+                    [
+                        self._docker_exe,
+                        "exec",
+                        "-i",
+                        self._container_id,
+                        "tar",
+                        "-xf",
+                        "-",
+                        "-C",
+                        normalized,
+                    ],
+                    stdin=payload,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=_FETCH_TIMEOUT_SECONDS,
+                )
+            if result.returncode != 0:
+                detail = (result.stderr or b"").decode("utf-8", "replace").strip()
+                raise FileFetchError(
+                    f"archive push to {remote_dir!r} failed: {detail}"
+                )
+        except subprocess.TimeoutExpired as exc:
+            raise FileFetchError(
+                f"archive push to {remote_dir!r} timed out"
+            ) from exc
+        except OSError as exc:
+            raise FileFetchError(
+                f"archive push to {remote_dir!r} failed: {exc}"
+            ) from exc
+
+    def publish_directory_atomic(self, source: str, destination: str) -> bool:
+        """Atomically publish or exchange two container directories."""
+        source = posixpath.normpath(source)
+        destination = posixpath.normpath(destination)
+        if (
+            not source.startswith("/")
+            or not destination.startswith("/")
+            or source == destination
+        ):
+            raise FileFetchError("invalid atomic directory publication paths")
+        marker = f"__HERMES_DIRECTORY_{uuid.uuid4().hex[:12]}__"
+        script = (
+            "import ctypes, os, sys\n"
+            "source, destination = sys.argv[1:3]\n"
+            "if os.path.lexists(destination):\n"
+            "    libc = ctypes.CDLL(None, use_errno=True)\n"
+            "    renameat2 = getattr(libc, 'renameat2', None)\n"
+            "    if renameat2 is None:\n"
+            "        raise OSError('renameat2 is unavailable')\n"
+            "    renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, "
+            "ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]\n"
+            "    result = renameat2(-100, os.fsencode(source), -100, "
+            "os.fsencode(destination), 2)\n"
+            "    if result != 0:\n"
+            "        error = ctypes.get_errno()\n"
+            "        raise OSError(error, os.strerror(error))\n"
+            f"    print('{marker}EXCHANGED')\n"
+            "else:\n"
+            "    os.rename(source, destination)\n"
+            f"    print('{marker}MOVED')\n"
+        )
+        command = (
+            "if command -v python3 >/dev/null 2>&1; then python_bin=python3; "
+            "elif command -v python >/dev/null 2>&1; then python_bin=python; "
+            "else exit 127; fi; "
+            f"\"$python_bin\" -c {shlex.quote(script)} "
+            f"{shlex.quote(source)} {shlex.quote(destination)}"
+        )
+        result = self.execute(
+            command,
+            timeout=_FETCH_TIMEOUT_SECONDS,
+            rewrite_compound_background=False,
+        )
+        if int(result.get("returncode") or 0) != 0:
+            raise FileFetchError(
+                f"atomic directory publication failed for {destination!r}"
+            )
+        outcomes = [
+            line.removeprefix(marker)
+            for line in (result.get("output") or "").splitlines()
+            if line.startswith(marker)
+        ]
+        if outcomes == ["EXCHANGED"]:
+            return True
+        if outcomes == ["MOVED"]:
+            return False
+        raise FileFetchError("atomic directory publication returned invalid output")
+
     def _remove_remote_transfer_target(self, remote_path: str) -> None:
         if not self._container_id:
             return
@@ -2398,6 +2633,14 @@ class DockerEnvironment(BaseEnvironment):
         return any(p in output for p in self._NO_CONTAINER_PATTERNS)
 
     def _recreate_container(self) -> bool:
+        lock = getattr(self, "_artifact_transfer_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._artifact_transfer_lock = lock
+        with lock:
+            return self._recreate_container_locked()
+
+    def _recreate_container_locked(self) -> bool:
         """Recreate the container after it was removed out-of-band.
 
         Tries label-based reuse first; if no existing container is found,
@@ -2491,7 +2734,21 @@ class DockerEnvironment(BaseEnvironment):
         OOM kill, daemon restart), detect the error and recreate the container
         transparently before retrying once.
         """
+        state = getattr(self, "_artifact_session_state", None)
+        expected_generation = (
+            getattr(state, "expected_generation", None) if state is not None else None
+        )
+        if (
+            expected_generation is not None
+            and self._container_generation != expected_generation
+        ):
+            return {
+                "returncode": 125,
+                "output": "Docker container generation changed during artifact transfer",
+            }
         result = super().execute(command, cwd, **kwargs)
+        if expected_generation is not None:
+            return result
         if (
             result.get("returncode", 0) != 0
             and self._is_container_gone(result.get("output", ""))

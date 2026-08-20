@@ -8,7 +8,9 @@ Docker daemon is remote and no host-side view exists at all.
 """
 
 import base64
+import hashlib
 import io
+import re
 import subprocess
 import tarfile
 from pathlib import Path
@@ -397,3 +399,151 @@ class TestDockerFetchFile:
 
         with patch("tools.environments.docker.subprocess.run", side_effect=fake_run):
             env._put_file_with_tar(str(source), "/workspace/blob")
+
+    def test_docker_metadata_batch_uses_one_exec(self):
+        env = self._make_env()
+        payloads = {
+            "/root/.hermes/skills/a": b"one",
+            "/root/.hermes/skills/$(touch nope)": b"two",
+        }
+        calls = []
+
+        def fake_execute(command, **kwargs):
+            calls.append((command, kwargs))
+            marker = re.search(r"(__HERMES_META_[0-9a-f]+__)", command).group(1)
+            lines = []
+            for index, path in enumerate(kwargs["stdin_data"].splitlines()):
+                digest = hashlib.sha256(payloads[path]).hexdigest()
+                lines.append(f"{marker}{index} {len(payloads[path])} {digest}")
+            return {"returncode": 0, "output": "\n".join(lines)}
+
+        env.execute = fake_execute
+        result = env.fetch_file_metadata_many(payloads)
+
+        assert len(calls) == 1
+        assert result == {
+            path: (len(payload), hashlib.sha256(payload).hexdigest())
+            for path, payload in payloads.items()
+        }
+        assert "eval" not in calls[0][0]
+
+    def test_docker_metadata_batch_hashes_532_real_files(self, tmp_path):
+        env = self._make_env()
+        payloads = {}
+        for index in range(532):
+            name = f"file {index:03d} $(not-executed).bin"
+            path = tmp_path / name
+            payload = f"payload-{index}".encode()
+            path.write_bytes(payload)
+            payloads[str(path)] = payload
+        missing = str(tmp_path / "missing file")
+        calls = []
+
+        def shell_execute(command, **kwargs):
+            calls.append(command)
+            result = subprocess.run(
+                ["bash", "-c", command],
+                input=kwargs["stdin_data"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            return {"returncode": result.returncode, "output": result.stdout + result.stderr}
+
+        env.execute = shell_execute
+        result = env.fetch_file_metadata_many([*payloads, missing])
+
+        assert len(calls) == 1
+        assert result == {
+            **{
+                path: (len(payload), hashlib.sha256(payload).hexdigest())
+                for path, payload in payloads.items()
+            },
+            missing: None,
+        }
+        assert 'sha256sum "$path"' not in calls[0]
+
+    def test_docker_artifact_session_disables_transparent_recreation(self):
+        from tools.environments.docker import DockerEnvironment
+
+        env = DockerEnvironment.__new__(DockerEnvironment)
+        env._container_generation = 3
+        env._persist_across_processes = True
+        env._recreate_container = Mock(return_value=True)
+
+        with patch.object(
+            BaseEnvironment,
+            "execute",
+            return_value={"returncode": 1, "output": "No such container"},
+        ):
+            with env.artifact_session(3):
+                result = env.execute("true")
+
+        assert result["returncode"] == 1
+        env._recreate_container.assert_not_called()
+
+    def test_docker_directory_publication_uses_atomic_exchange(self, tmp_path):
+        env = self._make_env()
+        source = tmp_path / "staging"
+        destination = tmp_path / "live"
+        source.mkdir()
+        destination.mkdir()
+        (source / "new.txt").write_text("new")
+        (destination / "old.txt").write_text("old")
+
+        def shell_execute(command, **_kwargs):
+            result = subprocess.run(
+                ["bash", "-c", command],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            return {"returncode": result.returncode, "output": result.stdout + result.stderr}
+
+        env.execute = shell_execute
+
+        assert env.publish_directory_atomic(str(source), str(destination)) is True
+        assert (destination / "new.txt").read_text() == "new"
+        assert (source / "old.txt").read_text() == "old"
+        assert env.publish_directory_atomic(str(destination), str(source)) is True
+        assert (destination / "old.txt").read_text() == "old"
+        assert (source / "new.txt").read_text() == "new"
+
+        first_publish = tmp_path / "first-publish"
+        assert env.publish_directory_atomic(str(source), str(first_publish)) is False
+        assert (first_publish / "new.txt").read_text() == "new"
+        assert not source.exists()
+
+    def test_docker_archive_push_streams_one_tar(self, tmp_path):
+        env = self._make_env()
+        archive_path = tmp_path / "skills.tar"
+        with tarfile.open(archive_path, "w") as archive:
+            member = tarfile.TarInfo("report/SKILL.md")
+            member.size = 8
+            archive.addfile(member, io.BytesIO(b"# Report"))
+
+        def fake_run(command, **kwargs):
+            assert command == [
+                "docker", "exec", "-i", "cafebabe1234",
+                "tar", "-xf", "-", "-C", "/root/.hermes/skills-stage",
+            ]
+            with tarfile.open(fileobj=kwargs["stdin"], mode="r:") as archive:
+                assert archive.getnames() == ["report/SKILL.md"]
+            return subprocess.CompletedProcess(command, 0, stdout=b"", stderr=b"")
+
+        with patch("tools.environments.docker.subprocess.run", side_effect=fake_run):
+            env.put_archive(str(archive_path), "/root/.hermes/skills-stage")
+
+    def test_docker_archive_push_rejects_traversal_member(self, tmp_path):
+        env = self._make_env()
+        archive_path = tmp_path / "unsafe.tar"
+        with tarfile.open(archive_path, "w") as archive:
+            member = tarfile.TarInfo("../../etc/passwd")
+            member.size = 3
+            archive.addfile(member, io.BytesIO(b"bad"))
+
+        with patch("tools.environments.docker.subprocess.run") as run_mock:
+            with pytest.raises(FileFetchError, match="unsafe member"):
+                env.put_archive(str(archive_path), "/root/.hermes/skills-stage")
+
+        run_mock.assert_not_called()

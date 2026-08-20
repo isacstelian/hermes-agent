@@ -1,6 +1,7 @@
 import hashlib
 import logging
 import os
+import shlex
 from io import BytesIO, StringIO
 from pathlib import Path
 import subprocess
@@ -782,10 +783,10 @@ def test_remote_auto_inputs_use_verified_artifact_bridge(monkeypatch, tmp_path):
         }],
     )
     monkeypatch.setattr(
-        "tools.credential_files.iter_skills_files",
+        "tools.credential_files.get_skills_directory_mount",
         lambda: [{
-            "host_path": str(skill),
-            "container_path": "/root/.hermes/skills/report/SKILL.md",
+            "host_path": str(skill.parents[1]),
+            "container_path": "/root/.hermes/skills",
         }],
     )
 
@@ -797,6 +798,9 @@ def test_remote_auto_inputs_use_verified_artifact_bridge(monkeypatch, tmp_path):
             assert kwargs["container_roots"]
 
         def push(self, host_path, container_path):
+            pushed.append((str(host_path), container_path))
+
+        def push_tree(self, host_path, container_path):
             pushed.append((str(host_path), container_path))
 
     monkeypatch.setattr("tools.environments.artifact_bridge.ArtifactBridge", _Bridge)
@@ -811,7 +815,7 @@ def test_remote_auto_inputs_use_verified_artifact_bridge(monkeypatch, tmp_path):
 
     assert pushed == [
         (str(credential), "/root/.hermes/token.json"),
-        (str(skill), "/root/.hermes/skills/report/SKILL.md"),
+        (str(skill.parents[1]), "/root/.hermes/skills"),
     ]
 
 
@@ -828,10 +832,10 @@ def test_remote_auto_inputs_stage_from_read_only_source_directory(monkeypatch, t
         "tools.credential_files.get_credential_file_mounts", lambda: []
     )
     monkeypatch.setattr(
-        "tools.credential_files.iter_skills_files",
+        "tools.credential_files.get_skills_directory_mount",
         lambda: [{
-            "host_path": str(skill),
-            "container_path": "/root/.hermes/skills/read-only/SKILL.md",
+            "host_path": str(source_dir),
+            "container_path": "/root/.hermes/skills/read-only",
         }],
     )
 
@@ -844,12 +848,41 @@ def test_remote_auto_inputs_stage_from_read_only_source_directory(monkeypatch, t
         (len(files[path]), hashlib.sha256(files[path]).hexdigest())
         if path in files else None
     )
+    remote_env.fetch_file_metadata_many = lambda paths: {
+        path: remote_env.fetch_file_metadata(path) for path in paths
+    }
     remote_env.put_file = lambda source, destination: files.__setitem__(
         destination, Path(source).read_bytes()
     )
 
+    def put_archive(source, destination):
+        with tarfile.open(source, "r") as archive:
+            for member in archive.getmembers():
+                if member.isfile():
+                    payload = archive.extractfile(member)
+                    assert payload is not None
+                    files[f"{destination}/{member.name}"] = payload.read()
+
+    remote_env.put_archive = put_archive
+
+    def publish_directory_atomic(source, destination):
+        staged = {
+            destination + path.removeprefix(source): payload
+            for path, payload in list(files.items())
+            if path == source or path.startswith(source + "/")
+        }
+        for path in list(files):
+            if path == source or path.startswith(source + "/"):
+                files.pop(path, None)
+        files.update(staged)
+        return False
+
+    remote_env.publish_directory_atomic = publish_directory_atomic
+
     def execute(command, **_kwargs):
         if command.startswith("mkdir -p -- "):
+            return {"returncode": 0, "output": ""}
+        if command.startswith("mkdir -m 700 -- "):
             return {"returncode": 0, "output": ""}
         if command.startswith("mv -f -- "):
             source, destination = command.removeprefix("mv -f -- ").split(" ", 1)
@@ -857,6 +890,12 @@ def test_remote_auto_inputs_stage_from_read_only_source_directory(monkeypatch, t
             return {"returncode": 0, "output": ""}
         if command.startswith("rm -f -- "):
             files.pop(command.removeprefix("rm -f -- "), None)
+            return {"returncode": 0, "output": ""}
+        if command.startswith("rm -rf -- "):
+            for prefix in shlex.split(command)[3:]:
+                for path in list(files):
+                    if path == prefix or path.startswith(prefix + "/"):
+                        files.pop(path, None)
             return {"returncode": 0, "output": ""}
         raise AssertionError(f"unexpected command: {command}")
 
@@ -1271,6 +1310,9 @@ def test_find_reusable_handles_empty_label_string(monkeypatch):
     container.  Regression test for the egilewski review on #48073."""
     monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
     monkeypatch.setattr(docker_env, "_get_active_profile_name", lambda: "default")
+    monkeypatch.setattr(
+        docker_env.DockerEnvironment, "_stage_remote_auto_inputs", lambda self: None
+    )
 
     def _run(cmd, **kwargs):
         if isinstance(cmd, list) and len(cmd) >= 2:

@@ -3,6 +3,7 @@
 import hashlib
 import os
 import shlex
+import tarfile
 from pathlib import Path
 
 import pytest
@@ -22,16 +23,32 @@ class _FakeEnvironment:
         self.realpaths = dict(realpaths or {})
         self.fetch_destinations = []
         self.put_destinations = []
+        self.archive_destinations = []
+        self.directory_publications = []
         self.commands = []
+        self.metadata_calls = []
+        self.metadata_many_calls = []
 
     def fetch_realpath(self, path):
         return self.realpaths.get(path, path)
 
     def fetch_file_metadata(self, path):
+        self.metadata_calls.append(path)
         payload = self.files.get(path)
         if payload is None:
             return None
         return len(payload), hashlib.sha256(payload).hexdigest()
+
+    def fetch_file_metadata_many(self, paths):
+        paths = list(paths)
+        self.metadata_many_calls.append(paths)
+        return {
+            path: (
+                (len(self.files[path]), hashlib.sha256(self.files[path]).hexdigest())
+                if path in self.files else None
+            )
+            for path in paths
+        }
 
     def fetch_file(self, path, destination, max_bytes=None):
         self.fetch_destinations.append(Path(destination))
@@ -44,9 +61,51 @@ class _FakeEnvironment:
         self.put_destinations.append(destination)
         self.files[destination] = Path(source).read_bytes()
 
+    def put_archive(self, source, destination):
+        self.archive_destinations.append(destination)
+        with tarfile.open(source, "r") as archive:
+            for member in archive.getmembers():
+                if member.isfile():
+                    payload = archive.extractfile(member)
+                    assert payload is not None
+                    self.files[f"{destination}/{member.name}"] = payload.read()
+
+    def publish_directory_atomic(self, source, destination):
+        self.directory_publications.append((source, destination))
+        had_previous = any(
+            path == destination or path.startswith(destination + "/")
+            for path in self.files
+        )
+        source_files = {
+            destination + path.removeprefix(source): payload
+            for path, payload in self.files.items()
+            if path == source or path.startswith(source + "/")
+        }
+        destination_files = {
+            source + path.removeprefix(destination): payload
+            for path, payload in self.files.items()
+            if path == destination or path.startswith(destination + "/")
+        }
+        for path in list(self.files):
+            if (
+                path == source
+                or path.startswith(source + "/")
+                or path == destination
+                or path.startswith(destination + "/")
+            ):
+                self.files.pop(path)
+        self.files.update(source_files)
+        if had_previous:
+            self.files.update(destination_files)
+        self.realpaths[destination] = destination
+        return had_previous
+
     def execute(self, command, **kwargs):
         self.commands.append(command)
         if command.startswith("mkdir -p "):
+            self.realpaths[shlex.split(command)[-1]] = shlex.split(command)[-1]
+            return {"returncode": 0, "output": ""}
+        if command.startswith("mkdir -m 700 -- "):
             self.realpaths[shlex.split(command)[-1]] = shlex.split(command)[-1]
             return {"returncode": 0, "output": ""}
         if command.startswith("ln -- "):
@@ -59,6 +118,13 @@ class _FakeEnvironment:
             return {"returncode": 0, "output": ""}
         if command.startswith("rm -f -- "):
             self.files.pop(command.removeprefix("rm -f -- "), None)
+            return {"returncode": 0, "output": ""}
+        if command.startswith("rm -rf -- "):
+            prefixes = shlex.split(command)[3:]
+            for prefix in prefixes:
+                for path in list(self.files):
+                    if path == prefix or path.startswith(prefix + "/"):
+                        self.files.pop(path)
             return {"returncode": 0, "output": ""}
         raise AssertionError(f"unexpected command: {command}")
 
@@ -172,6 +238,170 @@ def test_push_uses_remote_temp_verifies_then_renames(tmp_path):
     assert env.put_destinations[0] != "/workspace/uploads/payload.bin"
     assert not any(".hermes-artifact-" in path for path in env.files)
     assert any(command.startswith("mv -f -- ") for command in env.commands)
+
+
+def test_push_tree_batches_files_and_atomically_publishes(tmp_path):
+    env = _FakeEnvironment()
+    bridge, inbox, cache = _bridge(tmp_path, env)
+    tree = inbox / "skills"
+    (tree / "report" / "scripts").mkdir(parents=True)
+    (tree / "report" / "SKILL.md").write_text("# Report")
+    (tree / "report" / "scripts" / "run.py").write_bytes(b"print('ok')")
+
+    bridge.push_tree(tree, "/workspace/skills")
+
+    assert len(env.archive_destinations) == 1
+    assert env.files["/workspace/skills/report/SKILL.md"] == b"# Report"
+    assert env.files["/workspace/skills/report/scripts/run.py"] == b"print('ok')"
+    assert not any("hermes-tree" in path for path in env.files)
+    assert list(cache.iterdir()) == []
+
+
+def test_push_tree_532_files_has_constant_transport_call_budget(tmp_path):
+    env = _FakeEnvironment()
+    bridge, inbox, cache = _bridge(tmp_path, env)
+    tree = inbox / "skills"
+    tree.mkdir()
+    expected = {}
+    for index in range(532):
+        path = tree / f"skill-{index:03d}.bin"
+        payload = f"payload-{index}".encode()
+        path.write_bytes(payload)
+        expected[f"/workspace/skills/{path.name}"] = payload
+
+    bridge.push_tree(tree, "/workspace/skills")
+
+    assert env.archive_destinations and len(env.archive_destinations) == 1
+    assert len(env.metadata_many_calls) == 2
+    assert all(len(paths) == 532 for paths in env.metadata_many_calls)
+    assert env.put_destinations == []
+    assert env.metadata_calls == []
+    assert len(env.directory_publications) == 1
+    assert {path: env.files[path] for path in expected} == expected
+    assert list(cache.iterdir()) == []
+
+
+def test_push_tree_hash_mismatch_rejects_before_publication_and_cleans(tmp_path):
+    class CorruptStagingEnvironment(_FakeEnvironment):
+        def fetch_file_metadata_many(self, paths):
+            result = super().fetch_file_metadata_many(paths)
+            first = next(iter(result))
+            result[first] = (0, "0" * 64)
+            return result
+
+    old_path = "/workspace/skills/existing.bin"
+    env = CorruptStagingEnvironment({old_path: b"old"})
+    bridge, inbox, cache = _bridge(tmp_path, env)
+    tree = inbox / "skills"
+    tree.mkdir()
+    (tree / "new.bin").write_bytes(b"new")
+
+    with pytest.raises(ArtifactTransferError, match="verification failed"):
+        bridge.push_tree(tree, "/workspace/skills")
+
+    assert env.files[old_path] == b"old"
+    assert "/workspace/skills/new.bin" not in env.files
+    assert not any("hermes-tree" in path for path in env.files)
+    assert list(cache.iterdir()) == []
+
+
+def test_push_tree_final_hash_mismatch_rolls_back_previous_tree(tmp_path):
+    class CorruptFinalEnvironment(_FakeEnvironment):
+        def fetch_file_metadata_many(self, paths):
+            result = super().fetch_file_metadata_many(paths)
+            if len(self.metadata_many_calls) == 2:
+                first = next(iter(result))
+                result[first] = (0, "0" * 64)
+            return result
+
+    old_path = "/workspace/skills/existing.bin"
+    env = CorruptFinalEnvironment({old_path: b"old"})
+    bridge, inbox, cache = _bridge(tmp_path, env)
+    tree = inbox / "skills"
+    tree.mkdir()
+    (tree / "new.bin").write_bytes(b"new")
+
+    with pytest.raises(ArtifactTransferError, match="verification failed"):
+        bridge.push_tree(tree, "/workspace/skills")
+
+    assert env.files == {old_path: b"old"}
+    assert len(env.directory_publications) == 2
+    assert list(cache.iterdir()) == []
+
+
+def test_push_tree_interruption_after_atomic_exchange_keeps_complete_trees(tmp_path):
+    class InterruptedEnvironment(_FakeEnvironment):
+        def publish_directory_atomic(self, source, destination):
+            result = super().publish_directory_atomic(source, destination)
+            raise ArtifactTransferError("interrupted after atomic exchange")
+
+    old_path = "/workspace/skills/existing.bin"
+    env = InterruptedEnvironment({old_path: b"old"})
+    bridge, inbox, cache = _bridge(tmp_path, env)
+    tree = inbox / "skills"
+    tree.mkdir()
+    (tree / "new.bin").write_bytes(b"new")
+
+    with pytest.raises(ArtifactTransferError, match="interrupted"):
+        bridge.push_tree(tree, "/workspace/skills")
+
+    assert env.files["/workspace/skills/new.bin"] == b"new"
+    retained_old = [
+        payload
+        for path, payload in env.files.items()
+        if "hermes-tree" in path and path.endswith("/existing.bin")
+    ]
+    assert retained_old == [b"old"]
+    assert list(cache.iterdir()) == []
+
+
+def test_push_tree_failed_atomic_rollback_retains_both_complete_trees(tmp_path):
+    class FailedRollbackEnvironment(_FakeEnvironment):
+        def fetch_file_metadata_many(self, paths):
+            result = super().fetch_file_metadata_many(paths)
+            if len(self.metadata_many_calls) == 2:
+                first = next(iter(result))
+                result[first] = (0, "0" * 64)
+            return result
+
+        def publish_directory_atomic(self, source, destination):
+            if self.directory_publications:
+                raise ArtifactTransferError("rollback interrupted")
+            return super().publish_directory_atomic(source, destination)
+
+    old_path = "/workspace/skills/existing.bin"
+    env = FailedRollbackEnvironment({old_path: b"old"})
+    bridge, inbox, cache = _bridge(tmp_path, env)
+    tree = inbox / "skills"
+    tree.mkdir()
+    (tree / "new.bin").write_bytes(b"new")
+
+    with pytest.raises(ArtifactTransferError, match="rollback failed"):
+        bridge.push_tree(tree, "/workspace/skills")
+
+    assert env.files["/workspace/skills/new.bin"] == b"new"
+    retained_old = [
+        payload
+        for path, payload in env.files.items()
+        if "hermes-tree" in path and path.endswith("/existing.bin")
+    ]
+    assert retained_old == [b"old"]
+    assert list(cache.iterdir()) == []
+
+
+def test_push_tree_rejects_symlinks_before_transport(tmp_path):
+    env = _FakeEnvironment()
+    bridge, inbox, _cache = _bridge(tmp_path, env)
+    tree = inbox / "skills"
+    tree.mkdir()
+    outside = tmp_path / "secret"
+    outside.write_text("secret")
+    (tree / "link").symlink_to(outside)
+
+    with pytest.raises(ArtifactSecurityError, match="symlink"):
+        bridge.push_tree(tree, "/workspace/skills")
+
+    assert env.archive_destinations == []
 
 
 def test_push_creates_missing_allowed_root_below_safe_ancestor(tmp_path):

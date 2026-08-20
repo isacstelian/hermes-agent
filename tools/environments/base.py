@@ -1465,6 +1465,16 @@ class BaseEnvironment(ABC):
                 return int(match.group(1)), match.group(2).lower()
         return None
 
+    def fetch_file_metadata_many(
+        self, remote_paths: Iterable[str]
+    ) -> dict[str, tuple[int, str] | None]:
+        """Return verified metadata for several backend files.
+
+        Backends with a high-latency control plane should override this with
+        one remote probe. The default preserves compatibility.
+        """
+        return {path: self.fetch_file_metadata(path) for path in remote_paths}
+
     def fetch_realpath(self, remote_path: str) -> str | None:
         """Resolve symlinks of *remote_path* inside the backend, best-effort.
 
