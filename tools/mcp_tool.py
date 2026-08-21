@@ -5429,7 +5429,21 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 # it and detect the gateway platform / session for routing.
                 server._pending_call_context = contextvars.copy_context()
                 try:
-                    result = await server.session.call_tool(tool_name, arguments=args)
+                    call_kwargs = {}
+                    if (
+                        getattr(server, "_config", {}).get(
+                            "forward_current_attachments"
+                        )
+                        is True
+                    ):
+                        from gateway.session_context import current_attachments_meta
+
+                        meta = current_attachments_meta()
+                        if meta is not None:
+                            call_kwargs["meta"] = meta
+                    result = await server.session.call_tool(
+                        tool_name, arguments=args, **call_kwargs
+                    )
                 finally:
                     server._pending_call_context = None
             # The RPC round-trip completed — the session is demonstrably
