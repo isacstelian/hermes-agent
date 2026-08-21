@@ -18471,6 +18471,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         
         # Set session context variables for tools (task-local, concurrency-safe)
         _session_env_tokens = self._set_session_env(context)
+        from gateway.session_context import set_current_attachments
+
+        set_current_attachments(
+            getattr(event, "media_urls", None),
+            getattr(event, "media_types", None),
+        )
         
         # Read privacy.redact_pii from config (re-read per message)
         _redact_pii = False
