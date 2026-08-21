@@ -11287,10 +11287,25 @@ def _apply_yaml_config(yaml_cfg: dict, telegram_cfg: dict) -> dict | None:
         os.environ["TELEGRAM_MENTION_PATTERNS"] = _json.dumps(telegram_cfg["mention_patterns"])
     if "exclusive_bot_mentions" in telegram_cfg and not os.getenv("TELEGRAM_EXCLUSIVE_BOT_MENTIONS"):
         os.environ["TELEGRAM_EXCLUSIVE_BOT_MENTIONS"] = str(telegram_cfg["exclusive_bot_mentions"]).lower()
-    if "allow_bots" in telegram_cfg:
-        extras.setdefault("allow_bots", telegram_cfg["allow_bots"])
+    _missing = object()
+    _allow_bots = telegram_cfg.get("allow_bots", _missing)
+    _gateway_cfg = yaml_cfg.get("gateway")
+    _gateway_platforms = (
+        _gateway_cfg.get("platforms") if isinstance(_gateway_cfg, dict) else None
+    )
+    for _platforms in (_gateway_platforms, yaml_cfg.get("platforms")):
+        if not isinstance(_platforms, dict):
+            continue
+        _canonical_telegram = _platforms.get("telegram")
+        if not isinstance(_canonical_telegram, dict):
+            continue
+        _canonical_extra = _canonical_telegram.get("extra")
+        if isinstance(_canonical_extra, dict) and "allow_bots" in _canonical_extra:
+            _allow_bots = _canonical_extra["allow_bots"]
+    if _allow_bots is not _missing:
+        extras.setdefault("allow_bots", _allow_bots)
         if not _skip_env_bridge and not os.getenv("TELEGRAM_ALLOW_BOTS"):
-            os.environ["TELEGRAM_ALLOW_BOTS"] = str(telegram_cfg["allow_bots"]).lower()
+            os.environ["TELEGRAM_ALLOW_BOTS"] = str(_allow_bots).lower()
     if "guest_mode" in telegram_cfg and not os.getenv("TELEGRAM_GUEST_MODE"):
         os.environ["TELEGRAM_GUEST_MODE"] = str(telegram_cfg["guest_mode"]).lower()
     if "observe_unmentioned_group_messages" in telegram_cfg and not os.getenv("TELEGRAM_OBSERVE_UNMENTIONED_GROUP_MESSAGES"):
