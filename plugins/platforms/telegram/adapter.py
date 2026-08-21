@@ -738,6 +738,18 @@ class TelegramAdapter(BasePlatformAdapter):
         self._hermes_home: _Path = get_hermes_home()
         self._app: Optional[Application] = None
         self._bot: Optional[Bot] = None
+        self._bot_loop_guard = None
+        self._bot_loop_guard_config_error: Optional[str] = None
+        try:
+            from gateway.telegram_bot_guard import TelegramBotGuard
+
+            self._bot_loop_guard = TelegramBotGuard(
+                policy=self._bot_loop_guard_policy()
+            )
+        except Exception:
+            # The exact exception may contain raw config. Startup reports only
+            # this fixed diagnostic and refuses any enabled bot-origin policy.
+            self._bot_loop_guard_config_error = "invalid_or_unavailable_guard"
         # Durable grants are only candidates after restart. Bot API
         # reconciliation repopulates this process-local validated set.
         self._active_telegram_auto_authorized_groups: set[str] = set()
@@ -4257,6 +4269,62 @@ class TelegramAdapter(BasePlatformAdapter):
         # it observes alongside, never displaces, the core handlers.
         app.add_handler(TypeHandler(Update, self._on_platform_update), group=99)
 
+    def _bot_loop_guard_policy(self) -> str:
+        raw = (self.config.extra or {}).get("allow_bots")
+        if raw is None or not str(raw).strip():
+            raw = _scoped_gate_env("TELEGRAM_ALLOW_BOTS", "none")
+        return str(raw).strip().lower()
+
+    def _bot_loop_guard_startup_ready(self) -> bool:
+        policy = self._bot_loop_guard_policy()
+        guard = getattr(self, "_bot_loop_guard", None)
+        if policy == "none":
+            return True
+        if (
+            policy not in {"mentions", "all"}
+            or guard is None
+            or getattr(guard, "policy", None) != policy
+        ):
+            logger.error(
+                "[%s] Refusing Telegram startup: bot-origin guard unavailable or policy invalid",
+                self.name,
+            )
+            self._set_fatal_error(
+                "unsafe_bot_policy",
+                "Telegram bot-origin guard unavailable or policy invalid",
+                retryable=False,
+            )
+            return False
+        return True
+
+    def _record_bot_loop_guard_send(
+        self,
+        result: SendResult,
+        *,
+        chat_id: str,
+        reply_to: Optional[str],
+        content: str,
+    ) -> SendResult:
+        guard = getattr(self, "_bot_loop_guard", None)
+        if guard is None or not result.success:
+            return result
+        raw_ids = (
+            (result.raw_response or {}).get("message_ids")
+            if isinstance(result.raw_response, dict)
+            else None
+        )
+        message_ids = [str(value) for value in (raw_ids or []) if value is not None]
+        if not message_ids and result.message_id is not None:
+            message_ids = [str(result.message_id)]
+        if message_ids:
+            guard.note_outbound(
+                chat_id=str(chat_id),
+                message_ids=message_ids,
+                reply_to_message_id=reply_to,
+                content=content,
+            )
+        return result
+
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Connect to Telegram via polling or webhook.
 
@@ -4288,6 +4356,9 @@ class TelegramAdapter(BasePlatformAdapter):
         # Mode selection is re-evaluated on every explicit connection. Keep
         # webhook state false unless this connection starts its webhook.
         self._webhook_mode = False
+
+        if not self._bot_loop_guard_startup_ready():
+            return False
 
         if not TELEGRAM_AVAILABLE:
             logger.error(
@@ -5183,7 +5254,12 @@ class TelegramAdapter(BasePlatformAdapter):
                                 await self.send_typing(chat_id, metadata=metadata)
                             except Exception:
                                 pass  # Typing failures are non-fatal
-                    return rich_result
+                    return self._record_bot_loop_guard_send(
+                        rich_result,
+                        chat_id=chat_id,
+                        reply_to=reply_to,
+                        content=content,
+                    )
 
             # Format and split message if needed
             formatted = self.format_message(content)
@@ -5431,7 +5507,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 except Exception:
                     pass  # Typing failures are non-fatal
 
-            return SendResult(
+            result = SendResult(
                 success=True,
                 message_id=message_ids[0] if message_ids else None,
                 raw_response={
@@ -5439,6 +5515,12 @@ class TelegramAdapter(BasePlatformAdapter):
                     "requested_thread_id": requested_thread_id,
                     "thread_fallback": used_thread_fallback,
                 },
+            )
+            return self._record_bot_loop_guard_send(
+                result,
+                chat_id=chat_id,
+                reply_to=reply_to,
+                content=content,
             )
             
         except Exception as e:
@@ -11205,8 +11287,10 @@ def _apply_yaml_config(yaml_cfg: dict, telegram_cfg: dict) -> dict | None:
         os.environ["TELEGRAM_MENTION_PATTERNS"] = _json.dumps(telegram_cfg["mention_patterns"])
     if "exclusive_bot_mentions" in telegram_cfg and not os.getenv("TELEGRAM_EXCLUSIVE_BOT_MENTIONS"):
         os.environ["TELEGRAM_EXCLUSIVE_BOT_MENTIONS"] = str(telegram_cfg["exclusive_bot_mentions"]).lower()
-    if "allow_bots" in telegram_cfg and not os.getenv("TELEGRAM_ALLOW_BOTS"):
-        os.environ["TELEGRAM_ALLOW_BOTS"] = str(telegram_cfg["allow_bots"]).lower()
+    if "allow_bots" in telegram_cfg:
+        extras.setdefault("allow_bots", telegram_cfg["allow_bots"])
+        if not _skip_env_bridge and not os.getenv("TELEGRAM_ALLOW_BOTS"):
+            os.environ["TELEGRAM_ALLOW_BOTS"] = str(telegram_cfg["allow_bots"]).lower()
     if "guest_mode" in telegram_cfg and not os.getenv("TELEGRAM_GUEST_MODE"):
         os.environ["TELEGRAM_GUEST_MODE"] = str(telegram_cfg["guest_mode"]).lower()
     if "observe_unmentioned_group_messages" in telegram_cfg and not os.getenv("TELEGRAM_OBSERVE_UNMENTIONED_GROUP_MESSAGES"):

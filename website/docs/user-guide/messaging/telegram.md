@@ -186,6 +186,47 @@ TELEGRAM_BOT_TOKEN=123456789:ABCdefGHIjklMNOpqrSTUvwxYZ
 TELEGRAM_ALLOWED_USERS=123456789    # Comma-separated for multiple users
 ```
 
+### Messages from other bots (`allow_bots`)
+
+Other Telegram bots are rejected by default. To enable bounded bot-to-bot
+collaboration, set the canonical platform key in `~/.hermes/config.yaml`:
+
+```yaml
+gateway:
+  platforms:
+    telegram:
+      extra:
+        allow_bots: mentions  # none | mentions | all
+```
+
+The compatibility key `telegram.allow_bots` and environment variable
+`TELEGRAM_ALLOW_BOTS` accept the same values. The canonical
+`gateway.platforms.telegram.extra.allow_bots` value takes precedence when both
+are present.
+
+| Value | Behavior |
+|---|---|
+| `none` | Reject every bot-origin message. This is the default. |
+| `mentions` | Accept only an explicit `/command@this_bot` mention or a direct reply to this bot whose local lineage is known. |
+| `all` | May accept unmentioned bot messages, subject to the same lineage and rate limits. |
+
+Bot-origin traffic is always fail-closed. The guard deduplicates
+`(profile, chat_id, sender_bot_id, message_id)` for 10 minutes, accepts at most
+one message per ordered sender/receiver pair and six bot-origin messages per
+chat in 60 seconds, and accepts only interaction depth 1 from a root. Two
+rate/depth violations in 60 seconds open a 10-minute breaker for that chat.
+Unknown lineage, malformed state, state-store errors, and invalid policy values
+are dropped. Human-origin routing is unchanged.
+
+The gateway refuses to start an enabled bot policy (`mentions` or `all`) when
+the guard is unavailable or invalid. Guard logs expose only sanitized decision
+reasons and counters; they never include message bodies, bot tokens, or user
+identity fields.
+
+**Rollback:** set `allow_bots: none` (or remove the config key and
+`TELEGRAM_ALLOW_BOTS`), then restart the gateway. No Telegram or BotFather
+setting must be changed to disable bot-origin dispatch.
+
 ### Start the Gateway
 
 ```bash
