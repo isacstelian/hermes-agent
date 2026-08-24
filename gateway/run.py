@@ -29037,11 +29037,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # recursive call so queued voice turns can stream TTS and
                 # re-mark the generation for the final delivered turn.
                 next_message_type = None
+                from gateway.session_context import set_current_message_context
+
                 if pending_event is not None:
                     next_source = getattr(pending_event, "source", None) or source
                     next_message_id = self._reply_anchor_for_event(pending_event)
-                    from gateway.session_context import set_current_message_context
-
                     set_current_message_context(
                         next_message_id,
                         getattr(pending_event, "media_urls", None),
@@ -29076,6 +29076,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         return result
                     next_channel_prompt = getattr(pending_event, "channel_prompt", None)
                     next_message_type = getattr(pending_event, "message_type", None)
+                else:
+                    set_current_message_context(None, None, None)
 
                 # Clear the completed streaming marker from the prior logical
                 # turn so the recursive turn's streaming TTS is not suppressed
