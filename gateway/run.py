@@ -18471,9 +18471,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         
         # Set session context variables for tools (task-local, concurrency-safe)
         _session_env_tokens = self._set_session_env(context)
-        from gateway.session_context import set_current_attachments
+        from gateway.session_context import set_current_message_context
 
-        set_current_attachments(
+        set_current_message_context(
+            context.source.message_id,
             getattr(event, "media_urls", None),
             getattr(event, "media_types", None),
         )
@@ -28945,6 +28946,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 next_message_type = None
                 if pending_event is not None:
                     next_source = getattr(pending_event, "source", None) or source
+                    next_message_id = self._reply_anchor_for_event(pending_event)
+                    from gateway.session_context import set_current_message_context
+
+                    set_current_message_context(
+                        next_message_id,
+                        getattr(pending_event, "media_urls", None),
+                        getattr(pending_event, "media_types", None),
+                    )
                     if self._is_goal_continuation_event(pending_event) and not self._goal_still_active_for_session(session_id):
                         logger.info(
                             "Discarding stale goal continuation for session %s — goal is no longer active",
@@ -28972,7 +28981,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                     if next_message is None:
                         return result
-                    next_message_id = self._reply_anchor_for_event(pending_event)
                     next_channel_prompt = getattr(pending_event, "channel_prompt", None)
                     next_message_type = getattr(pending_event, "message_type", None)
 
