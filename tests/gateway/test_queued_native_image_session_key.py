@@ -79,6 +79,14 @@ class CaptureQueuedAttachmentAgent(CaptureQueuedNativeImageAgent):
         return super().run_conversation(message, conversation_history, task_id)
 
 
+class CapturePendingSteerAttachmentAgent(CaptureQueuedAttachmentAgent):
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        result = super().run_conversation(message, conversation_history, task_id)
+        if len(type(self).calls) == 1:
+            result["pending_steer"] = "steered follow-up"
+        return result
+
+
 def _make_runner(adapter):
     gateway_run = importlib.import_module("gateway.run")
     runner = object.__new__(gateway_run.GatewayRunner)
@@ -226,3 +234,46 @@ async def test_queued_followup_rebinds_current_attachment_and_message_id(
         assert queued["ai.hermes/current-attachments"]["files"][0]["path"] == str(queued_path)
     else:
         assert queued is None
+
+
+@pytest.mark.asyncio
+async def test_pending_steer_clears_current_attachment_and_message_id(monkeypatch, tmp_path):
+    CapturePendingSteerAttachmentAgent.calls = []
+    CapturePendingSteerAttachmentAgent.attachment_meta = []
+
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = CapturePendingSteerAttachmentAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
+
+    adapter = CaptureAdapter()
+    runner = _make_runner(adapter)
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="chat-1", chat_type="dm")
+    first_path = tmp_path / "first.pdf"
+    first_path.write_bytes(b"first")
+    tokens = set_session_vars(platform="telegram", message_id="first-1")
+    set_current_message_context("first-1", [str(first_path)], ["application/pdf"])
+
+    try:
+        await runner._run_agent(
+            message="first turn",
+            context_prompt="",
+            history=[],
+            source=source,
+            session_id="sess-pending-steer-attachment",
+            session_key="agent:main:telegram:dm:chat-1",
+        )
+    finally:
+        clear_session_vars(tokens)
+
+    first, steered = CapturePendingSteerAttachmentAgent.attachment_meta
+    assert first["ai.hermes/current-attachments"]["message_id"] == "first-1"
+    assert first["ai.hermes/current-attachments"]["files"][0]["path"] == str(first_path)
+    assert steered is None
