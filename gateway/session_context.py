@@ -222,6 +222,15 @@ def set_current_attachments(paths: Any, content_types: Any) -> None:
     _CURRENT_ATTACHMENTS.set(attachments)
 
 
+def set_current_message_context(
+    message_id: Any, paths: Any, content_types: Any
+) -> None:
+    """Rebind message-scoped metadata before each logical gateway turn."""
+
+    _SESSION_MESSAGE_ID.set(str(message_id or ""))
+    set_current_attachments(paths, content_types)
+
+
 def current_attachments_meta() -> dict[str, Any] | None:
     """Return MCP metadata for this Telegram message, if it has files."""
 
