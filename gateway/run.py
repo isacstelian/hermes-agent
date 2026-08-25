@@ -2861,10 +2861,10 @@ def _event_media_is_audio(event, index: int) -> bool:
 def _event_media_is_stt_input(event, index: int) -> bool:
     """True when an audio attachment should enter the automatic STT pipeline."""
     message_type = getattr(event, "message_type", None)
-    if message_type in {MessageType.AUDIO, MessageType.DOCUMENT}:
+    if message_type == MessageType.DOCUMENT:
         return False
     return (
-        message_type == MessageType.VOICE
+        message_type in {MessageType.VOICE, MessageType.AUDIO}
         or _event_media_type_at(event, index).startswith("audio/")
     )
 
@@ -17669,12 +17669,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # mis-routed here as an image and the provider 400s.
                 if _event_media_is_image(event, i):
                     image_paths.append(path)
-                # MessageType.AUDIO = audio file attachment (e.g. .mp3, .m4a) — never STT
-                # MessageType.VOICE = voice message (Opus/OGG) — always STT
-                if event.message_type == MessageType.AUDIO:
-                    audio_file_paths.append(path)
-                elif not _pending_stt_prepared and _event_media_is_stt_input(event, i):
+                is_stt_input = _event_media_is_stt_input(event, i)
+                if not _pending_stt_prepared and is_stt_input:
                     audio_paths.append(path)
+                elif event.message_type == MessageType.AUDIO and not is_stt_input:
+                    audio_file_paths.append(path)
                 if mtype.startswith("video/") or (not mtype and event.message_type == MessageType.VIDEO):
                     video_paths.append(path)
 
@@ -24212,10 +24211,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 duration_str = await _probe_audio_duration(abs_path)
                 if duration_str:
                     notes.append(
-                        f"[The user sent a voice message: {abs_path} (duration: {duration_str})]"
+                        f"[The user sent an audio message: {abs_path} (duration: {duration_str})]"
                     )
                 else:
-                    notes.append(f"[The user sent a voice message: {abs_path}]")
+                    notes.append(f"[The user sent an audio message: {abs_path}]")
             if not notes:
                 return user_text, []
             prefix = "\n\n".join(notes)
@@ -24298,7 +24297,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
                     agent_path = to_agent_visible_cache_path(os.path.abspath(path))
                     enriched_parts.append(
-                        "[voice message could not be transcribed automatically; "
+                        "[audio message could not be transcribed automatically; "
                         f"the audio is available at: {agent_path}]"
                     )
             except Exception as e:
@@ -24307,7 +24306,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
                 agent_path = to_agent_visible_cache_path(os.path.abspath(path))
                 enriched_parts.append(
-                    "[voice message could not be transcribed automatically; "
+                    "[audio message could not be transcribed automatically; "
                     f"the audio is available at: {agent_path}]"
                 )
 

@@ -10418,9 +10418,22 @@ class TelegramAdapter(BasePlatformAdapter):
                     return
                 file_obj = await msg.audio.get_file()
                 audio_bytes = await file_obj.download_as_bytearray()
-                cached_path = cache_audio_from_bytes(bytes(audio_bytes), ext=".mp3")
+                audio_name = (
+                    getattr(msg.audio, "file_name", "")
+                    or os.path.basename(getattr(file_obj, "file_path", "") or "")
+                )
+                ext = os.path.splitext(audio_name)[1].lower()
+                if ext not in {".mp3", ".m4a"}:
+                    ext = ".mp3"
+                cached_path = cache_audio_from_bytes(bytes(audio_bytes), ext=ext)
+                cached_ext = os.path.splitext(cached_path)[1].lower()
+                audio_mime = (getattr(msg.audio, "mime_type", "") or "").lower()
                 event.media_urls = [cached_path]
-                event.media_types = ["audio/mp3"]
+                event.media_types = [
+                    audio_mime
+                    if audio_mime.startswith("audio/")
+                    else ("audio/mp4" if cached_ext == ".m4a" else "audio/mpeg")
+                ]
                 logger.info("[Telegram] Cached user audio at %s", cached_path)
             except Exception as e:
                 logger.warning("[Telegram] Failed to cache audio: %s", _redact_telegram_error_text(e), exc_info=True)
