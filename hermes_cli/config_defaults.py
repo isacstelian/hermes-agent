@@ -1646,6 +1646,7 @@ DEFAULT_CONFIG = {
         "cloud_trim_silence": True,
         "cloud_trim_threshold_db": -40,  # audio quieter than this counts as silence
         "cloud_trim_keep_ms": 300,  # how much of each pause survives (keeps natural pacing)
+        "fallback_provider": "",  # optional second STT provider tried after the primary returns failure
         "local": {
             "model": "base",  # tiny, base, small, medium, large-v3
             "language": "",  # auto-detect by default; set to "en", "es", "fr", etc. to force
