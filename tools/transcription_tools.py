@@ -2967,7 +2967,7 @@ def _transcribe_prepared_audio(
         provider, Path(file_path).name, fallback_provider,
     )
     fallback_result = _transcribe_prepared_audio_once(
-        file_path, fallback_provider, stt_config, model=model, source=source,
+        file_path, fallback_provider, stt_config, model=None, source=source,
     )
     if fallback_result.get("success"):
         return fallback_result

@@ -629,6 +629,41 @@ class TestTranscribeAudioCloudFallback:
         mock_elevenlabs.assert_called_once()
         assert mock_openai.call_args.args[1] == "gpt-transcribe"
 
+    def test_primary_model_override_does_not_leak_to_different_fallback(self, sample_wav):
+        config = self._fallback_config()
+        with patch("tools.transcription_tools._load_stt_config", return_value=config), \
+             patch("tools.transcription_tools._get_provider", return_value="elevenlabs"), \
+             patch("tools.transcription_tools._trim_silence_for_cloud_stt", return_value=None), \
+             patch(
+                 "tools.transcription_tools._transcribe_elevenlabs",
+                 return_value={
+                     "success": False,
+                     "transcript": "",
+                     "provider": "elevenlabs",
+                     "error": "primary failed",
+                 },
+             ) as mock_elevenlabs, \
+             patch(
+                 "tools.transcription_tools._transcribe_openai",
+                 return_value={
+                     "success": True,
+                     "transcript": "fallback transcript",
+                     "provider": "openai",
+                 },
+             ) as mock_openai:
+            from tools.transcription_tools import transcribe_audio
+
+            result = transcribe_audio(sample_wav, model="scribe_v2")
+
+        assert result["success"] is True
+        assert mock_elevenlabs.call_args.args[1] == "scribe_v2"
+        assert mock_openai.call_args.args[1] == "gpt-transcribe"
+
+    def test_fallback_provider_default_is_disabled(self):
+        from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+        assert DEFAULT_CONFIG["stt"]["fallback_provider"] == ""
+
     def test_identical_fallback_provider_is_ignored(self, sample_wav):
         config = {
             "provider": "elevenlabs",
