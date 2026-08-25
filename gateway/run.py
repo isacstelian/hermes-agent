@@ -17999,20 +17999,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_key: Optional[str] = None,
     ) -> Optional[str]:
         """Run inbound preprocessing under the routed profile when multiplexed."""
+        async def _prepare_and_stage() -> Optional[str]:
+            prepared = await self._prepare_inbound_message_text(
+                event=event,
+                source=source,
+                history=history,
+                session_key=session_key,
+            )
+            if prepared is None or not event.media_urls:
+                return prepared
+            from gateway.media_fetch import stage_inbound_media
+
+            task_id = self._agent_task_id_for_source(source)
+            failures = await asyncio.to_thread(
+                stage_inbound_media, list(event.media_urls), task_id
+            )
+            if failures:
+                names = ", ".join(name for name, _reason in failures[:3])
+                prepared = (
+                    f"[System note: attachment staging failed for {names}; do not "
+                    "claim those files were read.]\n\n" + prepared
+                )
+            return prepared
+
         if getattr(getattr(self, "config", None), "multiplex_profiles", False):
             with _profile_runtime_scope(self._resolve_profile_home_for_source(source)):
-                return await self._prepare_inbound_message_text(
-                    event=event,
-                    source=source,
-                    history=history,
-                    session_key=session_key,
-                )
-        return await self._prepare_inbound_message_text(
-            event=event,
-            source=source,
-            history=history,
-            session_key=session_key,
-        )
+                return await _prepare_and_stage()
+        return await _prepare_and_stage()
 
     async def _prepare_clarify_reply_text(self, event) -> str:
         """Return raw text or successful voice transcripts for a clarify reply."""
@@ -18478,6 +18491,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         
         # Set session context variables for tools (task-local, concurrency-safe)
         _session_env_tokens = self._set_session_env(context)
+        from gateway.session_context import set_current_message_context
+
+        set_current_message_context(
+            context.source.message_id,
+            getattr(event, "media_urls", None),
+            getattr(event, "media_types", None),
+        )
         
         # Read privacy.redact_pii from config (re-read per message)
         _redact_pii = False
@@ -20269,7 +20289,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if _media_adapter:
                         await self._deliver_media_from_response(
                             response, event, _media_adapter,
-                            task_id=session_entry.session_id,
+                            task_id=_run_start_session_id,
                         )
                 # Streaming already delivered the body text, but the footer was
                 # intentionally held back (see the `not already_sent` gate above).
@@ -21755,9 +21775,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 resolver = getattr(self, "_agent_task_id_for_source", None)
                 return resolver(event.source) if callable(resolver) else None
 
+            _limit_resolver = getattr(adapter, "media_delivery_max_bytes", None)
+            _delivery_limit = (
+                _limit_resolver() if callable(_limit_resolver) else None
+            )
             media_files, _media_drops = (
                 BasePlatformAdapter.filter_media_delivery_paths_with_drops(
-                    media_files, task_id, _resolve_fetch_task_id
+                    media_files,
+                    task_id,
+                    _resolve_fetch_task_id,
+                    _delivery_limit,
                 )
             )
             # Do NOT deduplicate explicit MEDIA tags against prior turns here
@@ -21805,37 +21832,64 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if image_paths:
                 try:
                     images = [(f"file://{_quote(p)}", "") for p in image_paths]
-                    await adapter.send_multiple_images(
+                    _image_result = await adapter.send_multiple_images(
                         chat_id=event.source.chat_id,
                         images=images,
                         metadata=_thread_meta,
                     )
+                    if (
+                        _image_result is not None
+                        and getattr(_image_result, "success", True) is False
+                    ):
+                        _detail = getattr(_image_result, "error", None) or "platform upload failed"
+                        _media_drops.extend(
+                            (Path(path).name, "upload_failed", _detail)
+                            for path in image_paths
+                        )
                 except Exception as e:
                     logger.warning("[%s] Post-stream image batch delivery failed: %s", adapter.name, e)
+                    _media_drops.extend(
+                        (Path(path).name, "upload_failed", str(e) or "platform upload failed")
+                        for path in image_paths
+                    )
 
             for media_path, is_voice in non_image_media:
                 try:
                     ext = Path(media_path).suffix.lower()
                     if should_send_media_as_audio(event.source.platform, ext, is_voice=is_voice):
-                        await adapter.send_voice(
+                        _send_result = await adapter.send_voice(
                             chat_id=event.source.chat_id,
                             audio_path=media_path,
                             metadata=_thread_meta,
                         )
                     elif ext in _VIDEO_EXTS:
-                        await adapter.send_video(
+                        _send_result = await adapter.send_video(
                             chat_id=event.source.chat_id,
                             video_path=media_path,
                             metadata=_thread_meta,
                         )
                     else:
-                        await adapter.send_document(
+                        _send_result = await adapter.send_document(
                             chat_id=event.source.chat_id,
                             file_path=media_path,
                             metadata=_thread_meta,
                         )
+                    if (
+                        _send_result is not None
+                        and getattr(_send_result, "success", True) is False
+                    ):
+                        _media_drops.append((
+                            Path(media_path).name,
+                            "upload_failed",
+                            getattr(_send_result, "error", None) or "platform upload failed",
+                        ))
                 except Exception as e:
                     logger.warning("[%s] Post-stream media delivery failed: %s", adapter.name, e)
+                    _media_drops.append((
+                        Path(media_path).name,
+                        "upload_failed",
+                        str(e) or "platform upload failed",
+                    ))
 
             # The streamed text already reached the user, so an attachment that
             # was dropped can only be surfaced as its own message (#75065).
@@ -21973,6 +22027,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         _thread_metadata = self._thread_metadata_for_source(source, event_message_id)
 
+        from gateway.media_fetch import acquire_media_delivery_lease, stage_inbound_media
+
+        _artifact_lease = acquire_media_delivery_lease(task_id)
+
         try:
             user_config = _load_gateway_config()
             model, runtime_kwargs = self._resolve_session_agent_runtime(
@@ -22008,6 +22066,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # agent can see user-attached images (same as the main flow).
             enriched_prompt = prompt
             if media_urls:
+                _stage_failures = await asyncio.to_thread(
+                    stage_inbound_media, list(media_urls), task_id
+                )
+                if _stage_failures:
+                    _failed_names = ", ".join(
+                        name for name, _reason in _stage_failures[:3]
+                    )
+                    enriched_prompt = (
+                        f"[System note: attachment staging failed for {_failed_names}; "
+                        "do not claim those files were read.]\n\n" + enriched_prompt
+                    )
                 image_paths = []
                 for i, path in enumerate(media_urls):
                     mtype = media_types[i] if i < len(media_types) else ""
@@ -22074,9 +22143,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     BasePlatformAdapter,
                     format_media_drop_notice,
                 )
+                _limit_resolver = getattr(adapter, "media_delivery_max_bytes", None)
+                _delivery_limit = (
+                    _limit_resolver() if callable(_limit_resolver) else None
+                )
                 media_files, _media_drops = (
                     BasePlatformAdapter.filter_media_delivery_paths_with_drops(
-                        media_files, task_id
+                        media_files,
+                        task_id,
+                        max_bytes=_delivery_limit,
                     )
                 )
                 images, text_content = adapter.extract_images(response)
@@ -22126,35 +22201,57 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
                 _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
+                _delivery_drops = []
                 for media_path, _is_voice in (media_files or []):
                     _ext = os.path.splitext(media_path)[1].lower()
                     try:
                         if _should_send_media_as_audio(source.platform, _ext, _is_voice):
-                            await adapter.send_voice(
+                            _send_result = await adapter.send_voice(
                                 chat_id=source.chat_id,
                                 audio_path=media_path,
                                 metadata=_thread_metadata,
                             )
                         elif _ext in _VIDEO_EXTS:
-                            await adapter.send_video(
+                            _send_result = await adapter.send_video(
                                 chat_id=source.chat_id,
                                 video_path=media_path,
                                 metadata=_thread_metadata,
                             )
                         elif _ext in _IMAGE_EXTS:
-                            await adapter.send_image_file(
+                            _send_result = await adapter.send_image_file(
                                 chat_id=source.chat_id,
                                 image_path=media_path,
                                 metadata=_thread_metadata,
                             )
                         else:
-                            await adapter.send_document(
+                            _send_result = await adapter.send_document(
                                 chat_id=source.chat_id,
                                 file_path=media_path,
                                 metadata=_thread_metadata,
                             )
-                    except Exception:
-                        pass
+                        if (
+                            _send_result is not None
+                            and getattr(_send_result, "success", True) is False
+                        ):
+                            _delivery_drops.append((
+                                os.path.basename(media_path),
+                                "upload_failed",
+                                getattr(_send_result, "error", None)
+                                or "platform upload failed",
+                            ))
+                    except Exception as exc:
+                        _delivery_drops.append((
+                            os.path.basename(media_path),
+                            "upload_failed",
+                            str(exc) or "platform upload failed",
+                        ))
+                _delivery_notice = format_media_drop_notice(_delivery_drops)
+                if _delivery_notice:
+                    await adapter.send(
+                        chat_id=source.chat_id,
+                        content=_delivery_notice,
+                        metadata=_thread_metadata,
+                    )
             else:
                 preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
                 await adapter.send(
@@ -22173,6 +22270,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
             except Exception:
                 pass
+        finally:
+            if _artifact_lease is not None:
+                _artifact_lease.release()
 
 
 
@@ -28944,8 +29044,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # recursive call so queued voice turns can stream TTS and
                 # re-mark the generation for the final delivered turn.
                 next_message_type = None
+                from gateway.session_context import set_current_message_context
+
                 if pending_event is not None:
                     next_source = getattr(pending_event, "source", None) or source
+                    next_message_id = self._reply_anchor_for_event(pending_event)
+                    set_current_message_context(
+                        next_message_id,
+                        getattr(pending_event, "media_urls", None),
+                        getattr(pending_event, "media_types", None),
+                    )
                     if self._is_goal_continuation_event(pending_event) and not self._goal_still_active_for_session(session_id):
                         logger.info(
                             "Discarding stale goal continuation for session %s — goal is no longer active",
@@ -28973,9 +29081,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                     if next_message is None:
                         return result
-                    next_message_id = self._reply_anchor_for_event(pending_event)
                     next_channel_prompt = getattr(pending_event, "channel_prompt", None)
                     next_message_type = getattr(pending_event, "message_type", None)
+                else:
+                    set_current_message_context(None, None, None)
 
                 # Clear the completed streaming marker from the prior logical
                 # turn so the recursive turn's streaming TTS is not suppressed

@@ -27,7 +27,7 @@ import os
 import posixpath
 import uuid
 from pathlib import Path, PurePosixPath
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +36,96 @@ logger = logging.getLogger(__name__)
 # larger fetch would burn the transfer and then fail at the send anyway.
 MEDIA_FETCH_MAX_BYTES_ENV = "HERMES_MEDIA_FETCH_MAX_BYTES"
 _MEDIA_FETCH_MAX_BYTES_DEFAULT = 50 * 1024 * 1024
+
+
+def acquire_media_delivery_lease(
+    task_id: Optional[str] = None,
+    task_id_factory: Optional[Callable[[], Optional[str]]] = None,
+):
+    """Keep a remote task environment alive through attachment delivery.
+
+    The lease is acquired before the terminal environment necessarily exists;
+    this closes the turn-finalizer race with lazy sandbox creation. Callers
+    must release the returned object after media paths have been pulled into
+    the host cache. Local turns need no lease and return ``None``.
+    """
+    backend = (os.getenv("TERMINAL_ENV") or "local").strip().lower()
+    from agent.prompt_builder import _REMOTE_TERMINAL_BACKENDS
+
+    if backend not in _REMOTE_TERMINAL_BACKENDS:
+        return None
+    if not task_id and task_id_factory is not None:
+        task_id = task_id_factory()
+    if not task_id:
+        return None
+    from tools.terminal_tool import acquire_environment_lease
+
+    return acquire_environment_lease(task_id)
+
+
+def stage_inbound_media(
+    paths: list[str], task_id: Optional[str]
+) -> list[tuple[str, str]]:
+    """Push host-cached inbound files into a remote Docker container.
+
+    Returns ``(basename, reason)`` entries for files that could not be staged.
+    Local Docker uses bind mounts and therefore needs no transfer.
+    """
+    backend = (os.getenv("TERMINAL_ENV") or "local").strip().lower()
+    if backend != "docker" or not task_id or not paths:
+        return []
+
+    from tools.credential_files import (
+        from_agent_visible_cache_path,
+        get_cache_directory_mounts,
+        to_agent_visible_cache_path,
+    )
+    from tools.environments.artifact_bridge import ArtifactBridge
+    from tools.terminal_tool import ensure_task_env
+
+    try:
+        env = ensure_task_env(task_id)
+    except Exception as exc:  # noqa: BLE001 — convert startup failure to a note
+        logger.warning("Remote Docker environment creation failed: %s", exc)
+        env = None
+    if env is None:
+        return [
+            (Path(from_agent_visible_cache_path(str(path))).name or "file",
+             "remote Docker environment unavailable")
+            for path in paths
+        ]
+    if not bool(getattr(env, "remote_endpoint", False)):
+        return []
+
+    mounts = get_cache_directory_mounts()
+    failures: list[tuple[str, str]] = []
+    for raw_path in paths:
+        host_path = Path(from_agent_visible_cache_path(str(raw_path)))
+        container_path = to_agent_visible_cache_path(str(host_path))
+        mount = next(
+            (
+                entry
+                for entry in mounts
+                if container_path == entry["container_path"]
+                or container_path.startswith(entry["container_path"] + "/")
+            ),
+            None,
+        )
+        if mount is None or container_path == str(host_path):
+            failures.append((host_path.name or "file", "not in a managed media cache"))
+            continue
+        try:
+            bridge = ArtifactBridge(
+                env,
+                cache_dir=mount["host_path"],
+                host_roots=(mount["host_path"],),
+                container_roots=(mount["container_path"],),
+            )
+            bridge.push(host_path, container_path)
+        except Exception as exc:  # noqa: BLE001 — report all staging failures
+            logger.warning("Inbound media staging failed for %s: %s", host_path.name, exc)
+            failures.append((host_path.name or "file", str(exc)))
+    return failures
 
 
 def media_fetch_max_bytes() -> int:
@@ -127,9 +217,9 @@ def _active_remote_environment(task_id: Optional[str] = None):
     session exists — with an ephemeral sandbox the artifact is gone with it,
     so this is a real "cannot deliver", not something to retry.
 
-    The gateway keys terminal environments by session id, but a shared-
-    container deployment collapses every session onto ``"default"``, so try
-    the session's own id first and fall back.
+    The gateway keys terminal environments by session id. ``get_active_env``
+    already collapses that id onto ``"default"`` in shared-container mode;
+    an explicit session miss must not fall back to another session's sandbox.
     """
     backend = (os.getenv("TERMINAL_ENV") or "local").strip().lower()
     from agent.prompt_builder import _REMOTE_TERMINAL_BACKENDS
@@ -139,8 +229,7 @@ def _active_remote_environment(task_id: Optional[str] = None):
     try:
         from tools.terminal_tool import get_active_env
 
-        env = get_active_env(task_id) if task_id else None
-        return backend, env or get_active_env("default")
+        return backend, get_active_env(task_id or "default")
     except Exception as exc:
         logger.debug("Remote media fetch: could not resolve active env: %s", exc)
         return backend, None
@@ -153,7 +242,9 @@ def _sanitize_basename(path: str) -> str:
 
 
 def fetch_remote_media(
-    path: str, task_id: Optional[str] = None
+    path: str,
+    task_id: Optional[str] = None,
+    max_bytes: Optional[int] = None,
 ) -> Tuple[Optional[str], Optional[str]]:
     """Fetch *path* from the active remote backend into the document cache.
 
@@ -166,7 +257,7 @@ def fetch_remote_media(
         get_document_cache_dir,
         validate_media_delivery_path,
     )
-    from tools.environments.base import FileFetchError
+    from tools.environments.artifact_bridge import ArtifactBridge, ArtifactTransferError
 
     backend, env = _active_remote_environment(task_id)
     if not backend:
@@ -199,18 +290,26 @@ def fetch_remote_media(
                 "the file is not in the agent sandbox (it was never created, "
                 "or it was written to a different path)"
             )
-        limit = media_fetch_max_bytes()
+        limit = max_bytes or media_fetch_max_bytes()
         if size > limit:
             return None, (
                 f"the file is {_format_size(size)}, above the "
                 f"{_format_size(limit)} delivery limit"
             )
 
-        dest = get_document_cache_dir() / (
+        cache_dir = get_document_cache_dir()
+        dest = cache_dir / (
             f"doc_{uuid.uuid4().hex[:12]}_{_sanitize_basename(candidate)}"
         )
-        env.fetch_file(resolved or candidate, str(dest))
-    except FileFetchError as exc:
+        remote_source = resolved or candidate
+        bridge = ArtifactBridge(
+            env,
+            cache_dir=cache_dir,
+            host_roots=(cache_dir,),
+            container_roots=(posixpath.dirname(remote_source) or "/",),
+        )
+        bridge.pull(remote_source, destination=dest, max_bytes=limit)
+    except ArtifactTransferError as exc:
         return None, str(exc)
     except Exception as exc:
         logger.warning(

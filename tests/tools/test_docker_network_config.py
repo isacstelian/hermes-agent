@@ -64,6 +64,11 @@ def _reuse_guard_harness(monkeypatch, *, existing_mode: str, network: bool):
             stdout = ""
 
         if len(cmd) > 1 and cmd[1] == "ps":
+            if 'Label "hermes-mounts"' in " ".join(cmd):
+                # Stale-config probe: this harness exercises only network
+                # reuse, so model no immutable-config mismatches.
+                Result.stdout = ""
+                return Result()
             # Matches the egress-aware reuse probe: with egress off the
             # format string is ID\tState\tEgressLabel and docker renders a
             # missing label as "<no value>".
