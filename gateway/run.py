@@ -16015,6 +16015,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # are system-generated and must skip user authorization.
         is_internal = bool(getattr(event, "internal", False))
 
+        # Telegram bot-origin traffic is guarded before startup queueing,
+        # plugin hooks, authorization, or session side effects. Plugins are
+        # deliberately fail-open on callback errors, so they cannot own this
+        # safety boundary.
+        if not is_internal and not self._telegram_bot_origin_allowed(event):
+            return None
+
         # Ignored-channel guard runs FIRST — before startup-restore queueing,
         # plugin hooks, auth, and session setup — so a configured ignored
         # channel can never reach pairing/auth/session state (#51899).

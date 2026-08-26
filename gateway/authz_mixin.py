@@ -154,6 +154,48 @@ class GatewayAuthorizationMixin:
             getattr(source, "profile", None),
         )
 
+    def _telegram_bot_origin_allowed(self, event) -> bool:
+        """Apply Telegram's bot-origin guard before hooks or session state."""
+        from gateway.run import logger
+
+        source = getattr(event, "source", None)
+        if getattr(source, "platform", None) != Platform.TELEGRAM:
+            return True
+
+        adapter = self._adapter_for_source(source)
+        guard = getattr(adapter, "_bot_loop_guard", None) if adapter is not None else None
+        if guard is None:
+            if getattr(source, "is_bot", False):
+                logger.warning(
+                    "Telegram bot guard decision=drop reason=state_error count=1"
+                )
+                return False
+            return True
+
+        bot = getattr(adapter, "_bot", None)
+        receiver_bot_id = str(getattr(bot, "id", "") or "")
+        username_fn = getattr(adapter, "_current_bot_username", None)
+        receiver_username = (
+            str(username_fn() or "")
+            if callable(username_fn)
+            else str(getattr(bot, "username", "") or "")
+        )
+        try:
+            return bool(
+                guard.evaluate(
+                    event,
+                    receiver_bot_id=receiver_bot_id,
+                    receiver_username=receiver_username,
+                ).allowed
+            )
+        except Exception:
+            if getattr(source, "is_bot", False):
+                logger.warning(
+                    "Telegram bot guard decision=drop reason=state_error count=1"
+                )
+                return False
+            return True
+
     def _registered_transport_adapter(self, source: SessionSource):
         """Return the registered adapter that created *source*, if retained.
 
@@ -566,8 +608,21 @@ class GatewayAuthorizationMixin:
             Platform.SLACK: "SLACK_ALLOW_BOTS",
         }
         if getattr(source, "is_bot", False):
+            if source.platform == Platform.TELEGRAM:
+                try:
+                    adapter = self._adapter_for_source(source)
+                    live_guard = getattr(adapter, "_bot_loop_guard", None)
+                    if live_guard is not None:
+                        return getattr(live_guard, "policy", "none") in {
+                            "mentions",
+                            "all",
+                        }
+                except Exception:
+                    return False
             allow_bots_var = platform_allow_bots_map.get(source.platform)
-            if allow_bots_var and _platform_gate_env(allow_bots_var, "none").lower().strip() in {"mentions", "all"}:
+            if allow_bots_var and _platform_gate_env(
+                allow_bots_var, "none"
+            ).lower().strip() in {"mentions", "all"}:
                 return True
 
         if not user_id:
