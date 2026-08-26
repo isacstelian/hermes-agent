@@ -4304,6 +4304,7 @@ class TelegramAdapter(BasePlatformAdapter):
         chat_id: str,
         reply_to: Optional[str],
         content: str,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         guard = getattr(self, "_bot_loop_guard", None)
         if guard is None or not result.success:
@@ -4317,10 +4318,19 @@ class TelegramAdapter(BasePlatformAdapter):
         if not message_ids and result.message_id is not None:
             message_ids = [str(result.message_id)]
         if message_ids:
+            # The stream consumer's fallback/final path threads the reply
+            # anchor through metadata instead of the positional ``reply_to``
+            # argument. Honor it there too, otherwise a non-threaded fallback
+            # send is misrecorded as an unaddressed depth-0 root and the
+            # peer bot's native reply back escapes the depth cap.
+            anchor = (metadata or {}).get("reply_to_message_id")
+            effective_reply_to = reply_to or (
+                str(anchor) if anchor is not None else None
+            )
             guard.note_outbound(
                 chat_id=str(chat_id),
                 message_ids=message_ids,
-                reply_to_message_id=reply_to,
+                reply_to_message_id=effective_reply_to,
                 content=content,
             )
         return result
@@ -5259,6 +5269,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         chat_id=chat_id,
                         reply_to=reply_to,
                         content=content,
+                        metadata=metadata,
                     )
 
             # Format and split message if needed
@@ -5521,6 +5532,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 chat_id=chat_id,
                 reply_to=reply_to,
                 content=content,
+                metadata=metadata,
             )
             
         except Exception as e:

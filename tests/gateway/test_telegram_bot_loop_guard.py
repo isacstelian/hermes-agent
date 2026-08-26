@@ -1,7 +1,7 @@
 """Fail-closed Telegram bot-origin loop guard tests (IT-157)."""
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -474,6 +474,100 @@ def test_successful_adapter_send_result_records_outbound_depth() -> None:
             message_id="902",
             sender_id="320",
             text="reply",
+            reply_to_id="901",
+            reply_to_author_id=RECEIVER_ID,
+            reply_to_author_is_bot=True,
+        ),
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "depth_drop"
+
+
+def test_outbound_metadata_anchor_records_reply_depth() -> None:
+    """Fallback sends carry the reply anchor only in metadata.
+
+    The non-threaded fallback path calls ``adapter.send`` without a
+    positional ``reply_to``, so the guard would otherwise classify the
+    outbound message as an unaddressed depth-0 root and let the peer
+    bot's native reply back in as a fresh one-hop interaction.
+    """
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+
+    guard = _guard("mentions")
+    adapter = object.__new__(TelegramAdapter)
+    adapter._bot_loop_guard = guard
+
+    # Seed the inbound bot interaction at depth 1, as if the gateway had
+    # already accepted the peer bot's message this turn.
+    guard._store.load().message_depths[(CHAT_ID, "900")] = (
+        1,
+        9_999_999.0,
+    )
+
+    adapter._record_bot_loop_guard_send(
+        SendResult(success=True, message_id="901"),
+        chat_id=CHAT_ID,
+        reply_to=None,
+        content="plain answer without any bot handle",
+        metadata={"reply_to_message_id": "900"},
+    )
+
+    decision = _evaluate(
+        guard,
+        _event(
+            message_id="902",
+            sender_id="320",
+            text="native peer reply",
+            reply_to_id="901",
+            reply_to_author_id=RECEIVER_ID,
+            reply_to_author_is_bot=True,
+        ),
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "depth_drop"
+
+
+@pytest.mark.asyncio
+async def test_send_records_metadata_only_anchor_without_threading_reply() -> None:
+    """Fallback final sends preserve guard lineage without visibly threading."""
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+
+    clock = Clock()
+    guard = _guard("mentions", clock=clock)
+    inbound = _evaluate(
+        guard,
+        _event(message_id="900", sender_id="320", text="/status@receiver_bot"),
+    )
+    assert inbound.allowed is True
+    assert inbound.depth == 1
+    clock.advance(61)
+
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="not-a-real-token"))
+    adapter._bot = MagicMock()
+    adapter._bot.send_message = AsyncMock(
+        return_value=SimpleNamespace(message_id=901)
+    )
+    adapter._bot_loop_guard = guard
+    adapter._rich_messages_enabled = False
+
+    result = await adapter.send(
+        CHAT_ID,
+        "plain fallback final",
+        reply_to=None,
+        metadata={"notify": True, "reply_to_message_id": "900"},
+    )
+
+    assert result.success is True
+    assert adapter._bot.send_message.await_args.kwargs["reply_to_message_id"] is None
+
+    decision = _evaluate(
+        guard,
+        _event(
+            message_id="902",
+            sender_id="320",
+            text="native peer reply",
             reply_to_id="901",
             reply_to_author_id=RECEIVER_ID,
             reply_to_author_is_bot=True,
