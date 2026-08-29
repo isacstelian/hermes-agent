@@ -94,12 +94,10 @@ def _reuse_guard_harness(monkeypatch, *, existing_mode: str, network: bool):
     return commands
 
 
-def test_reuse_rejects_networked_container_when_lockdown_requested(monkeypatch):
+def test_reuse_preserves_networked_container_when_lockdown_requested(monkeypatch):
     commands = _reuse_guard_harness(monkeypatch, existing_mode="bridge", network=False)
 
-    assert any(cmd[1:3] == ["rm", "-f"] for cmd in commands), (
-        "bridge-networked container must be removed when docker_network=false"
-    )
+    assert not any(cmd[1] == "rm" for cmd in commands)
     run_cmd = next(cmd for cmd in commands if len(cmd) > 2 and cmd[1:3] == ["run", "-d"])
     assert "--network=none" in run_cmd
 
@@ -109,6 +107,106 @@ def test_reuse_keeps_airgapped_container_when_lockdown_requested(monkeypatch):
 
     assert not any(cmd[1] == "rm" for cmd in commands)
     assert not any(cmd[1] == "run" for cmd in commands), "matching container must be reused"
+
+
+def test_network_lockdown_reuses_legacy_container_without_network_label(monkeypatch):
+    commands = []
+    reuse_mounts = []
+    network_filtered = []
+
+    def fake_run(cmd, *args, **kwargs):
+        commands.append(cmd)
+
+        class Result:
+            returncode = 0
+            stderr = ""
+            stdout = ""
+
+        if len(cmd) > 1 and cmd[1] == "ps":
+            if 'Label "hermes-mounts"' in " ".join(cmd):
+                return Result()
+            mount_filter = next(
+                part for part in cmd if str(part).startswith("label=hermes-mounts=")
+            )
+            reuse_mounts.append(mount_filter.rsplit("=", 1)[-1])
+            network_filtered.append(
+                f"label={docker_env._NETWORK_LABEL_KEY}=none" in cmd
+            )
+            if len(reuse_mounts) == 2:
+                Result.stdout = "legacy-container-id\trunning\t<no value>\n"
+        elif len(cmd) > 1 and cmd[1] == "inspect":
+            Result.stdout = "none\n"
+        return Result()
+
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(docker_env.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        docker_env.DockerEnvironment,
+        "_storage_opt_supported",
+        lambda self: False,
+    )
+
+    env = docker_env.DockerEnvironment(
+        image="python:3.11",
+        cwd="/workspace",
+        timeout=60,
+        task_id="legacy-network-reuse",
+        network=False,
+        persist_across_processes=True,
+    )
+
+    assert len(reuse_mounts) == 2
+    assert set(reuse_mounts) == {env._labels[docker_env._MOUNTS_LABEL_KEY]}
+    assert network_filtered == [True, False]
+    assert env._container_id == "legacy-container-id"
+    assert not any(cmd[1] in {"rm", "run"} for cmd in commands)
+
+
+def test_network_lockdown_removes_exited_legacy_bridge_without_force(monkeypatch):
+    commands = []
+    reuse_probes = 0
+
+    def fake_run(cmd, *args, **kwargs):
+        nonlocal reuse_probes
+        commands.append(cmd)
+
+        class Result:
+            returncode = 0
+            stderr = ""
+            stdout = ""
+
+        if len(cmd) > 1 and cmd[1] == "ps":
+            if 'Label "hermes-mounts"' in " ".join(cmd):
+                return Result()
+            reuse_probes += 1
+            if reuse_probes == 2:
+                Result.stdout = "old-cid\texited\t<no value>\n"
+        elif len(cmd) > 1 and cmd[1] == "inspect":
+            Result.stdout = "bridge\n"
+        elif len(cmd) > 1 and cmd[1] == "run":
+            Result.stdout = "new-cid\n"
+        return Result()
+
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(docker_env.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        docker_env.DockerEnvironment,
+        "_storage_opt_supported",
+        lambda self: False,
+    )
+
+    env = docker_env.DockerEnvironment(
+        image="python:3.11",
+        cwd="/workspace",
+        timeout=60,
+        task_id="legacy-network-exited",
+        network=False,
+        persist_across_processes=True,
+    )
+
+    assert env._container_id == "new-cid"
+    rm_cmd = next(cmd for cmd in commands if cmd[1] == "rm")
+    assert rm_cmd[1:] == ["rm", "old-cid"]
 
 
 def test_reuse_skips_inspect_when_network_enabled(monkeypatch):

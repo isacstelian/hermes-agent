@@ -6,6 +6,7 @@ from io import BytesIO, StringIO
 from pathlib import Path
 import subprocess
 import tarfile
+import threading
 
 import pytest
 
@@ -611,6 +612,48 @@ def test_identity_labels_do_not_collapse_sanitized_task_or_profile_names(
     assert docker_env._PROFILE_KEY_LABEL_KEY in rendered
 
 
+def test_deterministic_container_name_uses_exact_immutable_identity():
+    name = docker_env._deterministic_container_name(
+        "task-key", "profile-key", "egress-key", "mounts-key"
+    )
+
+    assert name == docker_env._deterministic_container_name(
+        "task-key", "profile-key", "egress-key", "mounts-key"
+    )
+    assert name.startswith("hermes-")
+    assert name != docker_env._deterministic_container_name(
+        "task-key", "profile-key", "egress-key", "other-mounts"
+    )
+
+
+def test_network_lockdown_name_is_distinct_but_mount_label_is_rollback_safe(
+    monkeypatch,
+):
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(docker_env, "_get_active_profile_name", lambda: "default")
+
+    default_calls = _mock_subprocess_run(monkeypatch)
+    _make_dummy_env(task_id="network-identity", network=True)
+    default_run = _run_args_from_calls(default_calls)
+
+    lockdown_calls = _mock_subprocess_run(monkeypatch)
+    _make_dummy_env(task_id="network-identity", network=False)
+    lockdown_run = _run_args_from_calls(lockdown_calls)
+
+    default_name = default_run[default_run.index("--name") + 1]
+    lockdown_name = lockdown_run[lockdown_run.index("--name") + 1]
+    assert default_name != lockdown_name
+    default_labels = _labels_in_run_args(default_run)
+    lockdown_labels = _labels_in_run_args(lockdown_run)
+    assert next(
+        label for label in default_labels if label.startswith("hermes-mounts=")
+    ) == next(
+        label for label in lockdown_labels if label.startswith("hermes-mounts=")
+    )
+    assert f"{docker_env._NETWORK_LABEL_KEY}=default" in default_labels
+    assert f"{docker_env._NETWORK_LABEL_KEY}=none" in lockdown_labels
+
+
 def test_run_command_sanitizes_unsafe_task_id(monkeypatch):
     """A task_id containing characters Docker rejects in label values must be
     sanitized before reaching ``docker run --label``; otherwise the daemon
@@ -753,6 +796,7 @@ def test_labels_attribute_populated_after_init(monkeypatch):
         "hermes-profile-key": docker_env._identity_label_value("default"),
         "hermes-egress": "off",
         "hermes-mounts": env._labels["hermes-mounts"],
+        "hermes-network": "default",
     }
     assert len(env._labels["hermes-mounts"]) == 16
 
@@ -1141,7 +1185,7 @@ def test_stale_immutable_config_container_is_removed(monkeypatch):
                 cmd,
                 0,
                 stdout=(
-                    "old-cid\told-mounts\toff\t"
+                    "old-cid\texited\told-mounts\toff\t"
                     f"{env._labels[docker_env._TASK_KEY_LABEL_KEY]}\t"
                     f"{env._labels[docker_env._PROFILE_KEY_LABEL_KEY]}\n"
                 ),
@@ -1153,7 +1197,35 @@ def test_stale_immutable_config_container_is_removed(monkeypatch):
 
     env._remove_stale_config_containers("task", "default", "off", "new-mounts")
 
-    assert any(cmd[1:4] == ["rm", "-f", "old-cid"] for cmd, _ in calls)
+    assert any(cmd[1:3] == ["rm", "old-cid"] for cmd, _ in calls)
+
+
+def test_stale_cleanup_preserves_running_mismatched_container(monkeypatch):
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+    env = _make_dummy_env(persist_across_processes=False)
+    calls.clear()
+
+    def _run(cmd, **kwargs):
+        calls.append((list(cmd), kwargs))
+        if cmd[1:3] == ["ps", "-a"]:
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout=(
+                    "running-cid\trunning\told-mounts\toff\t"
+                    f"{env._labels[docker_env._TASK_KEY_LABEL_KEY]}\t"
+                    f"{env._labels[docker_env._PROFILE_KEY_LABEL_KEY]}\n"
+                ),
+                stderr="",
+            )
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(docker_env.subprocess, "run", _run)
+
+    env._remove_stale_config_containers("task", "default", "off", "new-mounts")
+
+    assert not any(cmd[1:3] == ["rm", "running-cid"] for cmd, _ in calls)
 
 
 def test_pre_identity_label_container_blocks_unsafe_upgrade(monkeypatch):
@@ -1171,7 +1243,7 @@ def test_pre_identity_label_container_blocks_unsafe_upgrade(monkeypatch):
             return subprocess.CompletedProcess(
                 cmd,
                 0,
-                stdout="legacy-cid\tnew-mounts\toff\t\t\n",
+                stdout="legacy-cid\texited\tnew-mounts\toff\t\t\n",
                 stderr="",
             )
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
@@ -1186,7 +1258,7 @@ def test_pre_identity_label_container_blocks_unsafe_upgrade(monkeypatch):
     ps_cmd = next(cmd for cmd, _ in calls if cmd[1:3] == ["ps", "-a"])
     assert not any("hermes-task-key=" in part for part in ps_cmd)
     assert not any("hermes-profile-key=" in part for part in ps_cmd)
-    assert not any(cmd[1:4] == ["rm", "-f", "legacy-cid"] for cmd, _ in calls)
+    assert not any(cmd[1:3] == ["rm", "legacy-cid"] for cmd, _ in calls)
 
 
 def test_stale_cleanup_preserves_exact_identity_collision(monkeypatch):
@@ -1202,7 +1274,7 @@ def test_stale_cleanup_preserves_exact_identity_collision(monkeypatch):
                 cmd,
                 0,
                 stdout=(
-                    "foreign-cid\told-mounts\toff\t"
+                    "foreign-cid\trunning\told-mounts\toff\t"
                     f"{docker_env._identity_label_value('session_tenant')}\t"
                     f"{env._labels[docker_env._PROFILE_KEY_LABEL_KEY]}\n"
                 ),
@@ -1216,7 +1288,7 @@ def test_stale_cleanup_preserves_exact_identity_collision(monkeypatch):
         "session_tenant", "default", "off", "new-mounts"
     )
 
-    assert not any(cmd[1:4] == ["rm", "-f", "foreign-cid"] for cmd, _ in calls)
+    assert not any(cmd[1:3] == ["rm", "foreign-cid"] for cmd, _ in calls)
 
 
 def test_bounded_exec_tar_pull_accepts_single_large_file(monkeypatch, tmp_path):
@@ -1305,6 +1377,89 @@ def _mock_subprocess_run_with_reuse(monkeypatch, ps_state: str | None,
 
     monkeypatch.setattr(docker_env.subprocess, "run", _run)
     return calls
+
+
+def test_concurrent_identical_identity_reuses_single_container(monkeypatch):
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(docker_env, "_get_active_profile_name", lambda: "default")
+    docker_env._cgroup_limits_ok = True
+
+    calls = []
+    state = {"winner": None, "name": None}
+    state_lock = threading.Lock()
+    initial_probe_barrier = threading.Barrier(2)
+
+    def _run(cmd, **kwargs):
+        command = list(cmd) if isinstance(cmd, list) else cmd
+        calls.append((command, kwargs))
+        if not isinstance(command, list) or len(command) < 2:
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        if command[1] == "version":
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout="Docker version", stderr=""
+            )
+        if command[1] == "ps":
+            reuse_probe = any(
+                str(part).startswith(f"label={docker_env._MOUNTS_LABEL_KEY}=")
+                for part in command
+            )
+            if not reuse_probe:
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            with state_lock:
+                winner = state["winner"]
+            if winner is None:
+                initial_probe_barrier.wait(timeout=5)
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout=f"{winner}\trunning\toff\n",
+                stderr="",
+            )
+        if command[1] == "run":
+            name = command[command.index("--name") + 1]
+            with state_lock:
+                if state["winner"] is None:
+                    state["winner"] = "winner-cid"
+                    state["name"] = name
+                    return subprocess.CompletedProcess(
+                        cmd, 0, stdout="winner-cid\n", stderr=""
+                    )
+                assert name == state["name"]
+            raise subprocess.CalledProcessError(
+                125,
+                cmd,
+                output="",
+                stderr="container name is already in use",
+            )
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(docker_env.subprocess, "run", _run)
+
+    environments = []
+    errors = []
+
+    def _create_environment():
+        try:
+            environments.append(_make_dummy_env(task_id="same-race-task"))
+        except Exception as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=_create_environment) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert not errors
+    assert all(not thread.is_alive() for thread in threads)
+    assert len(environments) == 2
+    assert {env._container_id for env in environments} == {"winner-cid"}
+    assert {env._container_name for env in environments} == {state["name"]}
+    run_calls = [cmd for cmd, _ in calls if cmd[1:2] == ["run"]]
+    assert len(run_calls) == 2
+    assert len({cmd[cmd.index("--name") + 1] for cmd in run_calls}) == 1
+    assert not any(cmd[1:2] == ["rm"] for cmd, _ in calls)
 
 
 def test_reuse_attaches_to_running_container_without_docker_run(monkeypatch):
@@ -1454,7 +1609,7 @@ def test_failed_docker_run_cleans_up_orphaned_container(monkeypatch):
     monkeypatch.setattr(docker_env.subprocess, "run", _run)
 
     with pytest.raises(subprocess.CalledProcessError):
-        _make_dummy_env()
+        _make_dummy_env(persist_across_processes=False)
 
     assert len(cleanup_calls) == 1, "docker rm should be called once for the orphaned container"
     rm_cmd = cleanup_calls[0]
@@ -1489,12 +1644,126 @@ def test_docker_run_timeout_cleans_up_orphaned_container(monkeypatch):
     monkeypatch.setattr(docker_env.subprocess, "run", _run)
 
     with pytest.raises(subprocess.TimeoutExpired):
-        _make_dummy_env()
+        _make_dummy_env(persist_across_processes=False)
 
     assert len(cleanup_calls) == 1, "docker rm should be called once for the orphaned container"
     rm_cmd = cleanup_calls[0]
     assert rm_cmd[1] == "rm" and rm_cmd[2] == "-f"
     assert rm_cmd[3].startswith("hermes-"), "should remove the container by its generated name"
+
+
+def test_persistent_docker_run_failure_does_not_remove_deterministic_name(
+    monkeypatch,
+):
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(docker_env, "_get_active_profile_name", lambda: "default")
+    calls = []
+
+    def _run(cmd, **kwargs):
+        command = list(cmd)
+        calls.append((command, kwargs))
+        if command[1] == "version":
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout="Docker version", stderr=""
+            )
+        if command[1] == "ps":
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        if command[1] == "run":
+            raise subprocess.CalledProcessError(
+                125, cmd, output="", stderr="daemon unavailable"
+            )
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(docker_env.subprocess, "run", _run)
+
+    with pytest.raises(subprocess.CalledProcessError):
+        _make_dummy_env(task_id="persistent-failure")
+
+    run_cmd = next(cmd for cmd, _ in calls if cmd[1:2] == ["run"])
+    name = run_cmd[run_cmd.index("--name") + 1]
+    assert name.startswith("hermes-")
+    assert not any(cmd[1:2] == ["rm"] for cmd, _ in calls)
+
+
+def test_persistent_docker_run_oserror_reprobes_and_reuses_winner(monkeypatch):
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(docker_env, "_get_active_profile_name", lambda: "default")
+    calls = []
+    reuse_probes = 0
+
+    def _run(cmd, **kwargs):
+        nonlocal reuse_probes
+        command = list(cmd)
+        calls.append((command, kwargs))
+        if command[1] == "version":
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout="Docker version", stderr=""
+            )
+        if command[1] == "ps":
+            reuse_probe = any(
+                str(part).startswith(f"label={docker_env._MOUNTS_LABEL_KEY}=")
+                for part in command
+            )
+            if not reuse_probe:
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            reuse_probes += 1
+            stdout = "" if reuse_probes == 1 else "winner-cid\trunning\toff\n"
+            return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
+        if command[1] == "run":
+            raise OSError("docker client disappeared")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(docker_env.subprocess, "run", _run)
+
+    env = _make_dummy_env(task_id="persistent-oserror-race")
+
+    assert env._container_id == "winner-cid"
+    assert not any(cmd[1:2] == ["rm"] for cmd, _ in calls)
+
+
+def test_persistent_failed_created_container_is_preserved_without_ownership(
+    monkeypatch,
+):
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(docker_env, "_get_active_profile_name", lambda: "default")
+    calls = []
+    reuse_probes = 0
+
+    def _run(cmd, **kwargs):
+        nonlocal reuse_probes
+        command = list(cmd)
+        calls.append((command, kwargs))
+        if command[1] == "version":
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout="Docker version", stderr=""
+            )
+        if command[1] == "ps":
+            reuse_probe = any(
+                str(part).startswith(f"label={docker_env._MOUNTS_LABEL_KEY}=")
+                for part in command
+            )
+            if not reuse_probe:
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            reuse_probes += 1
+            stdout = "" if reuse_probes == 1 else "created-cid\tcreated\toff\n"
+            return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
+        if command[1] == "run":
+            raise subprocess.CalledProcessError(
+                125, cmd, output="", stderr="daemon unavailable"
+            )
+        if command[1] == "start":
+            raise subprocess.CalledProcessError(
+                1, cmd, output="", stderr="container cannot start"
+            )
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(docker_env.subprocess, "run", _run)
+
+    with pytest.raises(subprocess.CalledProcessError) as excinfo:
+        _make_dummy_env(task_id="persistent-created-failure")
+
+    assert excinfo.value.stderr == "daemon unavailable"
+    assert not any(cmd[1:2] == ["rm"] for cmd, _ in calls)
 
 
 def test_find_reusable_handles_empty_label_string(monkeypatch):
@@ -2064,6 +2333,52 @@ def test_recreate_container_increments_generation(monkeypatch):
     assert env._recreate_container() is True
     assert env._container_id == "replacement-cid"
     assert env.container_generation == 2
+
+
+def test_recreate_container_reuses_deterministic_name_race_winner(monkeypatch):
+    env = docker_env.DockerEnvironment.__new__(docker_env.DockerEnvironment)
+    env.cwd = "/root"
+    env._container_id = "gone-cid"
+    env._container_generation = 1
+    env._docker_exe = "/usr/bin/docker"
+    env._image = "python:3.11"
+    env._image_uses_s6_init = False
+    env._all_run_args = []
+    env._labels = {
+        "hermes-agent": "1",
+        "hermes-task-id": "task",
+        "hermes-profile": "default",
+        docker_env._TASK_KEY_LABEL_KEY: "task-key",
+        docker_env._PROFILE_KEY_LABEL_KEY: "profile-key",
+        docker_env._EGRESS_LABEL_KEY: "off",
+        docker_env._MOUNTS_LABEL_KEY: "mounts-key",
+    }
+    env._container_name = docker_env._deterministic_container_name(
+        "task-key", "profile-key", "off", "mounts-key"
+    )
+    env._snapshot_ready = True
+    env.init_session = lambda: None
+    env._stage_remote_auto_inputs = lambda: None
+    probes = iter([None, ("winner-cid", "running")])
+    env._find_reusable_container = lambda *_args: next(probes)
+    calls = []
+
+    def _run(cmd, **kwargs):
+        calls.append(list(cmd))
+        if cmd[1] == "run":
+            raise subprocess.CalledProcessError(
+                125, cmd, output="", stderr="container name is already in use"
+            )
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(docker_env.subprocess, "run", _run)
+
+    assert env._recreate_container() is True
+    assert env._container_id == "winner-cid"
+    assert env.container_generation == 2
+    run_cmd = next(cmd for cmd in calls if cmd[1] == "run")
+    assert run_cmd[run_cmd.index("--name") + 1] == env._container_name
+    assert not any(cmd[1:2] == ["rm"] for cmd in calls)
 
 
 def test_execute_does_not_recover_on_ordinary_failure(monkeypatch):
