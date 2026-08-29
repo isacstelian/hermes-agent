@@ -60,6 +60,84 @@ test('same scope and fingerprint share one bootstrap', async () => {
   assert.equal(runs, 1)
 })
 
+test('bounds concurrent bootstraps across different profile scopes', async () => {
+  const coordinator = createBootstrapCoordinator({ maxConcurrent: 2 })
+  const gates = Array.from({ length: 31 }, () => deferred())
+  const started: number[] = []
+
+  const promises = gates.map((gate, index) =>
+    coordinator.start(String(index), 'same', async () => {
+      started.push(index)
+      await gate.promise
+
+      return index
+    })
+  )
+
+  await Promise.resolve()
+  await Promise.resolve()
+  assert.deepEqual(started, [0, 1])
+
+  gates[0].resolve()
+  assert.equal(await promises[0], 0)
+  await Promise.resolve()
+  assert.deepEqual(started, [0, 1, 2])
+
+  gates.slice(1).forEach(gate => gate.resolve())
+  assert.deepEqual(await Promise.all(promises), Array.from({ length: 31 }, (_, index) => index))
+})
+
+test('a queued bootstrap cancelled before its permit never runs', async () => {
+  const coordinator = createBootstrapCoordinator({ maxConcurrent: 1 })
+  const gate = deferred()
+  let queuedRuns = 0
+
+  const active = coordinator.start('active', 'x', async () => gate.promise)
+  await Promise.resolve()
+
+  const queued = coordinator.start('queued', 'x', async () => {
+    queuedRuns += 1
+  })
+
+  coordinator.cancel('queued')
+  gate.resolve('done')
+  await active
+  await assert.rejects(queued, (error: any) => error.kind === 'superseded')
+  assert.equal(queuedRuns, 0)
+})
+
+test('a primary reconnect jumps ahead of queued profile prewarms', async () => {
+  const coordinator = createBootstrapCoordinator({ maxConcurrent: 2 })
+  const gates = [deferred(), deferred()]
+  const started: string[] = []
+
+  const active = gates.map((gate, index) =>
+    coordinator.start(`pool-${index}`, 'x', async () => {
+      started.push(`pool-${index}`)
+      await gate.promise
+    }, { managedScope: 'pool' })
+  )
+
+  await Promise.resolve()
+
+  const queuedPool = coordinator.start('pool-queued', 'x', async () => {
+    started.push('pool-queued')
+  }, { managedScope: 'pool' })
+
+  const primary = coordinator.start('primary', 'x', async () => {
+    started.push('primary')
+  }, { managedScope: 'primary' })
+
+  gates[0].resolve()
+  await active[0]
+  await primary
+  await queuedPool
+  assert.deepEqual(started, ['pool-0', 'pool-1', 'primary', 'pool-queued'])
+
+  gates[1].resolve()
+  await active[1]
+})
+
 test('changed fingerprint waits for old rollback before starting', async () => {
   const coordinator = createBootstrapCoordinator()
   const gate = deferred()

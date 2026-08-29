@@ -346,6 +346,10 @@ import {
 } from './session-windows'
 import { ensureLoginShellPath } from './shell-path'
 import { createBootstrapCoordinator, sshConfigFingerprint } from './ssh-bootstrap-coordinator'
+import {
+  SSH_BOOTSTRAP_MAX_CONCURRENCY,
+  sshReadyTimeoutMs
+} from './ssh-bootstrap-policy'
 import { collectSshConfigHosts, parseSshGOutput } from './ssh-config'
 import { createSshProbeConnection, pickLocalPort, redactSecrets, SshConnection } from './ssh-connection'
 import { createStreamThrottle } from './stream-throttle'
@@ -9848,7 +9852,7 @@ function clearManagedSshRecovery(connectionId, correlationId) {
   }
 }
 
-const sshBootstrapCoordinator = createBootstrapCoordinator()
+const sshBootstrapCoordinator = createBootstrapCoordinator({ maxConcurrent: SSH_BOOTSTRAP_MAX_CONCURRENCY })
 
 let sshQuitTeardownDone = false
 let backendQuitTeardownDone = false
@@ -10207,6 +10211,7 @@ async function bootstrapSshConnectionInner(profile, sshConfig, reuseToken, sourc
 
     const platform = await detectRemotePlatform(ssh, sshConfig.remoteHermesPath || '')
     const lifecycle = platform.os === 'Windows' ? connectWindowsRemote : remoteLifecycle.connect
+    const readyTimeoutMs = sshReadyTimeoutMs(metadata)
     result = await lifecycle({
       ssh,
       profile: resolveRemoteSshDashboardProfile(sshConfig.remoteProfile, profile),
@@ -10220,7 +10225,8 @@ async function bootstrapSshConnectionInner(profile, sshConfig, reuseToken, sourc
       probeReuseProof: sshProbeReuseProof,
       adoptServedToken: adoptServedDashboardToken,
       rememberLog: sshRememberLog,
-      signal: lease.signal
+      signal: lease.signal,
+      ...(readyTimeoutMs ? { readyTimeoutMs } : {})
     })
   } catch (error: any) {
     if (created) {
