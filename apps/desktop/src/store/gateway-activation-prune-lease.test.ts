@@ -157,7 +157,7 @@ describe('activation lease vs. the live-work pruner (#89622)', () => {
     expect(secondaryGateways[0].close).toHaveBeenCalled()
   })
 
-  it('an orphaned lease expires — the pruner is not permanently locked out', async () => {
+  it('the lease covers a full remote cold boot, then expires', async () => {
     vi.useFakeTimers()
 
     let releaseConnect: () => void = () => undefined
@@ -174,9 +174,15 @@ describe('activation lease vs. the live-work pruner (#89622)', () => {
     pruneSecondaryGateways(new Set())
     expect(secondaryGateways[0].close).not.toHaveBeenCalled()
 
-    // Past the lease window: reclaimed. (Lease is wall-clock bounded so a
-    // leaked lease cannot pin a dead entry forever.)
-    vi.setSystemTime(Date.now() + 31_000)
+    // The complete valid chain can consume 75s for the descriptor, 20s for URL
+    // minting and 15s for the WebSocket handshake. It must remain protected.
+    vi.setSystemTime(Date.now() + 110_000)
+    pruneSecondaryGateways(new Set())
+    expect(secondaryGateways[0].close).not.toHaveBeenCalled()
+
+    // Past the complete lease window: reclaimed. The lease remains bounded so
+    // a leaked activation cannot pin a dead entry forever.
+    vi.setSystemTime(Date.now() + 6_000)
     pruneSecondaryGateways(new Set())
     expect(secondaryGateways[0].close).toHaveBeenCalled()
 

@@ -18,19 +18,106 @@ function sshConfigFingerprint(scope, config) {
     .digest('hex')
 }
 
-function createBootstrapCoordinator() {
+function supersededError(message = 'SSH bootstrap was superseded by newer connection settings.') {
+  const error: any = new Error(message)
+  error.kind = 'superseded'
+
+  return error
+}
+
+function bootstrapPriority(metadata) {
+  return metadata?.managedScope === 'primary' ? 1 : 0
+}
+
+function createBootstrapCoordinator({ maxConcurrent = Number.POSITIVE_INFINITY } = {}) {
   const active = new Set<any>()
   const pending = new Map<string, any>()
   const generations = new Map<string, number>()
   const drains = new Map<string, Promise<void>>()
+  const concurrency = Number.isFinite(maxConcurrent) ? Math.max(1, Math.floor(maxConcurrent)) : Number.POSITIVE_INFINITY
+  const waiters: any[] = []
+  let waiterSequence = 0
+  let running = 0
   let shutdownRequested = false
+
+  function releasePermit() {
+    running = Math.max(0, running - 1)
+    pump()
+  }
+
+  function pump() {
+    while (running < concurrency && waiters.length > 0) {
+      waiters.sort((left, right) => right.priority - left.priority || left.sequence - right.sequence)
+      const waiter = waiters.shift()
+
+      if (waiter.cancelled || waiter.signal.aborted) {
+        continue
+      }
+
+      waiter.signal.removeEventListener('abort', waiter.onAbort)
+      running += 1
+      waiter.launch()
+    }
+  }
+
+  function schedule(signal, run, metadata) {
+    if (signal.aborted) {
+      return Promise.reject(supersededError())
+    }
+
+    return new Promise((resolve, reject) => {
+      const waiter: any = {
+        cancelled: false,
+        launch: null,
+        onAbort: null,
+        priority: bootstrapPriority(metadata),
+        sequence: waiterSequence++,
+        signal
+      }
+
+      waiter.launch = () => {
+        let result
+
+        try {
+          result = run()
+        } catch (error) {
+          releasePermit()
+          reject(error)
+
+          return
+        }
+
+        Promise.resolve(result).then(
+          value => {
+            releasePermit()
+            resolve(value)
+          },
+          error => {
+            releasePermit()
+            reject(error)
+          }
+        )
+      }
+
+      waiter.onAbort = () => {
+        if (waiter.cancelled) {
+          return
+        }
+
+        waiter.cancelled = true
+        reject(supersededError())
+        pump()
+      }
+
+      signal.addEventListener('abort', waiter.onAbort, { once: true })
+      waiters.push(waiter)
+      pump()
+    })
+  }
 
   function start(scope, fingerprint, run, metadata = null) {
     if (shutdownRequested) {
-      const error: any = new Error('SSH bootstrap was cancelled because Desktop is quitting.')
-      error.kind = 'superseded'
-
-      return Promise.reject(error)
+      return Promise.reject(supersededError('SSH bootstrap was cancelled because Desktop is quitting.'))
     }
 
     const current = pending.get(scope)
@@ -56,9 +143,7 @@ function createBootstrapCoordinator() {
       isCurrent: () => !controller.signal.aborted && generations.get(scope) === generation,
       assertCurrent() {
         if (!this.isCurrent()) {
-          const error: any = new Error('SSH bootstrap was superseded by newer connection settings.')
-          error.kind = 'superseded'
-          throw error
+          throw supersededError()
         }
       }
     }
@@ -71,7 +156,11 @@ function createBootstrapCoordinator() {
       .then(() => {
         lease.assertCurrent()
 
-        return run(lease)
+        return schedule(lease.signal, () => {
+          lease.assertCurrent()
+
+          return run(lease)
+        }, metadata)
       })
       .finally(() => {
         forceCleanups.clear()

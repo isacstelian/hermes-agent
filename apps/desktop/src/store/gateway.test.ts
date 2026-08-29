@@ -128,6 +128,105 @@ describe('ensureGatewayForProfile — secondary connect failure surfaces (#81094
     expect(gatewayMocks.instances[0].close).toHaveBeenCalledTimes(1)
   })
 
+  it('gives a recreated secondary the cold-boot budget after pruning', async () => {
+    vi.useFakeTimers()
+
+    let redial = false
+    let redialCalls = 0
+
+    const getConnection = vi.fn((profile: string) => {
+      if (redial) {
+        redialCalls += 1
+
+        if (redialCalls === 1) {
+          return Promise.resolve({ sharedPrimary: false })
+        }
+
+        return new Promise(() => undefined)
+      }
+
+      return Promise.resolve({
+        authMode: 'token',
+        baseUrl: `https://${profile}.invalid`,
+        mode: 'local',
+        profile,
+        token: 'fake-test-token',
+        wsUrl: `wss://${profile}.invalid/ws`
+      })
+    })
+
+    installDesktop({ getConnection })
+    gatewayMocks.connect.mockImplementation(async () => undefined)
+    await ensureGatewayForProfile('work')
+    await ensureGatewayForProfile('default')
+    pruneSecondaryGateways(new Set())
+
+    redial = true
+    let settled = false
+    let failure: unknown = null
+
+    const pending = ensureGatewayForProfile('work').catch(error => {
+      failure = error
+      settled = true
+    })
+
+    await vi.advanceTimersByTimeAsync(20_000)
+    expect(settled).toBe(false)
+
+    await vi.advanceTimersByTimeAsync(55_000)
+    await pending
+    expect(failure).toMatchObject({ message: 'Timed out connecting to profile "work"' })
+  })
+
+  it('keeps the short timeout for a reconnect on the same secondary', async () => {
+    vi.useFakeTimers()
+
+    let reconnect = false
+    let reconnectCalls = 0
+
+    const getConnection = vi.fn((profile: string) => {
+      if (reconnect) {
+        reconnectCalls += 1
+
+        if (reconnectCalls === 1) {
+          return Promise.resolve({ sharedPrimary: false })
+        }
+
+        return new Promise(() => undefined)
+      }
+
+      return Promise.resolve({
+        authMode: 'token',
+        baseUrl: `https://${profile}.invalid`,
+        mode: 'local',
+        profile,
+        token: 'fake-test-token',
+        wsUrl: `wss://${profile}.invalid/ws`
+      })
+    })
+
+    installDesktop({ getConnection })
+    gatewayMocks.connect.mockImplementation(async () => undefined)
+    await ensureGatewayForProfile('work')
+    ;(activeGateway() as unknown as { connectionState: string }).connectionState = 'closed'
+
+    reconnect = true
+    let settled = false
+    let failure: unknown = null
+
+    const pending = ensureGatewayForProfile('work').catch(error => {
+      failure = error
+      settled = true
+    })
+
+    await vi.advanceTimersByTimeAsync(19_999)
+    expect(settled).toBe(false)
+
+    await vi.advanceTimersByTimeAsync(1)
+    await pending
+    expect(failure).toMatchObject({ message: 'Timed out connecting to profile "work"' })
+  })
+
   it('keeps the reconnect schedule armed so transient failures still self-heal', async () => {
     vi.useFakeTimers()
 
@@ -305,9 +404,9 @@ describe('secondary connection timeout (#93454)', () => {
 
     const pending = expect(ensureGatewayForProfile('work')).rejects.toThrow('Timed out connecting to profile "work"')
 
-    // Advance past the internal reconnect-attempt timeout (20s) — the stalled
-    // await must reject instead of hanging forever.
-    await vi.advanceTimersByTimeAsync(20_000)
+    // The first secondary dial owns a cold backend boot, so it gets the longer
+    // boot budget. It must still reject instead of hanging forever.
+    await vi.advanceTimersByTimeAsync(75_000)
     await pending
   })
 
