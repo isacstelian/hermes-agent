@@ -12,7 +12,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { $botMeta } from './data'
-import { duplicateBot } from './profile-ops'
+import { duplicateBot, pullServerAvatars } from './profile-ops'
 import type { RosterRow } from './types'
 
 const { ensureBotMetadataMock, hostMock, storageMock } = vi.hoisted(() => ({
@@ -151,5 +151,89 @@ describe('duplicating a bot', () => {
     hostMock.requestProfile.mockResolvedValue({ ok: true })
 
     expect(await duplicateBot(bot, [bot, elsewhere])).toBe('ops-2')
+  })
+})
+
+describe('roster avatar sync routing', () => {
+  it('keeps active-source avatar reads on the ambient gateway for a 31-profile roster', () => {
+    const roster = Array.from({ length: 31 }, (_, index) => {
+      const name = `agent-${index}`
+
+      return {
+        connectionId: 'imac-hermes',
+        has_avatar: true,
+        name,
+        route: {
+          connectionId: 'imac-hermes',
+          mode: 'remote' as const,
+          profile: name,
+          targetProfile: name
+        },
+        sourceScoped: true
+      } as RosterRow
+    })
+
+    hostMock.request.mockResolvedValue({ found: false })
+    hostMock.requestProfile.mockResolvedValue({ found: false })
+
+    pullServerAvatars(roster)
+
+    expect(hostMock.request).toHaveBeenCalledTimes(31)
+    expect(hostMock.request.mock.calls.every(([method]) => method === 'profiles.get_asset')).toBe(true)
+    expect(hostMock.requestProfile).not.toHaveBeenCalled()
+  })
+
+  it('keeps a different connection on its exact routed gateway', () => {
+    const remote = {
+      connectionId: 'other-host',
+      has_avatar: true,
+      name: 'remote-agent',
+      remoteSource: true,
+      route: {
+        connectionId: 'other-host',
+        mode: 'remote' as const,
+        profile: 'remote-agent',
+        targetProfile: 'remote-agent'
+      },
+      sourceScoped: true
+    } as RosterRow
+
+    hostMock.requestProfile.mockResolvedValue({ found: false })
+
+    pullServerAvatars([remote])
+
+    expect(hostMock.requestProfile).toHaveBeenCalledWith(
+      remote.route,
+      'profiles.get_asset',
+      expect.objectContaining({ asset: 'avatar', name: 'remote-agent' })
+    )
+    expect(hostMock.request).not.toHaveBeenCalled()
+  })
+
+  it('keeps active-source avatar backfills on the ambient gateway too', () => {
+    const bot = {
+      connectionId: 'imac-hermes',
+      has_avatar: false,
+      name: 'active-agent',
+      route: {
+        connectionId: 'imac-hermes',
+        mode: 'remote' as const,
+        profile: 'active-agent',
+        targetProfile: 'active-agent'
+      },
+      sourceScoped: true
+    } as RosterRow
+
+    $botMeta.set({ 'imac-hermes::active-agent': { image: 'data:image/png;base64,active' } })
+    hostMock.request.mockResolvedValue({ ok: true })
+
+    pullServerAvatars([bot])
+
+    expect(hostMock.request).toHaveBeenCalledWith('profiles.set_asset', {
+      asset: 'avatar',
+      data: 'data:image/png;base64,active',
+      name: 'active-agent'
+    })
+    expect(hostMock.requestProfile).not.toHaveBeenCalled()
   })
 })

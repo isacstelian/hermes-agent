@@ -40,6 +40,13 @@ import type { RosterRow } from './types'
 const avatarFetchInflight = new Set<string>()
 const avatarPushInflight = new Set<string>()
 
+// Active-source rows are sourceScoped for identity too. Only remoteSource
+// rows need their exact routed socket; routing every active row would dial one
+// SSH backend per profile whenever the Bots roster syncs avatars.
+function usesRemoteAvatarGateway(bot: RosterRow) {
+  return Boolean(bot.sourceScoped && bot.remoteSource)
+}
+
 /** Backfill: local meta has art the server lacks -> profiles.set_asset.
  *  Server-side avatars power the inter-agent notice pfp (core #85855) and
  *  cross-machine roster art, so local-only images are a bug, not a state. */
@@ -56,7 +63,7 @@ function pushLocalAvatars(roster: RosterRow[]) {
     if (image && typeof image === 'string' && image.startsWith('data:')) {
       avatarPushInflight.add(key)
 
-      const request = bot.sourceScoped
+      const request = usesRemoteAvatarGateway(bot)
         ? requestForBot(bot, 'profiles.set_asset', {
             name: bot.name,
             asset: 'avatar',
@@ -92,7 +99,7 @@ function pushLocalAvatars(roster: RosterRow[]) {
     rasterizeSvgToPng(svg, 160)
       .then(png =>
         png
-          ? (bot.sourceScoped
+          ? (usesRemoteAvatarGateway(bot)
               ? requestForBot(bot, 'profiles.set_asset', {
                   name: bot.name,
                   asset: 'avatar',
@@ -175,7 +182,7 @@ export function pullServerAvatars(roster: RosterRow[]) {
 
     avatarFetchInflight.add(key)
 
-    const assetRequest = bot.sourceScoped
+    const assetRequest = usesRemoteAvatarGateway(bot)
       ? requestForBot(bot, 'profiles.get_asset', {
           name: bot.name,
           asset: 'avatar'
