@@ -15,6 +15,11 @@ export const BACKEND_BOOT_WAIT_TIMEOUT_MS = 45_000
 // caller forever. Every caller of these bounds them with this shared budget.
 export const RECONNECT_ATTEMPT_TIMEOUT_MS = 20_000
 
+// A secondary's FIRST descriptor request can own a full remote SSH bootstrap,
+// including a large profile's plugin and session-store initialization. That is
+// a cold boot, not a reconnect. Keep later re-dials on the short budget above.
+export const SECONDARY_BACKEND_BOOT_WAIT_TIMEOUT_MS = 75_000
+
 /** Rejection raised by withTimeout. The bounded work is NOT cancelled — the
  * caller decides what a straggler that settles later means. */
 export class TimeoutError extends Error {

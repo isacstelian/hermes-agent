@@ -4,7 +4,11 @@ import { atom } from 'nanostores'
 import type { HermesConnection } from '@/global'
 import { HermesGateway, setApiRequestConnection } from '@/hermes'
 import { reconnectBackoffDelayMs } from '@/lib/reconnect-backoff'
-import { RECONNECT_ATTEMPT_TIMEOUT_MS, withTimeout } from '@/lib/with-timeout'
+import {
+  RECONNECT_ATTEMPT_TIMEOUT_MS,
+  SECONDARY_BACKEND_BOOT_WAIT_TIMEOUT_MS,
+  withTimeout
+} from '@/lib/with-timeout'
 import { markNativeNotifyBaseline } from '@/store/notify-baseline'
 import { setConnection, setGatewayState } from '@/store/session'
 
@@ -112,10 +116,12 @@ interface Secondary {
   activationLeaseUntil: number
 }
 
-// How long a mid-dial activation holds its prune lease: covers a cold pool
-// backend spawn + socket connect with margin, while still letting a leaked
-// lease expire quickly enough for the reaper to reclaim the entry.
-const ACTIVATION_LEASE_MS = 30_000
+// How long a mid-dial activation holds its prune lease. A first remote
+// descriptor may spend the full cold-boot budget, WebSocket URL minting has
+// its own reconnect budget, and JsonRpcGatewayClient allows a 15s handshake.
+// Keep 5s of margin while still bounding orphaned leases for the reaper.
+const ACTIVATION_LEASE_MS =
+  SECONDARY_BACKEND_BOOT_WAIT_TIMEOUT_MS + RECONNECT_ATTEMPT_TIMEOUT_MS + 20_000
 
 // ── HMR-stable module state ─────────────────────────────────────────────────
 // All mutable singletons (live sockets, active-profile routing, the event
@@ -514,10 +520,16 @@ async function openSecondary(entry: Secondary): Promise<void> {
     // open. Awaiting it is intentional: correctness at the generation boundary
     // outranks the single local-module microtask this adds to a reconnect.
     const openedScopes = openedSecondaryScopes()
-    const reopening = entry.openedOnce || entry.connection !== null || openedScopes.has(entry.scope)
+    const reconnectingSocket = entry.openedOnce || entry.connection !== null
+    const resettingRuntimeBindings = reconnectingSocket || openedScopes.has(entry.scope)
+
+    const descriptorTimeoutMs = reconnectingSocket
+      ? RECONNECT_ATTEMPT_TIMEOUT_MS
+      : SECONDARY_BACKEND_BOOT_WAIT_TIMEOUT_MS
+
     let reconcileBusyAfterOpen: null | (() => void) = null
 
-    if (reopening) {
+    if (resettingRuntimeBindings) {
       try {
         const { reconcileBusyStatesOnReconnect, resetTileRuntimeBindings } = await import('@/store/session-states')
 
@@ -557,12 +569,12 @@ async function openSecondary(entry: Secondary): Promise<void> {
       entry.connectionId && desktop.getConnectionFor
         ? await withTimeout(
             desktop.getConnectionFor({ connectionId: entry.connectionId, profile: entry.profile }),
-            RECONNECT_ATTEMPT_TIMEOUT_MS,
+            descriptorTimeoutMs,
             `Timed out connecting to profile "${entry.profile}"`
           )
         : await withTimeout(
             desktop.getConnection(entry.profile),
-            RECONNECT_ATTEMPT_TIMEOUT_MS,
+            descriptorTimeoutMs,
             `Timed out connecting to profile "${entry.profile}"`
           )
 
