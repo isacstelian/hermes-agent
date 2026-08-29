@@ -150,10 +150,15 @@ class TestRecoveryDoesNotLeakMediaFragments:
         # Use the REAL extract_media (so the strong regex cleans `response`),
         # but force the path to be filtered out (unsafe/nonexistent) so we hit
         # the empty-text + no-attachment recovery branch deterministically.
+        # Report no drops either: this test pins the recovery regex, while the
+        # user-facing "couldn't deliver <name>" notice has its own coverage in
+        # test_media_drop_notice.py.
         monkeypatch.setattr(
             type(adapter),
-            "filter_media_delivery_paths",
-            staticmethod(lambda m, session_key="": []),
+            "filter_media_delivery_paths_with_drops",
+            staticmethod(
+                lambda m, task_id=None, task_id_factory=None, session_key="": ([], [])
+            ),
         )
 
         event = _make_event(Platform.DISCORD)

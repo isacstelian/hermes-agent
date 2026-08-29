@@ -2986,6 +2986,64 @@ def _transcribe_prepared_audio(
         }
 
     provider = _get_provider(stt_config)
+    result = _transcribe_prepared_audio_once(
+        file_path, provider, stt_config, model=model, source=source,
+    )
+    if result.get("success"):
+        return result
+
+    fallback_provider = _resolve_stt_fallback_provider(stt_config, provider)
+    if fallback_provider is None:
+        return result
+
+    logger.info(
+        "Primary STT provider '%s' failed for %s; trying fallback provider '%s'",
+        provider, Path(file_path).name, fallback_provider,
+    )
+    fallback_result = _transcribe_prepared_audio_once(
+        file_path, fallback_provider, stt_config, model=None, source=source,
+    )
+    if fallback_result.get("success"):
+        return fallback_result
+
+    primary_error = result.get("error", "unknown error")
+    fallback_error = fallback_result.get("error", "unknown error")
+    fallback_result["error"] = (
+        f"Primary STT provider '{provider}' failed: {primary_error}; "
+        f"fallback STT provider '{fallback_provider}' failed: {fallback_error}"
+    )
+    return fallback_result
+
+
+def _resolve_stt_fallback_provider(
+    stt_config: Dict[str, Any],
+    primary_provider: str,
+) -> Optional[str]:
+    raw = stt_config.get("fallback_provider")
+    fallback = str(raw or "").strip().lower()
+    if fallback in {"", "none", "off", "false"}:
+        return None
+
+    primary = str(primary_provider or "").strip().lower()
+    configured_primary = str(stt_config.get("provider", DEFAULT_PROVIDER) or "").strip().lower()
+    if fallback in {primary, configured_primary}:
+        logger.warning(
+            "Ignoring stt.fallback_provider='%s' because it matches the primary STT provider",
+            fallback,
+        )
+        return None
+    return fallback
+
+
+def _transcribe_prepared_audio_once(
+    file_path: str,
+    provider: str,
+    stt_config: Dict[str, Any],
+    *,
+    model: Optional[str] = None,
+    source: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Dispatch one STT provider attempt for an already prepared audio file."""
     if not _is_local_stt_provider(provider, stt_config):
         error = _validate_audio_file_size(Path(file_path))
         if error:

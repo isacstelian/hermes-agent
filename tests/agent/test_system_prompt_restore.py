@@ -16,11 +16,15 @@ instead of rebuilding).  Covers:
 from __future__ import annotations
 
 import logging
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from agent.conversation_loop import _restore_or_build_system_prompt
+from agent.system_prompt import (
+    HERMES_AGENT_HELP_GUIDANCE,
+    stored_prompt_has_current_soul,
+)
 
 
 def _make_agent(session_db=None, prebuilt_prompt: str = "BUILT_PROMPT"):
@@ -31,6 +35,9 @@ def _make_agent(session_db=None, prebuilt_prompt: str = "BUILT_PROMPT"):
     agent.model = "test-model"
     agent.provider = "openrouter"
     agent.platform = "cli"
+    agent.valid_tool_names = set()
+    agent.load_soul_identity = False
+    agent.skip_context_files = True
     agent._session_db = session_db
     # MagicMock attributes are truthy by default; the static-prefix
     # reconstruction is gated on _use_prompt_caching, so default it off
@@ -46,6 +53,19 @@ def _make_agent(session_db=None, prebuilt_prompt: str = "BUILT_PROMPT"):
 
 
 class TestStoredPromptReuse:
+    def test_soul_match_uses_exact_identity_boundary(self):
+        agent = _make_agent()
+        expected = "CURRENT SOUL\n\n" + HERMES_AGENT_HELP_GUIDANCE
+
+        with patch(
+            "agent.system_prompt.build_current_soul_prompt",
+            return_value="CURRENT SOUL",
+        ):
+            assert stored_prompt_has_current_soul(agent, expected)
+            assert not stored_prompt_has_current_soul(
+                agent, "CURRENT SOUL WITH OLD RULES\n\n" + HERMES_AGENT_HELP_GUIDANCE
+            )
+
     def test_present_row_is_reused_verbatim(self, caplog):
         """Continuing session with a stored prompt → reuse byte-for-byte."""
         stored = "Stored prompt from turn 1 — byte-identical reuse"
@@ -71,6 +91,104 @@ class TestStoredPromptReuse:
 
         _restore_or_build_system_prompt(agent, None, [{"role": "user", "content": "hi"}])
         assert agent._cached_system_prompt == stored
+
+    def test_changed_skills_index_rebuilds_existing_session(self, caplog):
+        stored = "Identity\n\nOLD SKILLS INDEX\n\nModel: test-model\nProvider: openrouter\nPlatform: cli"
+        rebuilt = "Identity\n\nCURRENT SKILLS INDEX\n\nModel: test-model\nProvider: openrouter\nPlatform: cli"
+        db = MagicMock()
+        db.get_session.return_value = {"system_prompt": stored}
+        agent = _make_agent(session_db=db, prebuilt_prompt=rebuilt)
+        agent.valid_tool_names = {"skill_view"}
+
+        with (
+            patch(
+                "agent.system_prompt.build_current_skills_prompt",
+                return_value="CURRENT SKILLS INDEX",
+            ),
+            caplog.at_level(logging.INFO, logger="agent.conversation_loop"),
+        ):
+            _restore_or_build_system_prompt(
+                agent, None, [{"role": "user", "content": "hi"}]
+            )
+
+        assert agent._cached_system_prompt == rebuilt
+        agent._build_system_prompt.assert_called_once_with(None)
+        db.update_system_prompt.assert_called_once_with(agent.session_id, rebuilt)
+        assert any("stale runtime identity" in r.getMessage() for r in caplog.records)
+
+    def test_changed_soul_rebuilds_existing_session(self, caplog):
+        stored = "OLD SOUL\n\nHermes help\n\nModel: test-model\nProvider: openrouter\nPlatform: cli"
+        rebuilt = "CURRENT SOUL\n\nHermes help\n\nModel: test-model\nProvider: openrouter\nPlatform: cli"
+        db = MagicMock()
+        db.get_session.return_value = {"system_prompt": stored}
+        agent = _make_agent(session_db=db, prebuilt_prompt=rebuilt)
+
+        with (
+            patch(
+                "agent.system_prompt.stored_prompt_has_current_soul",
+                return_value=False,
+            ),
+            caplog.at_level(logging.INFO, logger="agent.conversation_loop"),
+        ):
+            _restore_or_build_system_prompt(
+                agent, None, [{"role": "user", "content": "hi"}]
+            )
+
+        assert agent._cached_system_prompt == rebuilt
+        agent._build_system_prompt.assert_called_once_with(None)
+        db.update_system_prompt.assert_called_once_with(agent.session_id, rebuilt)
+        assert any("stale runtime identity" in r.getMessage() for r in caplog.records)
+
+    def test_matching_soul_keeps_byte_identical_prompt(self):
+        stored = "CURRENT SOUL\n\nHermes help\n\nModel: test-model\nProvider: openrouter\nPlatform: cli"
+        db = MagicMock()
+        db.get_session.return_value = {"system_prompt": stored}
+        agent = _make_agent(session_db=db)
+
+        with patch(
+            "agent.system_prompt.stored_prompt_has_current_soul",
+            return_value=True,
+        ):
+            _restore_or_build_system_prompt(
+                agent, None, [{"role": "user", "content": "hi"}]
+            )
+
+        assert agent._cached_system_prompt == stored
+        agent._build_system_prompt.assert_not_called()
+        db.update_system_prompt.assert_not_called()
+
+    def test_matching_skills_index_keeps_byte_identical_prompt(self):
+        stored = "Identity\n\nCURRENT SKILLS INDEX\n\nModel: test-model\nProvider: openrouter\nPlatform: cli"
+        db = MagicMock()
+        db.get_session.return_value = {"system_prompt": stored}
+        agent = _make_agent(session_db=db)
+        agent.valid_tool_names = {"skill_view"}
+
+        with patch(
+            "agent.system_prompt.build_current_skills_prompt",
+            return_value="CURRENT SKILLS INDEX",
+        ):
+            _restore_or_build_system_prompt(
+                agent, None, [{"role": "user", "content": "hi"}]
+            )
+
+        assert agent._cached_system_prompt == stored
+        agent._build_system_prompt.assert_not_called()
+        db.update_system_prompt.assert_not_called()
+
+    def test_session_without_skill_tools_does_not_rebuild(self):
+        stored = "Identity\n\nModel: test-model\nProvider: openrouter\nPlatform: cli"
+        db = MagicMock()
+        db.get_session.return_value = {"system_prompt": stored}
+        agent = _make_agent(session_db=db)
+
+        _restore_or_build_system_prompt(
+            agent, None, [{"role": "user", "content": "hi"}]
+        )
+
+        assert agent._cached_system_prompt == stored
+        agent._build_system_prompt.assert_not_called()
+        db.update_system_prompt.assert_not_called()
 
     def test_present_row_with_stale_runtime_identity_rebuilds(self, caplog):
         """Stored prompts are cache gold unless their runtime identity is stale.

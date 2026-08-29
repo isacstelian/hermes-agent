@@ -6153,6 +6153,19 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 # it and detect the gateway platform / session for routing.
                 server._pending_call_context = contextvars.copy_context()
                 try:
+                    call_kwargs = {}
+                    if (
+                        getattr(server, "_config", {}).get(
+                            "forward_current_attachments"
+                        )
+                        is True
+                    ):
+                        from gateway.session_context import current_attachments_meta
+
+                        meta = current_attachments_meta()
+                        if meta is not None:
+                            call_kwargs["meta"] = meta
+
                     # Fast-fail (#81995): a stdio subprocess that is already
                     # dead must not own this call slot — fail immediately
                     # instead of waiting out the full tool timeout on a
@@ -6182,7 +6195,9 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                             f"exited; failing the call fast instead of "
                             f"waiting {float(tool_timeout):.0f}s"
                         )
-                    _call_coro = server.session.call_tool(tool_name, arguments=args)
+                    _call_coro = server.session.call_tool(
+                        tool_name, arguments=args, **call_kwargs
+                    )
                     _watch_children = getattr(server, "_watch_stdio_children", None)
                     _watch_ok = (
                         _watch_children is not None
