@@ -432,6 +432,79 @@ def _profile_name_for_home(home: Path) -> str:
         return "default"
 
 
+def build_current_soul_prompt(
+    agent: Any, context_length: Optional[int] = None
+) -> str:
+    """Return the current SOUL.md content injected for *agent*, if any."""
+    if not (agent.load_soul_identity or not agent.skip_context_files):
+        return ""
+    return _ra().load_soul_md(
+        context_length, home_override=_agent_home(agent)
+    ) or ""
+
+
+def _help_guidance_for_skills_prompt(agent: Any, skills_prompt: str) -> str:
+    """Return the help block selected by the system-prompt builder."""
+    valid_tool_names = getattr(agent, "valid_tool_names", None) or ()
+    if "skill_view" in valid_tool_names and "- hermes-agent:" in skills_prompt:
+        return HERMES_AGENT_HELP_GUIDANCE
+    return HERMES_AGENT_HELP_GUIDANCE_NO_SKILLS
+
+
+def stored_prompt_has_current_soul(agent: Any, prompt: str) -> bool:
+    """Validate the stored SOUL prefix and its current help-guidance variant."""
+    context_length: Optional[int] = None
+    compressor = getattr(agent, "context_compressor", None)
+    compressor_length = getattr(compressor, "context_length", None)
+    if isinstance(compressor_length, int) and compressor_length > 0:
+        context_length = compressor_length
+
+    current_soul = build_current_soul_prompt(agent, context_length)
+    if not current_soul:
+        return True
+
+    current_skills_prompt = build_current_skills_prompt(agent)
+    help_guidance = _help_guidance_for_skills_prompt(agent, current_skills_prompt)
+    expected_prefix = current_soul.strip() + "\n\n" + help_guidance.strip()
+    return prompt.startswith(expected_prefix)
+
+
+def build_current_skills_prompt(agent: Any) -> str:
+    """Render the skill index visible to *agent* in the current runtime."""
+    valid_tool_names = set(getattr(agent, "valid_tool_names", None) or ())
+    has_skills_tools = bool(
+        valid_tool_names.intersection({"skills_list", "skill_view", "skill_manage"})
+    )
+    if not has_skills_tools:
+        return ""
+
+    runtime = _ra()
+    available_toolsets = {
+        toolset
+        for toolset in (
+            runtime.get_toolset_for_tool(tool_name)
+            for tool_name in valid_tool_names
+        )
+        if toolset
+    }
+    compact_categories = frozenset()
+    try:
+        from agent.coding_context import coding_compact_skill_categories
+
+        compact_categories = coding_compact_skill_categories(
+            platform=agent.platform, cwd=resolve_context_cwd()
+        )
+    except Exception:
+        compact_categories = frozenset()
+
+    return runtime.build_skills_system_prompt(
+        available_tools=valid_tool_names,
+        available_toolsets=available_toolsets,
+        compact_categories=compact_categories or None,
+        skills_dir_override=_agent_skills_dir(agent),
+    )
+
+
 def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) -> Dict[str, str]:
     """Assemble the system prompt as three ordered cache tiers.
 
@@ -472,15 +545,13 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # Try SOUL.md as primary identity unless the caller explicitly skipped it.
     # Some execution modes (cron) still want HERMES_HOME persona while keeping
     # cwd project instructions disabled.
-    _soul_loaded = False
-    if agent.load_soul_identity or not agent.skip_context_files:
-        # Scope the SOUL.md read to the agent's OWN home (see _agent_home) —
-        # ambient resolution on a thread that lost the HERMES_HOME ContextVar
-        # reads the launch profile's SOUL.md instead (#50233).
-        _soul_content = _r.load_soul_md(_ctx_len, home_override=_agent_home(agent))
-        if _soul_content:
-            stable_parts.append(_soul_content)
-            _soul_loaded = True
+    # Scope the SOUL.md read to the agent's OWN home (see _agent_home) —
+    # ambient resolution on a thread that lost the HERMES_HOME ContextVar
+    # reads the launch profile's SOUL.md instead (#50233).
+    _soul_content = build_current_soul_prompt(agent, _ctx_len)
+    _soul_loaded = bool(_soul_content)
+    if _soul_content:
+        stable_parts.append(_soul_content)
 
     if not _soul_loaded:
         # Fallback to hardcoded identity
@@ -493,7 +564,6 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # variant is chosen AFTER the skills index is built (see below) and
     # this slot holds its position. Toolset and skill set are fixed
     # per-session, so cache-safe either way.
-    _has_skill_view = "skill_view" in (agent.valid_tool_names or set())
     _help_guidance_slot = len(stable_parts)
     stable_parts.append(HERMES_AGENT_HELP_GUIDANCE_NO_SKILLS)
 
@@ -616,44 +686,16 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             from agent.prompt_builder import execution_guidance_text
             stable_parts.append(execution_guidance_text(agent.valid_tool_names))
 
-    has_skills_tools = any(name in agent.valid_tool_names for name in ['skills_list', 'skill_view', 'skill_manage'])
-    if has_skills_tools:
-        avail_toolsets = {
-            toolset
-            for toolset in (
-                _r.get_toolset_for_tool(tool_name) for tool_name in agent.valid_tool_names
-            )
-            if toolset
-        }
-        # Focus mode (opt-in) demotes non-coding skill categories to
-        # names-only in the index (never hidden — skill_view/skills_list
-        # reach everything, and every name stays visible for recall). The
-        # default coding posture leaves the index untouched.
-        _compact_cats = frozenset()
-        try:
-            from agent.coding_context import coding_compact_skill_categories
-
-            _compact_cats = coding_compact_skill_categories(
-                platform=agent.platform, cwd=resolve_context_cwd()
-            )
-        except Exception:
-            _compact_cats = frozenset()
-        skills_prompt = _r.build_skills_system_prompt(
-            available_tools=agent.valid_tool_names,
-            available_toolsets=avail_toolsets,
-            compact_categories=_compact_cats or None,
-            skills_dir_override=_agent_skills_dir(agent),
-        )
-    else:
-        skills_prompt = ""
+    skills_prompt = build_current_skills_prompt(agent)
 
     # Resolve the help-guidance variant now that the skills index exists:
     # the skill-pointer variant requires BOTH skill_view in the toolset AND
     # the hermes-agent skill actually present in the index (gating on the
     # rendered index line keeps this a pure string check — no second
     # filesystem scan, and it inherits the index cache's stability).
-    if _has_skill_view and "- hermes-agent:" in skills_prompt:
-        stable_parts[_help_guidance_slot] = HERMES_AGENT_HELP_GUIDANCE
+    stable_parts[_help_guidance_slot] = _help_guidance_for_skills_prompt(
+        agent, skills_prompt
+    )
 
     # Alibaba Coding Plan API always returns "glm-4.7" as model name regardless
     # of the requested model. Inject explicit model identity into the system prompt

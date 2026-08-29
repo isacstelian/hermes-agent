@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from gateway.config import Platform
-from gateway.platforms.base import MessageEvent
+from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult
 from gateway.session import SessionSource
 
 
@@ -91,7 +91,7 @@ class TestRunBackgroundTask:
     async def test_no_credentials_sends_error(self):
         """When provider credentials are missing, an error is sent."""
         runner = _make_runner()
-        mock_adapter = AsyncMock()
+        mock_adapter = MagicMock()
         mock_adapter.send = AsyncMock()
         runner.adapters[Platform.TELEGRAM] = mock_adapter
 
@@ -114,10 +114,11 @@ class TestRunBackgroundTask:
     async def test_successful_task_sends_result(self):
         """When the agent completes successfully, the result is sent."""
         runner = _make_runner()
-        mock_adapter = AsyncMock()
+        mock_adapter = MagicMock()
         mock_adapter.send = AsyncMock()
         mock_adapter.extract_media = MagicMock(return_value=([], "Hello from background!"))
         mock_adapter.extract_images = MagicMock(return_value=([], "Hello from background!"))
+        mock_adapter.media_delivery_max_bytes = MagicMock(return_value=None)
         runner.adapters[Platform.TELEGRAM] = mock_adapter
 
         source = SessionSource(
@@ -161,6 +162,84 @@ class TestRunBackgroundTask:
         assert agent_kwargs["checkpoint_max_file_size_mb"] == 3
         mock_agent_instance.shutdown_memory_provider.assert_called_once()
         mock_agent_instance.close.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_inbound_document_is_staged_before_agent_run(self):
+        runner = _make_runner()
+        mock_adapter = MagicMock()
+        mock_adapter.send = AsyncMock()
+        mock_adapter.extract_media = MagicMock(return_value=([], "done"))
+        mock_adapter.extract_images = MagicMock(return_value=([], "done"))
+        mock_adapter.media_delivery_max_bytes = MagicMock(return_value=None)
+        runner.adapters[Platform.TELEGRAM] = mock_adapter
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            user_id="12345",
+            chat_id="67890",
+            user_name="testuser",
+        )
+        document = "/root/.hermes/cache/documents/Audit.pdf"
+
+        with patch(
+            "gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "test-key"}
+        ), patch("gateway.run._load_gateway_config", return_value={}), patch(
+            "gateway.media_fetch.stage_inbound_media", return_value=[]
+        ) as stage, patch("run_agent.AIAgent") as MockAgent:
+            agent = MagicMock()
+            agent.run_conversation.return_value = {"final_response": "done"}
+            MockAgent.return_value = agent
+
+            await runner._run_background_task(
+                "read it", source, "bg_docs", media_urls=[document]
+            )
+
+        stage.assert_called_once_with([document], "bg_docs")
+        agent.run_conversation.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_failed_background_document_upload_sends_notice(
+        self, tmp_path, monkeypatch
+    ):
+        runner = _make_runner()
+        document = tmp_path / "Audit.pdf"
+        document.write_bytes(b"%PDF")
+        monkeypatch.setattr(
+            "gateway.platforms.base.MEDIA_DELIVERY_SAFE_ROOTS", (tmp_path,)
+        )
+        adapter = MagicMock()
+        adapter.extract_media = BasePlatformAdapter.extract_media
+        adapter.extract_images = BasePlatformAdapter.extract_images
+        adapter.media_delivery_max_bytes = MagicMock(return_value=50 * 1024 * 1024)
+        adapter.send_document = AsyncMock(
+            return_value=SendResult(success=False, error="Telegram upload rejected")
+        )
+        adapter.send = AsyncMock(return_value=SendResult(success=True))
+        runner.adapters[Platform.TELEGRAM] = adapter
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            user_id="12345",
+            chat_id="67890",
+            user_name="testuser",
+        )
+
+        with patch(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            return_value={"api_key": "test-key"},
+        ), patch("gateway.run._load_gateway_config", return_value={}), patch(
+            "run_agent.AIAgent"
+        ) as MockAgent:
+            agent = MagicMock()
+            agent.run_conversation.return_value = {
+                "final_response": f"Raport gata.\nMEDIA:{document}"
+            }
+            MockAgent.return_value = agent
+
+            await runner._run_background_task("raport", source, "bg_docs")
+
+        adapter.send_document.assert_awaited_once()
+        notices = [call.kwargs.get("content", "") for call in adapter.send.await_args_list]
+        assert any("Couldn't deliver" in content for content in notices)
+        assert any("Audit.pdf" in content for content in notices)
 
 
 # ---------------------------------------------------------------------------

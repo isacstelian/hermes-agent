@@ -10,18 +10,21 @@ We mock the telegram module at import time to avoid collection errors.
 
 import asyncio
 import os
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from gateway.config import PlatformConfig
+from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     SendResult,
     SUPPORTED_VIDEO_TYPES,
 )
+from gateway.session import SessionSource
 
 
 # ---------------------------------------------------------------------------
@@ -147,6 +150,36 @@ class TestDocumentTypeDetection:
         assert event.message_type == MessageType.DOCUMENT
 
 
+class TestOutboundDocumentLimit:
+    def test_public_bot_api_limit_is_50_mb(self, adapter):
+        assert adapter.media_delivery_max_bytes() == 50 * 1024 * 1024
+
+    def test_self_hosted_bot_api_limit_is_2_gb(self):
+        config = PlatformConfig(
+            enabled=True,
+            token="fake-token",
+            extra={"base_url": "http://telegram-bot-api:8081/bot"},
+        )
+        adapter = TelegramAdapter(config)
+
+        assert adapter.media_delivery_max_bytes() == 2 * 1024 * 1024 * 1024
+
+    @pytest.mark.asyncio
+    async def test_oversized_public_document_is_rejected_before_upload(
+        self, adapter, tmp_path, monkeypatch
+    ):
+        path = tmp_path / "large.pdf"
+        path.write_bytes(b"x")
+        monkeypatch.setattr(os.path, "getsize", lambda _path: 51 * 1024 * 1024)
+        adapter._bot = MagicMock()
+
+        result = await adapter.send_document("123", str(path))
+
+        assert result.success is False
+        assert "50 MB" in result.error
+        adapter._bot.send_document.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # TestDocumentDownloadBlock
 # ---------------------------------------------------------------------------
@@ -158,6 +191,41 @@ def _make_photo(file_obj=None):
 
 
 class TestDocumentDownloadBlock:
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("filename", "mime_type", "payload"),
+        [
+            ("Audit Creste cu Magic.pdf", "application/pdf", b"%PDF-1.7\ntelegram"),
+            (
+                "Raport board.docx",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                b"PK\x03\x04word document bytes",
+            ),
+        ],
+    )
+    async def test_replied_document_is_cached_as_real_event_media(
+        self, adapter, filename, mime_type, payload
+    ):
+        replied = _make_message(
+            document=_make_document(
+                file_name=filename,
+                mime_type=mime_type,
+                file_obj=_make_file_obj(payload),
+            )
+        )
+        msg = _make_message(caption="citeste documentul")
+        msg.reply_to_message = replied
+        event = MessageEvent(
+            text="citeste documentul",
+            source=SessionSource(platform=Platform.TELEGRAM, chat_id="123"),
+        )
+
+        await adapter._cache_replied_media(msg, event)
+
+        assert len(event.media_urls) == 1
+        assert Path(event.media_urls[0]).read_bytes() == payload
+        assert event.media_types == [mime_type]
 
 
     @pytest.mark.asyncio

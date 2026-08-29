@@ -205,6 +205,47 @@ TELEGRAM_BOT_TOKEN=123456789:ABCdefGHIjklMNOpqrSTUvwxYZ
 TELEGRAM_ALLOWED_USERS=123456789    # Comma-separated for multiple users
 ```
 
+### Messages from other bots (`allow_bots`)
+
+Other Telegram bots are rejected by default. To enable bounded bot-to-bot
+collaboration, set the canonical platform key in `~/.hermes/config.yaml`:
+
+```yaml
+gateway:
+  platforms:
+    telegram:
+      extra:
+        allow_bots: mentions  # none | mentions | all
+```
+
+The compatibility key `telegram.allow_bots` and environment variable
+`TELEGRAM_ALLOW_BOTS` accept the same values. The canonical
+`gateway.platforms.telegram.extra.allow_bots` value takes precedence when both
+are present.
+
+| Value | Behavior |
+|---|---|
+| `none` | Reject every bot-origin message. This is the default. |
+| `mentions` | Accept only an explicit `/command@this_bot` mention or a direct reply to this bot whose local lineage is known. |
+| `all` | May accept unmentioned bot messages, subject to the same lineage and rate limits. |
+
+Bot-origin traffic is always fail-closed. The guard deduplicates
+`(profile, chat_id, sender_bot_id, message_id)` for 10 minutes, accepts at most
+one message per ordered sender/receiver pair and six bot-origin messages per
+chat in 60 seconds, and accepts only interaction depth 1 from a root. Two
+rate/depth violations in 60 seconds open a 10-minute breaker for that chat.
+Unknown lineage, malformed state, state-store errors, and invalid policy values
+are dropped. Human-origin routing is unchanged.
+
+The gateway refuses to start an enabled bot policy (`mentions` or `all`) when
+the guard is unavailable or invalid. Guard logs expose only sanitized decision
+reasons and counters; they never include message bodies, bot tokens, or user
+identity fields.
+
+**Rollback:** set `allow_bots: none` (or remove the config key and
+`TELEGRAM_ALLOW_BOTS`), then restart the gateway. No Telegram or BotFather
+setting must be changed to disable bot-origin dispatch.
+
 ### Start the Gateway
 
 ```bash
@@ -1050,6 +1091,31 @@ Behavior:
 - A chat in `TELEGRAM_GROUP_ALLOWED_CHATS` authorizes every member of that chat, regardless of sender.
 - Use `*` in any of these to allow any sender/chat.
 - This layers on top of existing mention/pattern triggers and on top of `group_topics` + `ignored_threads`.
+
+### Trusted administrator group enrollment
+
+Hermes can persistently admit a Telegram group when a trusted Telegram user promotes the bot to **administrator**:
+
+```yaml
+telegram:
+  auto_allow_groups_from_trusted_adders: true
+  trusted_group_adders:
+    - "123456789"
+  require_mention: true
+```
+
+This mode is intentionally strict:
+
+- Enrollment occurs only on a transition to Telegram `administrator`, only when the actor who performed the promotion is in `trusted_group_adders`. Merely adding the bot as a member does not enroll the group.
+- While the mode is enabled, a group must be present in `allowed_chats`, `group_allowed_chats`, or the active validated enrollment set. An empty set no longer means “all groups.” Sender allowlists and `guest_mode` mentions cannot bypass this admission gate.
+- Persisted enrollments are only restart candidates: post-connect housekeeping checks each one with Telegram `getChatMember` and activates it only when the bot is currently an administrator. Member status, unknown status, and API errors remain inactive (the durable candidate is retained for a later retry).
+- Once a group is admitted, normal mention, reply, topic, sender, and command gates still apply. Enrollment does not make the bot answer every message.
+- Inline button callbacks in groups/forums use the same admission boundary before model selection, choices, approvals, or session state can change. Explicitly configured and currently active enrolled groups retain normal callback authorization.
+- Any transition away from `administrator` revokes the live grant immediately, regardless of who changed the bot's role, and removes the durable grant. A persistence failure never creates a live-only enrollment or keeps a revoked live grant. Leaving or being kicked also revokes it.
+- When Telegram migrates a dynamically enrolled basic group to a supergroup, Hermes atomically moves the durable grant to the new negative chat ID and denies the old dynamic grant immediately. Explicit `allowed_chats` / `group_allowed_chats` entries are never rewritten or copied.
+- State is stored under the active Hermes profile at `$HERMES_HOME/state/telegram-auto-authorized-groups.json` (normally `~/.hermes/state/telegram-auto-authorized-groups.json`). Hermes stores only negative numeric chat IDs, writes with atomic replacement, restricts the state directory/file to owner-only permissions (`0700`/`0600`) on POSIX systems, and rejects symlinked or non-regular state paths. Treat the profile state directory as security-sensitive and do not share or hand-edit this file while the gateway is running.
+
+Both settings default to disabled/empty. Invalid booleans or malformed trusted-user lists fail closed and do not enroll a group.
 
 ### Migration from before PR #17686
 

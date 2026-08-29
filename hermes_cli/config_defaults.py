@@ -1924,6 +1924,7 @@ DEFAULT_CONFIG = {
         "cloud_trim_silence": True,
         "cloud_trim_threshold_db": -40,  # audio quieter than this counts as silence
         "cloud_trim_keep_ms": 300,  # how much of each pause survives (keeps natural pacing)
+        "fallback_provider": "",  # optional second STT provider tried after the primary returns failure
         "local": {
             "model": "base",  # tiny, base, small, medium, large-v3
             "language": "",  # auto-detect by default; set to "en", "es", "fr", etc. to force
@@ -2499,6 +2500,8 @@ DEFAULT_CONFIG = {
         "reactions": False,            # Add 👀/✅/❌ reactions to messages during processing
         "channel_prompts": {},         # Per-chat/topic ephemeral system prompts (topics inherit from parent group)
         "allowed_chats": "",           # If set, bot ONLY responds in these group/supergroup chat IDs (whitelist)
+        "auto_allow_groups_from_trusted_adders": False,  # Persist groups where a trusted actor promotes the bot to admin
+        "trusted_group_adders": [],     # Telegram user IDs permitted to auto-authorize groups
         "extra": {
             "rich_messages": False,     # Bot API 10.1 rich messages (tables/task lists/details/math) render natively; set True to opt in. Default stays legacy MarkdownV2 because rich messages can be hard to copy as plain text in Telegram clients.
             "rich_drafts": False,       # Experimental Bot API 10.1 rich draft previews during Telegram DM streaming. Default off because Telegram Desktop/macOS can visually overlay rich draft frames until the chat redraws.

@@ -615,7 +615,7 @@ import dataclasses
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Dict, List, Optional, Any, Callable, Awaitable, Tuple, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Any, Callable, Awaitable, Sequence, Tuple, Union
 from enum import Enum
 
 from pathlib import Path as _Path
@@ -1404,58 +1404,63 @@ def _media_delivery_strict_mode() -> bool:
     return raw in ("1", "true", "yes", "on")
 
 
+# Module-level (not local to _media_delivery_denied_paths) so the remote-path
+# check in gateway/media_fetch.py can apply the same set to a backend
+# filesystem, which cannot be stat'd from here.
+# The active Hermes profile and shared Hermes root both contain control
+# files and credentials. Only cache subdirectories under them are
+# explicitly allowlisted above (matched BEFORE this denylist in
+# validate_media_delivery_path, so generated media still delivers).
+#
+# These are the per-file credential / secret stores that live at the
+# HERMES_HOME root. The set mirrors the canonical read guard in
+# agent/file_safety.py (get_read_block_error / build_write_denied_*) so the
+# delivery (read/exfil) side can't trail the write side: a credential the
+# agent is forbidden to write or read must also never be auto-attached to a
+# chat reply. Enumerated explicitly per-file rather than denying the whole
+# tree, so skills/, logs/, and ad-hoc agent-written files under ~/.hermes
+# stay deliverable (see #32090, #34425).
+_ROOT_CREDENTIAL_FILES = (
+    ".env",
+    "auth.json",
+    "auth.lock",
+    "credentials",
+    "config.yaml",
+    # Anthropic PKCE / OAuth refresh credential store.
+    ".anthropic_oauth.json",
+    # Google Workspace skill: auto-refreshing OAuth token (mtime bumps
+    # every turn, which defeated the strict-mode recency window) plus the
+    # pending-exchange session/verifier file.
+    "google_token.json",
+    "google_oauth_pending.json",
+    os.path.join("auth", "google_oauth.json"),
+    # Webhook subscription HMAC secrets.
+    "webhook_subscriptions.json",
+    # Bitwarden Secrets Manager plaintext and encrypted disk caches.
+    os.path.join("cache", "bws_cache.json"),
+    os.path.join("cache", "bws_cache.enc.json"),
+)
+# Directory trees whose every child is credential material.
+#
+# mcp-tokens/ holds live MCP OAuth access tokens (<server>.json) and
+# dynamically-registered client credentials (<server>.client.json); see
+# tools/mcp_oauth.py. Same credential class as auth.json/credentials/.
+# The write side already denies it (file_tools _check_sensitive_path);
+# this pairs the media-delivery (exfil) side so a prompt-injection MEDIA
+# tag can't deliver a live bearer token as a native attachment.
+# (session/kanban SQLite stores are handled by #41071 — kept out here.)
+_ROOT_CREDENTIAL_DIRS = (
+    "pairing",
+    "mcp-tokens",
+)
+
+
 def _media_delivery_denied_paths() -> List[Path]:
     """Return absolute denylist paths under which delivery is never allowed."""
     denied = [Path(p) for p in _MEDIA_DELIVERY_DENIED_PREFIXES]
     home = Path(os.path.expanduser("~"))
     for sub in _MEDIA_DELIVERY_DENIED_HOME_SUBPATHS:
         denied.append(home / sub)
-    # The active Hermes profile and shared Hermes root both contain control
-    # files and credentials. Only cache subdirectories under them are
-    # explicitly allowlisted above (matched BEFORE this denylist in
-    # validate_media_delivery_path, so generated media still delivers).
-    #
-    # These are the per-file credential / secret stores that live at the
-    # HERMES_HOME root. The set mirrors the canonical read guard in
-    # agent/file_safety.py (get_read_block_error / build_write_denied_*) so the
-    # delivery (read/exfil) side can't trail the write side: a credential the
-    # agent is forbidden to write or read must also never be auto-attached to a
-    # chat reply. Enumerated explicitly per-file rather than denying the whole
-    # tree, so skills/, logs/, and ad-hoc agent-written files under ~/.hermes
-    # stay deliverable (see #32090, #34425).
-    _ROOT_CREDENTIAL_FILES = (
-        ".env",
-        "auth.json",
-        "auth.lock",
-        "credentials",
-        "config.yaml",
-        # Anthropic PKCE / OAuth refresh credential store.
-        ".anthropic_oauth.json",
-        # Google Workspace skill: auto-refreshing OAuth token (mtime bumps
-        # every turn, which defeated the strict-mode recency window) plus the
-        # pending-exchange session/verifier file.
-        "google_token.json",
-        "google_oauth_pending.json",
-        os.path.join("auth", "google_oauth.json"),
-        # Webhook subscription HMAC secrets.
-        "webhook_subscriptions.json",
-        # Bitwarden Secrets Manager plaintext and encrypted disk caches.
-        os.path.join("cache", "bws_cache.json"),
-        os.path.join("cache", "bws_cache.enc.json"),
-    )
-    # Directory trees whose every child is credential material.
-    #
-    # mcp-tokens/ holds live MCP OAuth access tokens (<server>.json) and
-    # dynamically-registered client credentials (<server>.client.json); see
-    # tools/mcp_oauth.py. Same credential class as auth.json/credentials/.
-    # The write side already denies it (file_tools _check_sensitive_path);
-    # this pairs the media-delivery (exfil) side so a prompt-injection MEDIA
-    # tag can't deliver a live bearer token as a native attachment.
-    # (session/kanban SQLite stores are handled by #41071 — kept out here.)
-    _ROOT_CREDENTIAL_DIRS = (
-        "pairing",
-        "mcp-tokens",
-    )
     for hermes_root in (_HERMES_HOME, _HERMES_ROOT):
         for rel in _ROOT_CREDENTIAL_FILES:
             denied.append(hermes_root / rel)
@@ -1806,8 +1811,27 @@ def _translate_docker_container_media_path(candidate: Path, session_key: str = "
     return None
 
 
-def validate_media_delivery_path(path: str, session_key: str = "") -> Optional[str]:
-    """Return a safe absolute file path for native media delivery, else None.
+# Reason codes for a rejected media-delivery path. ``denied`` is a security
+# rejection (credential / system denylist, or a strict-mode miss); ``missing``
+# means nothing deliverable lives at that path *on the gateway host* — the
+# usual shape when the agent runs under a sandboxed terminal backend whose
+# filesystem the gateway process cannot see, and no docker mount maps the
+# container path back to the host (#75065).
+MEDIA_DROP_DENIED = "denied"
+MEDIA_DROP_MISSING = "missing"
+
+
+def classify_media_delivery_path(
+    path: str, session_key: str = ""
+) -> Tuple[Optional[str], str]:
+    """Resolve *path* for native delivery, and say why when it is rejected.
+
+    Returns ``(resolved_path, "")`` when the file may be delivered, else
+    ``(None, reason)`` with one of the ``MEDIA_DROP_*`` codes above. Callers
+    that only need the accept/reject decision use the
+    :func:`validate_media_delivery_path` wrapper below; the reason exists so
+    the gateway can tell the user *why* an attachment never arrived instead
+    of dropping it behind a host-side log line only (#75065).
 
     Default mode (single-user / private gateway): accept any existing regular
     file that isn't under the credential / system-path denylist
@@ -1827,22 +1851,22 @@ def validate_media_delivery_path(path: str, session_key: str = "") -> Optional[s
     Symlinks are resolved before any containment / denylist check.
     """
     if not path:
-        return None
+        return None, MEDIA_DROP_MISSING
 
     candidate = str(path).strip()
     if len(candidate) >= 2 and candidate[0] == candidate[-1] and candidate[0] in "`\"'":
         candidate = candidate[1:-1].strip()
     candidate = candidate.lstrip("`\"'").rstrip("`\"',.;:)}]")
     if not candidate:
-        return None
+        return None, MEDIA_DROP_MISSING
 
     try:
         expanded = Path(os.path.expanduser(candidate))
     except (OSError, RuntimeError, ValueError):
         # expanduser raises ValueError("embedded null byte") for a ~\x00 path.
-        return None
+        return None, MEDIA_DROP_MISSING
     if not expanded.is_absolute():
-        return None
+        return None, MEDIA_DROP_MISSING
 
     # Docker agents emit MEDIA:/workspace/... (or other configured container
     # mount paths). Resolve those to host paths before the normal host-side
@@ -1854,10 +1878,10 @@ def validate_media_delivery_path(path: str, session_key: str = "") -> Optional[s
         try:
             resolved = expanded.resolve(strict=True)
         except (OSError, RuntimeError, ValueError):
-            return None
+            return None, MEDIA_DROP_MISSING
 
     if not resolved.is_file():
-        return None
+        return None, MEDIA_DROP_MISSING
 
     # Cache / operator allowlist is always honored — these are unconditionally
     # trusted regardless of mode.
@@ -1867,7 +1891,7 @@ def validate_media_delivery_path(path: str, session_key: str = "") -> Optional[s
         except (OSError, RuntimeError, ValueError):
             continue
         if _path_is_within(resolved, resolved_root):
-            return str(resolved)
+            return str(resolved), ""
 
     # Non-strict mode (default): accept anything not on the denylist.
     # The denylist still blocks /etc, /proc, ~/.ssh, ~/.aws, and the
@@ -1878,8 +1902,8 @@ def validate_media_delivery_path(path: str, session_key: str = "") -> Optional[s
     # ``MEDIA:~/.hermes/google_token.json``) remain rejected.
     if not _media_delivery_strict_mode():
         if _path_under_denied_prefix(resolved):
-            return None
-        return str(resolved)
+            return None, MEDIA_DROP_DENIED
+        return str(resolved), ""
 
     # Strict mode: fall back to recency-based trust for freshly-produced
     # files (e.g. ``pandoc -o /tmp/report.pdf`` or
@@ -1889,10 +1913,18 @@ def validate_media_delivery_path(path: str, session_key: str = "") -> Optional[s
     window = _media_delivery_recency_seconds()
     if window > 0 and not _path_under_denied_prefix(resolved):
         if _file_is_recently_produced(resolved, window):
-            return str(resolved)
+            return str(resolved), ""
 
-    return None
+    return None, MEDIA_DROP_DENIED
 
+
+def validate_media_delivery_path(path: str, session_key: str = "") -> Optional[str]:
+    """Return a safe absolute file path for native media delivery, else None.
+
+    Thin wrapper over :func:`classify_media_delivery_path` for the callers
+    that only care whether the file is deliverable.
+    """
+    return classify_media_delivery_path(path, session_key=session_key)[0]
 
 # Neutralise control chars and the Unicode line separators (NEL, LS, PS) that
 # str.splitlines() / log aggregators treat as breaks, so a model-emitted path
@@ -1903,6 +1935,98 @@ _LOG_UNSAFE_CHARS = re.compile(r"[\x00-\x1f\x7f\x85\u2028\u2029]")
 def _log_safe_path(path: str) -> str:
     """Return a single-line, length-bounded path for log output."""
     return _LOG_UNSAFE_CHARS.sub("?", str(path))[:200]
+
+
+def _notice_safe_name(path: str) -> str:
+    """Return the basename of *path*, safe to show in a chat message.
+
+    Only the basename: the directory part is host filesystem layout and is
+    never echoed into chat (same rule the send_* fallbacks follow).
+    """
+    candidate = str(path).strip().strip("`\"'").rstrip("`\"',.;:)}]")
+    # Split on both separators: a Windows gateway sees backslash paths, and
+    # the agent may emit either shape regardless of the gateway's own OS.
+    name = re.split(r"[\\/]", candidate)[-1] or "file"
+    return _LOG_UNSAFE_CHARS.sub("?", name)[:80]
+
+
+def _log_media_delivery_drop(
+    kind: str, raw: str, reason: str, fetch_reason: str = "",
+) -> None:
+    """Log a dropped delivery path, distinguishing *why* it was dropped.
+
+    The ``denied`` wording is unchanged from before the reason codes existed
+    so log searches for the security rejection keep working; ``missing`` gets
+    its own line, carrying why the backend fetch could not rescue it either.
+    """
+    if reason == MEDIA_DROP_DENIED:
+        logger.warning("Skipping unsafe %s path: %s", kind, _log_safe_path(raw))
+    else:
+        logger.warning(
+            "Skipping missing %s path (not on the gateway host and not "
+            "fetchable from the terminal backend: %s): %s",
+            kind, fetch_reason or "no backend fetch attempted", _log_safe_path(raw),
+        )
+
+
+def _maybe_fetch_remote_media(
+    path: str,
+    task_id: Optional[str] = None,
+    max_bytes: Optional[int] = None,
+) -> Tuple[Optional[str], str]:
+    """Try to fetch a locally-missing MEDIA path out of the terminal backend.
+
+    Returns ``(local_path, "")`` on success or ``(None, reason)``. Never
+    raises: a fetch bug must not take down the delivery of the message.
+    """
+    try:
+        from gateway.media_fetch import fetch_remote_media
+
+        local_path, reason = fetch_remote_media(path, task_id, max_bytes=max_bytes)
+        return local_path, reason or ""
+    except Exception as exc:  # noqa: BLE001 — delivery must survive a fetch bug
+        logger.warning("Remote media fetch errored: %s", exc, exc_info=True)
+        return None, "remote fetch errored"
+
+
+# Cap the per-message notice so a response with dozens of bad paths cannot
+# push the real reply out of the platform's message length limit.
+_MEDIA_DROP_NOTICE_MAX_LINES = 5
+
+
+def format_media_drop_notice(dropped: Sequence[Tuple[str, ...]]) -> str:
+    """Render a user-visible notice for attachments that were NOT delivered.
+
+    Empty string when nothing was dropped, so callers can append
+    unconditionally. Wording mirrors the ``send_document`` fallback notice so
+    a user sees one consistent failure shape.
+
+    Each entry is ``(display_name, reason)`` or ``(display_name, reason,
+    detail)``. The detail is the backend fetch's own short explanation and
+    wins when present: "not found in the docker backend" and "the sandbox is
+    gone" are different problems for the reader, and collapsing both into
+    "the gateway can't see that path" sends people hunting the wrong bug.
+    """
+    if not dropped:
+        return ""
+    lines = []
+    for entry in dropped[:_MEDIA_DROP_NOTICE_MAX_LINES]:
+        name, reason = entry[0], entry[1]
+        detail = entry[2] if len(entry) > 2 else ""
+        if detail:
+            why = detail
+        elif reason == MEDIA_DROP_DENIED:
+            why = "blocked by the media delivery policy"
+        else:
+            why = (
+                "the gateway host cannot see that path (files created inside "
+                "the terminal sandbox stay there)"
+            )
+        lines.append(f"⚠️ Couldn't deliver the file attachment ({name}): {why}.")
+    remaining = len(dropped) - _MEDIA_DROP_NOTICE_MAX_LINES
+    if remaining > 0:
+        lines.append(f"⚠️ …and {remaining} more attachment(s) not delivered.")
+    return "\n".join(lines)
 
 
 SUPPORTED_DOCUMENT_TYPES = {
@@ -2083,11 +2207,10 @@ MEDIA_TAG_CLEANUP_RE = re.compile(
 # unknown extension (.py, .log, .weirdext, ...) — are validated and delivered
 # via MEDIA_EXTENSIONLESS_TAG_RE. Every ``MEDIA:`` path is therefore
 # deliverable regardless of file type (#36060): known extensions extract
-# unconditionally via the anchored pattern above, everything else extracts
-# only after ``validate_media_delivery_path`` accepts it (exists on disk, not
-# under the credential/system denylist, strict-mode rules honored), so
-# prompt-injection paths that do not validate are left visible instead of
-# silently dropped.
+# unconditionally via the anchored pattern above, and everything else is
+# extracted as an explicit delivery request before host/backend validation.
+# This matters for container-only files, which cannot validate on the gateway
+# host until the artifact bridge has pulled them out of the sandbox.
 #
 # The path class uses a tempered-greedy token (``[^\s\n`"']+?`` followed by
 # a ``(?=...)`` lookahead) instead of the prior ``[^\s\n`"']+`` so a
@@ -2117,13 +2240,14 @@ MEDIA_EXTENSIONLESS_TAG_RE = re.compile(
 
 
 def _match_extensionless_path(scan_text: str, match: "re.Match") -> Optional[Tuple[str, int]]:
-    """Resolve an extensionless MEDIA tag match to a validated on-disk path.
+    """Resolve an extensionless MEDIA tag without requiring a host-side file.
 
     Tries the regex-captured path first. When that fails validation, the
     candidate is progressively extended forward across single spaces
     (validation-gated, bounded at 8 tokens, never past a newline or a
-    subsequent ``MEDIA:`` keyword) so unknown-extension paths containing
-    spaces deliver (#24032). Returns ``(safe_path, end_offset)`` where
+    subsequent ``MEDIA:`` keyword) so local unknown-extension paths containing
+    spaces deliver (#24032). Otherwise the explicit bare token is returned for
+    downstream host/backend validation. Returns ``(path, end_offset)`` where
     ``end_offset`` is the index in ``scan_text`` just past the matched path,
     or ``None`` when nothing validates.
     """
@@ -2155,7 +2279,7 @@ def _match_extensionless_path(scan_text: str, match: "re.Match") -> Optional[Tup
         if safe:
             return safe, start + tok_end
         pos = tok_end
-    return None
+    return path, match.end("path")
 
 
 def _merge_spans(spans: list) -> list:
@@ -5026,30 +5150,141 @@ class BasePlatformAdapter(ABC):
         """Return a resolved path if it is safe for native attachment upload."""
         return validate_media_delivery_path(path, session_key=session_key)
 
+    def agent_task_id_for_session(self, session_key: str) -> Optional[str]:
+        """Map a gateway session_key to the task id the agent ran under.
+
+        The agent is invoked with ``task_id=session_id`` and the terminal
+        sandbox is keyed by that id, so a delivery-time sandbox lookup has to
+        translate the gateway's session_key through the store's key→session_id
+        index first. Falls back to the raw key for stores that accept either.
+        """
+        store = getattr(self, "_session_store", None)
+        if store is not None:
+            peek = getattr(store, "peek_session_id", None)
+            if callable(peek):
+                try:
+                    return peek(session_key) or session_key
+                except Exception:  # noqa: BLE001 — never break delivery
+                    return session_key
+        return session_key
+
+    def media_delivery_max_bytes(self) -> int:
+        """Return the platform's native attachment upload limit."""
+        from gateway.media_fetch import media_fetch_max_bytes
+
+        return media_fetch_max_bytes()
+
     @staticmethod
-    def filter_media_delivery_paths(media_files, session_key: str = "") -> List[Tuple[str, bool]]:
+    def filter_media_delivery_paths(
+        media_files,
+        task_id: Optional[str] = None,
+        task_id_factory: Optional[Callable[[], Optional[str]]] = None,
+        max_bytes: Optional[int] = None,
+        session_key: str = "",
+    ) -> List[Tuple[str, bool]]:
         """Drop unsafe MEDIA paths and normalize accepted paths."""
+        return BasePlatformAdapter.filter_media_delivery_paths_with_drops(
+            media_files,
+            task_id=task_id,
+            task_id_factory=task_id_factory,
+            max_bytes=max_bytes,
+            session_key=session_key,
+        )[0]
+
+    @staticmethod
+    def filter_media_delivery_paths_with_drops(
+        media_files,
+        task_id: Optional[str] = None,
+        task_id_factory: Optional[Callable[[], Optional[str]]] = None,
+        max_bytes: Optional[int] = None,
+        session_key: str = "",
+    ) -> Tuple[List[Tuple[str, bool]], List[Tuple[str, str, str]]]:
+        """Filter MEDIA paths, returning the accepted ones and the drops.
+
+        A path that is merely *missing* on the gateway host is retried
+        against the active terminal backend: the file is fetched out of the
+        sandbox into the document cache and delivered from there, so a
+        MEDIA: directive works for artifacts the agent created inside its
+        container (#466). *Denied* paths are never fetched — re-reading a
+        credential from the backend would launder the rejection.
+
+        ``task_id_factory`` is the lazy form of ``task_id``: it is called at
+        most once, and ONLY when a fetch is actually attempted, so an ordinary
+        reply with no undeliverable path never pays for the session lookup
+        (#73771 pins that invariant).
+
+        The second element is a list of ``(display_name, reason, detail)``
+        triples for the paths that will NOT be delivered, so the caller can
+        tell the user instead of failing silently (#75065); *detail* is the
+        backend fetch's own explanation when one was attempted. Only the
+        basename is reported — the full path is a host filesystem layout leak.
+        """
         safe_media: List[Tuple[str, bool]] = []
+        dropped: List[Tuple[str, str, str]] = []
+        task_id_resolved = task_id is not None or task_id_factory is None
         for media_path, is_voice in media_files or []:
             raw = str(media_path)
-            safe_path = validate_media_delivery_path(raw, session_key=session_key)
+            safe_path, reason = classify_media_delivery_path(
+                raw, session_key=session_key
+            )
+            fetch_reason = ""
+            fetched_remote = False
+            if not safe_path and reason == MEDIA_DROP_MISSING:
+                if not task_id_resolved:
+                    task_id_resolved = True
+                    try:
+                        task_id = task_id_factory()
+                    except Exception:  # noqa: BLE001 — never break delivery
+                        task_id = None
+                safe_path, fetch_reason = _maybe_fetch_remote_media(
+                    raw, task_id, max_bytes=max_bytes
+                )
+                fetched_remote = bool(safe_path)
+            if safe_path and max_bytes is not None:
+                try:
+                    size = os.path.getsize(safe_path)
+                except OSError:
+                    safe_path = None
+                    reason = MEDIA_DROP_MISSING
+                else:
+                    if size > max_bytes:
+                        if fetched_remote:
+                            try:
+                                Path(safe_path).unlink(missing_ok=True)
+                            except OSError:
+                                pass
+                        safe_path = None
+                        reason = "oversize"
+                        fetch_reason = (
+                            f"the file is {size / (1024 * 1024):.1f} MB, above "
+                            f"the delivery limit of {max_bytes / (1024 * 1024):.1f} MB"
+                        )
             if safe_path:
                 safe_media.append((safe_path, bool(is_voice)))
             else:
-                logger.warning("Skipping unsafe MEDIA directive path: %s", _log_safe_path(raw))
-        return safe_media
+                _log_media_delivery_drop("MEDIA directive", raw, reason, fetch_reason)
+                dropped.append((_notice_safe_name(raw), reason, fetch_reason))
+        return safe_media, dropped
 
     @staticmethod
     def filter_local_delivery_paths(file_paths, session_key: str = "") -> List[str]:
-        """Drop unsafe bare local file paths and normalize accepted paths."""
+        """Drop unsafe bare local file paths and normalize accepted paths.
+
+        No drop reporting here on purpose: these paths are auto-detected from
+        the message body (a heuristic, #20834), not the explicit MEDIA
+        attachment contract, so a rejected one is usually a path the model
+        merely mentioned — not a delivery the user is waiting for.
+        """
         safe_paths: List[str] = []
         for file_path in file_paths or []:
             raw = str(file_path)
-            safe_path = validate_media_delivery_path(raw, session_key=session_key)
+            safe_path, reason = classify_media_delivery_path(
+                raw, session_key=session_key
+            )
             if safe_path:
                 safe_paths.append(safe_path)
             else:
-                logger.warning("Skipping unsafe local file path: %s", _log_safe_path(raw))
+                _log_media_delivery_drop("local file", raw, reason)
         return safe_paths
 
 
@@ -5198,7 +5433,9 @@ class BasePlatformAdapter(ABC):
         # referenced twice in one response — e.g. a MEDIA tag inline AND in a
         # summary footer — is uploaded once, not twice (#29131).
         seen_paths: set = set()
-        for match in media_pattern.finditer(scan_content):
+        known_matches = list(media_pattern.finditer(scan_content))
+        known_spans = [match.span() for match in known_matches]
+        for match in known_matches:
             path = _normalize_media_tag_path(match.group("path"))
             if path:
                 # ``[[audio_as_voice]]`` is message-global, but it must only
@@ -5221,6 +5458,8 @@ class BasePlatformAdapter(ABC):
                     media.append((expanded, is_voice))
 
         for match in MEDIA_EXTENSIONLESS_TAG_RE.finditer(scan_content):
+            if any(match.start() < end and match.end() > start for start, end in known_spans):
+                continue
             path = _normalize_media_tag_path(match.group("path"))
             if not path or not _path_lacks_deliverable_extension(path):
                 continue
@@ -5246,6 +5485,8 @@ class BasePlatformAdapter(ABC):
             masked_cleaned = BasePlatformAdapter._mask_json_string_media(masked_cleaned)
             spans = [m.span() for m in media_pattern.finditer(masked_cleaned)]
             for match in MEDIA_EXTENSIONLESS_TAG_RE.finditer(masked_cleaned):
+                if any(match.start() < end and match.end() > start for start, end in spans):
+                    continue
                 path = _normalize_media_tag_path(match.group("path"))
                 if not path or not _path_lacks_deliverable_extension(path):
                     continue
@@ -6533,6 +6774,12 @@ class BasePlatformAdapter(ABC):
                 typing_task,
                 metadata=_thread_metadata,
             )
+
+        from gateway.media_fetch import acquire_media_delivery_lease
+
+        _artifact_lease = acquire_media_delivery_lease(
+            task_id_factory=lambda: self.agent_task_id_for_session(session_key)
+        )
         
         try:
             await self._run_processing_hook("on_processing_start", event)
@@ -6584,7 +6831,33 @@ class BasePlatformAdapter(ABC):
 
                 # Extract MEDIA:<path> tags (from TTS tool) before other processing
                 media_files, response = self.extract_media(response)
-                media_files = self.filter_media_delivery_paths(media_files, session_key=session_key)
+                _media_filter = self.filter_media_delivery_paths_with_drops
+                try:
+                    _filter_params = inspect.signature(_media_filter).parameters.values()
+                    _filter_accepts_limit = any(
+                        param.name == "max_bytes"
+                        or param.kind == inspect.Parameter.VAR_KEYWORD
+                        for param in _filter_params
+                    )
+                    _filter_accepts_session_key = any(
+                        param.name == "session_key"
+                        or param.kind == inspect.Parameter.VAR_KEYWORD
+                        for param in _filter_params
+                    )
+                except (TypeError, ValueError):
+                    _filter_accepts_limit = True
+                    _filter_accepts_session_key = True
+                _filter_kwargs: dict[str, Any] = {
+                    "task_id_factory": lambda: (
+                        getattr(_artifact_lease, "requested_task_id", None)
+                        or self.agent_task_id_for_session(session_key)
+                    ),
+                }
+                if _filter_accepts_limit:
+                    _filter_kwargs["max_bytes"] = self.media_delivery_max_bytes()
+                if _filter_accepts_session_key:
+                    _filter_kwargs["session_key"] = session_key
+                media_files, _media_drops = _media_filter(media_files, **_filter_kwargs)
 
                 # Extract image URLs and send them as native platform attachments
                 images, text_content = self.extract_images(response)
@@ -6649,6 +6922,17 @@ class BasePlatformAdapter(ABC):
                             self.name, len(_response_pre_extract), event.source.chat_id,
                         )
                         text_content = _recovered
+
+                # An attachment the gateway could not deliver has to be visible
+                # to the user: text alone reads as a successful send, which is
+                # how undelivered files went unnoticed for days (#75065).
+                _drop_notice = format_media_drop_notice(_media_drops)
+                if _drop_notice:
+                    text_content = (
+                        f"{text_content}\n\n{_drop_notice}"
+                        if text_content
+                        else _drop_notice
+                    )
 
                 # Final user-visible content (text, TTS, media, files) gets
                 # the existing notify=True marker. Clone once so typing/status
@@ -7135,6 +7419,8 @@ class BasePlatformAdapter(ABC):
             if isinstance(e, (SystemExit, KeyboardInterrupt)):
                 raise
         finally:
+            if _artifact_lease is not None:
+                _artifact_lease.release()
             # Stop typing before any deferred callback work.  Post-delivery
             # callbacks may perform platform I/O; a stuck callback must not
             # leave the typing refresh task running indefinitely.

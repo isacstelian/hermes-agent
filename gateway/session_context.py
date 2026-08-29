@@ -109,6 +109,12 @@ _BROWSER_CONTROL_TRANSPORT_FAMILY: ContextVar = ContextVar(
     "HERMES_BROWSER_CONTROL_TRANSPORT_FAMILY", default=_UNSET
 )
 
+# Host paths for files received in this exact turn. Kept out of ``_VAR_MAP``
+# so they never enter subprocess environments or model-visible tool arguments.
+_CURRENT_ATTACHMENTS: ContextVar = ContextVar(
+    "HERMES_CURRENT_ATTACHMENTS", default=_UNSET
+)
+
 # Per-session cron marker. Unlike the process-global legacy env var, this is
 # scoped to one cron job / inbound session. _UNSET preserves the legacy env
 # fallback for CLI/tests; "1" marks cron; "" explicitly marks non-cron and
@@ -204,6 +210,55 @@ def set_current_session_id(session_id: str) -> None:
     os.environ["HERMES_SESSION_ID"] = session_id
 
 
+def set_current_attachments(paths: Any, content_types: Any) -> None:
+    """Bind immutable host file metadata to the current gateway task."""
+
+    from tools.credential_files import from_agent_visible_cache_path
+
+    raw_paths = list(paths or [])
+    raw_types = list(content_types or [])
+    attachments = tuple(
+        (
+            from_agent_visible_cache_path(str(path)),
+            str(raw_types[index] or "application/octet-stream")
+            if index < len(raw_types)
+            else "application/octet-stream",
+        )
+        for index, path in enumerate(raw_paths)
+        if path
+    )
+    _CURRENT_ATTACHMENTS.set(attachments)
+
+
+def set_current_message_context(
+    message_id: Any, paths: Any, content_types: Any
+) -> None:
+    """Rebind message-scoped metadata before each logical gateway turn."""
+
+    _SESSION_MESSAGE_ID.set(str(message_id or ""))
+    set_current_attachments(paths, content_types)
+
+
+def current_attachments_meta() -> dict[str, Any] | None:
+    """Return MCP metadata for this Telegram message, if it has files."""
+
+    attachments = _CURRENT_ATTACHMENTS.get()
+    platform = get_session_env("HERMES_SESSION_PLATFORM", "")
+    message_id = get_session_env("HERMES_SESSION_MESSAGE_ID", "")
+    if attachments is _UNSET or not attachments or platform != "telegram" or not message_id:
+        return None
+    return {
+        "ai.hermes/current-attachments": {
+            "platform": platform,
+            "message_id": message_id,
+            "files": [
+                {"path": path, "content_type": content_type}
+                for path, content_type in attachments
+            ],
+        }
+    }
+
+
 @contextmanager
 def scoped_current_session_id(session_id: str | None = None) -> Iterator[None]:
     """Bind a task-local session id and restore the prior value on exit.
@@ -267,6 +322,7 @@ def set_session_vars(
     # "ContextVar-authoritative, strip on _UNSET" — see session_context_engaged.
     global _session_context_engaged
     _session_context_engaged = True
+    _CURRENT_ATTACHMENTS.set(())
     tokens = [
         _SESSION_PLATFORM.set(platform),
         _SESSION_SOURCE.set(source),
@@ -329,6 +385,7 @@ def clear_session_vars(tokens: list) -> None:
         _CRON_SESSION,
     ):
         var.set("")
+    _CURRENT_ATTACHMENTS.set(())
     # Reset async-delivery capability to the "never set" sentinel rather than a
     # falsy value: a cleared context should fall back to the default-supported
     # behavior (CLI / unaware paths), not be mistaken for an opted-out
@@ -382,6 +439,7 @@ def reset_session_vars() -> None:
     # same inheritance-leak reason as the mapped vars above — see clear_session_vars,
     # which resets this var on the handler-exit path for the symmetric concern.
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
+    _CURRENT_ATTACHMENTS.set(_UNSET)
     try:
         from agent.runtime_cwd import clear_session_cwd
 

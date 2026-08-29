@@ -579,6 +579,164 @@ class TestTranscribeAudioDispatch:
 
         assert mock_local.call_args[0][1] == "small"
 
+
+class TestTranscribeAudioCloudFallback:
+    def _fallback_config(self) -> dict:
+        return {
+            "provider": "elevenlabs",
+            "fallback_provider": "openai",
+            "openai": {"model": "gpt-transcribe"},
+            "elevenlabs": {"model_id": "scribe_v2"},
+        }
+
+    def test_primary_success_does_not_call_fallback(self, sample_wav):
+        config = self._fallback_config()
+        with patch("tools.transcription_tools._load_stt_config", return_value=config), \
+             patch("tools.transcription_tools._get_provider", return_value="elevenlabs"), \
+             patch("tools.transcription_tools._trim_silence_for_cloud_stt", return_value=None), \
+             patch(
+                 "tools.transcription_tools._transcribe_elevenlabs",
+                 return_value={
+                     "success": True,
+                     "transcript": "primary transcript",
+                     "provider": "elevenlabs",
+                 },
+             ) as mock_elevenlabs, \
+             patch("tools.transcription_tools._transcribe_openai") as mock_openai:
+            from tools.transcription_tools import transcribe_audio
+
+            result = transcribe_audio(sample_wav)
+
+        assert result["success"] is True
+        assert result["transcript"] == "primary transcript"
+        mock_elevenlabs.assert_called_once()
+        mock_openai.assert_not_called()
+
+    def test_elevenlabs_failure_uses_openai_configured_model(self, sample_wav):
+        config = self._fallback_config()
+        with patch("tools.transcription_tools._load_stt_config", return_value=config), \
+             patch("tools.transcription_tools._get_provider", return_value="elevenlabs"), \
+             patch("tools.transcription_tools._trim_silence_for_cloud_stt", return_value=None), \
+             patch(
+                 "tools.transcription_tools._transcribe_elevenlabs",
+                 return_value={
+                     "success": False,
+                     "transcript": "",
+                     "provider": "elevenlabs",
+                     "error": "elevenlabs failed",
+                 },
+             ) as mock_elevenlabs, \
+             patch(
+                 "tools.transcription_tools._transcribe_openai",
+                 return_value={
+                     "success": True,
+                     "transcript": "fallback transcript",
+                     "provider": "openai",
+                 },
+             ) as mock_openai:
+            from tools.transcription_tools import transcribe_audio
+
+            result = transcribe_audio(sample_wav)
+
+        assert result["success"] is True
+        assert result["transcript"] == "fallback transcript"
+        mock_elevenlabs.assert_called_once()
+        assert mock_openai.call_args.args[1] == "gpt-transcribe"
+
+    def test_primary_model_override_does_not_leak_to_different_fallback(self, sample_wav):
+        config = self._fallback_config()
+        with patch("tools.transcription_tools._load_stt_config", return_value=config), \
+             patch("tools.transcription_tools._get_provider", return_value="elevenlabs"), \
+             patch("tools.transcription_tools._trim_silence_for_cloud_stt", return_value=None), \
+             patch(
+                 "tools.transcription_tools._transcribe_elevenlabs",
+                 return_value={
+                     "success": False,
+                     "transcript": "",
+                     "provider": "elevenlabs",
+                     "error": "primary failed",
+                 },
+             ) as mock_elevenlabs, \
+             patch(
+                 "tools.transcription_tools._transcribe_openai",
+                 return_value={
+                     "success": True,
+                     "transcript": "fallback transcript",
+                     "provider": "openai",
+                 },
+             ) as mock_openai:
+            from tools.transcription_tools import transcribe_audio
+
+            result = transcribe_audio(sample_wav, model="scribe_v2")
+
+        assert result["success"] is True
+        assert mock_elevenlabs.call_args.args[1] == "scribe_v2"
+        assert mock_openai.call_args.args[1] == "gpt-transcribe"
+
+    def test_fallback_provider_default_is_disabled(self):
+        from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+        assert DEFAULT_CONFIG["stt"]["fallback_provider"] == ""
+
+    def test_identical_fallback_provider_is_ignored(self, sample_wav):
+        config = {
+            "provider": "elevenlabs",
+            "fallback_provider": "elevenlabs",
+            "elevenlabs": {"model_id": "scribe_v2"},
+        }
+        with patch("tools.transcription_tools._load_stt_config", return_value=config), \
+             patch("tools.transcription_tools._get_provider", return_value="elevenlabs"), \
+             patch("tools.transcription_tools._trim_silence_for_cloud_stt", return_value=None), \
+             patch(
+                 "tools.transcription_tools._transcribe_elevenlabs",
+                 return_value={
+                     "success": False,
+                     "transcript": "",
+                     "provider": "elevenlabs",
+                     "error": "primary failed",
+                 },
+             ) as mock_elevenlabs:
+            from tools.transcription_tools import transcribe_audio
+
+            result = transcribe_audio(sample_wav)
+
+        assert result["success"] is False
+        assert result["error"] == "primary failed"
+        mock_elevenlabs.assert_called_once()
+
+    def test_fallback_failure_does_not_loop(self, sample_wav):
+        config = self._fallback_config()
+        with patch("tools.transcription_tools._load_stt_config", return_value=config), \
+             patch("tools.transcription_tools._get_provider", return_value="elevenlabs"), \
+             patch("tools.transcription_tools._trim_silence_for_cloud_stt", return_value=None), \
+             patch(
+                 "tools.transcription_tools._transcribe_elevenlabs",
+                 return_value={
+                     "success": False,
+                     "transcript": "",
+                     "provider": "elevenlabs",
+                     "error": "primary failed",
+                 },
+             ) as mock_elevenlabs, \
+             patch(
+                 "tools.transcription_tools._transcribe_openai",
+                 return_value={
+                     "success": False,
+                     "transcript": "",
+                     "provider": "openai",
+                     "error": "fallback failed",
+                 },
+             ) as mock_openai:
+            from tools.transcription_tools import transcribe_audio
+
+            result = transcribe_audio(sample_wav)
+
+        assert result["success"] is False
+        assert "primary failed" in result["error"]
+        assert "fallback failed" in result["error"]
+        mock_elevenlabs.assert_called_once()
+        mock_openai.assert_called_once()
+
 # ============================================================================
 # _transcribe_mistral
 # ============================================================================

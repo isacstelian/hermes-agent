@@ -1208,6 +1208,34 @@ def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
     if stored_platform and current_platform and stored_platform != current_platform:
         return False
 
+    # A gateway restart creates a fresh AIAgent but restores the persisted
+    # prompt for the existing conversation. If SOUL.md or a skill changed since
+    # that prompt was stored, reusing it would keep stale instructions
+    # indefinitely even though the process loaded the new files. Compare the
+    # current inputs and rebuild only when they drifted; unchanged sessions keep
+    # byte-for-byte prefix-cache reuse.
+    try:
+        from agent.system_prompt import (
+            build_current_skills_prompt,
+            stored_prompt_has_current_soul,
+        )
+
+        has_current_soul = stored_prompt_has_current_soul(agent, prompt)
+        current_skills_prompt = build_current_skills_prompt(agent)
+    except Exception as exc:
+        logger.warning(
+            "Could not verify current prompt inputs for session %s: %s. "
+            "Keeping the stored system prompt.",
+            getattr(agent, "session_id", "") or "unknown",
+            exc,
+        )
+        has_current_soul = True
+        current_skills_prompt = ""
+    if not has_current_soul:
+        return False
+    if current_skills_prompt and current_skills_prompt not in prompt:
+        return False
+
     return True
 
 

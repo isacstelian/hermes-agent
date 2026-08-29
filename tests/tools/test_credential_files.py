@@ -7,6 +7,7 @@ from unittest.mock import patch
 import pytest
 
 from tools.credential_files import (
+    _safe_skills_path,
     clear_credential_files,
     get_credential_file_mounts,
     get_cache_directory_mounts,
@@ -123,6 +124,21 @@ class TestSkillsDirectoryMount:
             mounts = get_skills_directory_mount()
 
         assert mounts[0]["host_path"] == str(skills_dir)
+
+    def test_multiple_sanitized_roots_remain_available(self, tmp_path):
+        roots = []
+        for name in ("first", "second"):
+            root = tmp_path / name
+            root.mkdir()
+            (root / "SKILL.md").write_text(f"# {name}")
+            (root / "link").symlink_to(tmp_path / "outside")
+            roots.append(root)
+
+        safe_first = Path(_safe_skills_path(roots[0]))
+        safe_second = Path(_safe_skills_path(roots[1]))
+
+        assert (safe_first / "SKILL.md").read_text() == "# first"
+        assert (safe_second / "SKILL.md").read_text() == "# second"
 
 
 class TestIterSkillsFiles:

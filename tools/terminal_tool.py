@@ -1145,6 +1145,9 @@ PTY: pty=true + background=true for interactive CLIs (they hang without a termin
 _active_environments: Dict[str, Any] = {}
 _last_activity: Dict[str, float] = {}
 _env_lock = threading.Lock()
+_environment_generations: Dict[str, int] = {}
+_environment_leases: Dict[str, int] = {}
+_pending_environment_cleanup: Dict[str, bool] = {}
 _creation_locks: Dict[str, threading.Lock] = {}  # Per-task locks for sandbox creation
 _creation_locks_lock = threading.Lock()  # Protects _creation_locks dict itself
 _cleanup_thread = None
@@ -1155,6 +1158,66 @@ _cleanup_running = False
 # calls for parallel subagents won't re-trigger the sweep.
 _docker_orphan_reaper_ran = False
 _docker_orphan_reaper_lock = threading.Lock()
+
+
+class EnvironmentLease:
+    """Keep a task environment alive while artifacts are being staged."""
+
+    def __init__(self, task_id: str, requested_task_id: Optional[str] = None):
+        self.task_id = task_id
+        self.requested_task_id = requested_task_id or task_id
+        self._released = False
+
+    @property
+    def generation(self) -> int:
+        return get_environment_generation(self.task_id)
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        cleanup_requested = False
+        force_remove = False
+        with _env_lock:
+            remaining = max(0, _environment_leases.get(self.task_id, 0) - 1)
+            if remaining:
+                _environment_leases[self.task_id] = remaining
+            else:
+                _environment_leases.pop(self.task_id, None)
+                if self.task_id in _pending_environment_cleanup:
+                    cleanup_requested = True
+                    force_remove = _pending_environment_cleanup.pop(self.task_id)
+        if cleanup_requested:
+            cleanup_vm(self.task_id, force_remove=force_remove)
+
+
+def acquire_environment_lease(task_id: str) -> EnvironmentLease:
+    """Acquire a lease before lazy creation so cleanup cannot race delivery."""
+    lookup = _resolve_container_task_id(task_id)
+    with _env_lock:
+        _environment_leases[lookup] = _environment_leases.get(lookup, 0) + 1
+    return EnvironmentLease(lookup, requested_task_id=task_id)
+
+
+def _register_active_environment_locked(task_id: str, env: Any) -> int:
+    generation = _environment_generations.get(task_id, 0) + 1
+    _environment_generations[task_id] = generation
+    _active_environments[task_id] = env
+    _last_activity[task_id] = time.time()
+    return generation
+
+
+def register_active_environment(task_id: str, env: Any) -> int:
+    """Register *env* and return its monotonically increasing generation."""
+    lookup = _resolve_container_task_id(task_id)
+    with _env_lock:
+        return _register_active_environment_locked(lookup, env)
+
+
+def get_environment_generation(task_id: str) -> int:
+    lookup = _resolve_container_task_id(task_id)
+    with _env_lock:
+        return _environment_generations.get(lookup, 0)
 
 
 def _maybe_reap_docker_orphans(container_config: Dict[str, Any]) -> None:
@@ -2183,6 +2246,9 @@ def _cleanup_inactive_envs(lifetime_seconds: int = 300):
     with _env_lock:
         for task_id, last_time in list(_last_activity.items()):
             if current_time - last_time > lifetime_seconds:
+                if _environment_leases.get(task_id, 0) > 0:
+                    _pending_environment_cleanup.setdefault(task_id, False)
+                    continue
                 env = _active_environments.pop(task_id, None)
                 _last_activity.pop(task_id, None)
                 if env is not None:
@@ -2341,8 +2407,7 @@ def ensure_task_env(task_id: Optional[str] = None):
             return None
 
         with _env_lock:
-            _active_environments[effective_task_id] = new_env
-            _last_activity[effective_task_id] = time.time()
+            _register_active_environment_locked(effective_task_id, new_env)
         logger.info(
             "%s environment lazily initialized for task %s",
             env_type, effective_task_id[:8],
@@ -2427,10 +2492,17 @@ def cleanup_vm(task_id: str, *, force_remove: bool = False):
     # Remove from tracking dicts while holding the lock, but defer the
     # actual (potentially slow) env.cleanup() call to outside the lock
     # so other tool calls aren't blocked.
+    task_id = _resolve_container_task_id(task_id)
     env = None
     with _env_lock:
+        if _environment_leases.get(task_id, 0) > 0:
+            _pending_environment_cleanup[task_id] = bool(
+                force_remove or _pending_environment_cleanup.get(task_id, False)
+            )
+            return
         env = _active_environments.pop(task_id, None)
         _last_activity.pop(task_id, None)
+        _pending_environment_cleanup.pop(task_id, None)
 
     # Clean up per-task creation lock
     with _creation_locks_lock:
@@ -3052,8 +3124,7 @@ def terminal_tool(
                         }, ensure_ascii=False)
 
                     with _env_lock:
-                        _active_environments[effective_task_id] = new_env
-                        _last_activity[effective_task_id] = time.time()
+                        _register_active_environment_locked(effective_task_id, new_env)
                         env = new_env
                     logger.info("%s environment ready for task %s", env_type, effective_task_id[:8])
 
@@ -3925,16 +3996,9 @@ def _evict_environment_for_task(task_id: Optional[str]) -> None:
     keys = {_resolve_container_task_id(task_id)}
     if task_id:
         keys.add(task_id)
-    evicted = []
-    with _env_lock:
-        for key in keys:
-            env = _active_environments.pop(key, None)
-            _last_activity.pop(key, None)
-            if env is not None:
-                evicted.append(env)
-    for env in evicted:
+    for key in keys:
         try:
-            env.cleanup()
+            cleanup_vm(key, force_remove=True)
         except Exception:
             logger.debug("cleanup of degraded environment failed", exc_info=True)
 

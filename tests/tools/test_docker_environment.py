@@ -1,7 +1,11 @@
+import hashlib
 import logging
 import os
-from io import StringIO
+import shlex
+from io import BytesIO, StringIO
+from pathlib import Path
 import subprocess
+import tarfile
 
 import pytest
 
@@ -594,6 +598,39 @@ def test_label_sanitizer_rejects_invalid_characters():
     assert len(docker_env._sanitize_label_value(long_value)) == 63
 
 
+def test_identity_labels_do_not_collapse_sanitized_task_or_profile_names(
+    monkeypatch,
+):
+    assert docker_env._sanitize_label_value("session/tenant") == "session_tenant"
+    assert docker_env._sanitize_label_value("session_tenant") == "session_tenant"
+    assert (
+        docker_env._identity_label_value("session/tenant")
+        != docker_env._identity_label_value("session_tenant")
+    )
+
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+    monkeypatch.setattr(
+        docker_env, "_get_active_profile_name", lambda: "board/profile"
+    )
+    env = _make_dummy_env(task_id="session/tenant", persist_across_processes=False)
+    calls.clear()
+
+    env._remove_stale_config_containers(
+        env._labels["hermes-task-id"],
+        env._labels["hermes-profile"],
+        env._labels[docker_env._EGRESS_LABEL_KEY],
+        env._labels[docker_env._MOUNTS_LABEL_KEY],
+    )
+
+    ps_cmd = next(cmd for cmd, _ in calls if cmd[1:3] == ["ps", "-a"])
+    assert "label=hermes-task-id=session_tenant" in ps_cmd
+    assert "label=hermes-profile=board_profile" in ps_cmd
+    rendered = " ".join(ps_cmd)
+    assert docker_env._TASK_KEY_LABEL_KEY in rendered
+    assert docker_env._PROFILE_KEY_LABEL_KEY in rendered
+
+
 def test_run_command_sanitizes_unsafe_task_id(monkeypatch):
     """A task_id containing characters Docker rejects in label values must be
     sanitized before reaching ``docker run --label``; otherwise the daemon
@@ -732,14 +769,304 @@ def test_labels_attribute_populated_after_init(monkeypatch):
         "hermes-agent": "1",
         "hermes-task-id": "abc",
         "hermes-profile": "default",
+        "hermes-task-key": docker_env._identity_label_value("abc"),
+        "hermes-profile-key": docker_env._identity_label_value("default"),
         "hermes-egress": "off",
+        "hermes-mounts": env._labels["hermes-mounts"],
     }
+    assert len(env._labels["hermes-mounts"]) == 16
+
+
+def test_remote_daemon_omits_local_auto_mounts(monkeypatch, tmp_path):
+    credential = tmp_path / "auth.json"
+    credential.write_text("{}")
+    skills = tmp_path / "skills"
+    skills.mkdir()
+    cache = tmp_path / "documents"
+    cache.mkdir()
+
+    monkeypatch.setenv("DOCKER_HOST", "ssh://sandbox-vps")
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    staged = []
+    monkeypatch.setattr(
+        docker_env.DockerEnvironment,
+        "_stage_remote_auto_inputs",
+        lambda self: staged.append(self.container_generation),
+    )
+    monkeypatch.setattr(
+        "tools.credential_files.get_credential_file_mounts",
+        lambda: [{"host_path": str(credential), "container_path": "/root/.hermes/auth.json"}],
+    )
+    monkeypatch.setattr(
+        "tools.credential_files.get_skills_directory_mount",
+        lambda: [{"host_path": str(skills), "container_path": "/root/.hermes/skills"}],
+    )
+    monkeypatch.setattr(
+        "tools.credential_files.get_cache_directory_mounts",
+        lambda: [{"host_path": str(cache), "container_path": "/root/.hermes/cache/documents"}],
+    )
+    calls = _mock_subprocess_run(monkeypatch)
+
+    env = _make_dummy_env(volumes=["board-output:/output"])
+
+    run_cmd = next(cmd for cmd, _ in calls if cmd[1:2] == ["run"])
+    rendered = " ".join(run_cmd)
+    assert env.remote_endpoint is True
+    assert str(credential) not in rendered
+    assert str(skills) not in rendered
+    assert str(cache) not in rendered
+    assert "board-output:/output" in rendered
+    assert staged == [1]
+
+
+def test_remote_persistent_sandbox_uses_daemon_named_volumes(monkeypatch):
+    monkeypatch.setenv("DOCKER_HOST", "ssh://sandbox-vps")
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(
+        docker_env.DockerEnvironment, "_stage_remote_auto_inputs", lambda self: None
+    )
+    calls = _mock_subprocess_run(monkeypatch)
+
+    _make_dummy_env(persistent_filesystem=True, task_id="board-session")
+
+    run_cmd = next(cmd for cmd, _ in calls if cmd[1:2] == ["run"])
+    rendered = " ".join(run_cmd)
+    assert "type=volume,source=hermes-home-" in rendered
+    assert "type=volume,source=hermes-workspace-" in rendered
+    assert ".hermes/sandboxes" not in rendered
+
+
+def test_remote_named_volumes_are_profile_scoped(monkeypatch):
+    monkeypatch.setenv("DOCKER_HOST", "ssh://sandbox-vps")
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(
+        docker_env.DockerEnvironment, "_stage_remote_auto_inputs", lambda self: None
+    )
+    profile = ["profile-a"]
+    monkeypatch.setattr(docker_env, "_get_active_profile_name", lambda: profile[0])
+    calls = _mock_subprocess_run(monkeypatch)
+
+    _make_dummy_env(persistent_filesystem=True, task_id="default")
+    profile[0] = "profile-b"
+    _make_dummy_env(persistent_filesystem=True, task_id="default")
+
+    runs = [cmd for cmd, _ in calls if cmd[1:2] == ["run"]]
+    first_mounts = {runs[0][i + 1] for i, token in enumerate(runs[0]) if token == "--mount"}
+    second_mounts = {runs[1][i + 1] for i, token in enumerate(runs[1]) if token == "--mount"}
+    assert first_mounts.isdisjoint(second_mounts)
+
+
+def test_remote_named_volumes_do_not_run_as_host_uid(monkeypatch):
+    monkeypatch.setenv("DOCKER_HOST", "ssh://sandbox-vps")
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(
+        docker_env.DockerEnvironment, "_stage_remote_auto_inputs", lambda self: None
+    )
+    calls = _mock_subprocess_run(monkeypatch)
+
+    _make_dummy_env(persistent_filesystem=True, run_as_host_user=True)
+
+    run_cmd = next(cmd for cmd, _ in calls if cmd[1:2] == ["run"])
+    assert "--user" not in run_cmd
+
+
+def test_remote_daemon_rejects_user_host_bind(monkeypatch):
+    monkeypatch.setenv("DOCKER_HOST", "ssh://sandbox-vps")
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    _mock_subprocess_run(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="daemon is remote"):
+        _make_dummy_env(volumes=["/tmp/reports:/reports"])
+
+
+def test_remote_daemon_rejects_extra_arg_bind(monkeypatch):
+    monkeypatch.setenv("DOCKER_HOST", "ssh://sandbox-vps")
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    _mock_subprocess_run(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="daemon is remote"):
+        _make_dummy_env(extra_args=[
+            "--mount", "type=bind,source=/tmp/reports,target=/reports",
+        ])
+
+
+def test_remote_auto_inputs_use_verified_artifact_bridge(monkeypatch, tmp_path):
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    process_home = tmp_path / "process-profile"
+    profile_home = tmp_path / "scoped-profile"
+    monkeypatch.setenv("HERMES_HOME", str(process_home))
+    credential = tmp_path / "token.json"
+    credential.write_bytes(b'{"token":"scoped"}')
+    skill = tmp_path / "skills" / "report" / "SKILL.md"
+    skill.parent.mkdir(parents=True)
+    skill.write_text("# Report")
+    pushed = []
+
+    monkeypatch.setattr(
+        "tools.credential_files.get_credential_file_mounts",
+        lambda: [{
+            "host_path": str(credential),
+            "container_path": "/root/.hermes/token.json",
+        }],
+    )
+    monkeypatch.setattr(
+        "tools.credential_files.get_skills_directory_mount",
+        lambda: [{
+            "host_path": str(skill.parents[1]),
+            "container_path": "/root/.hermes/skills",
+        }],
+    )
+
+    class _Bridge:
+        def __init__(self, env, **kwargs):
+            assert env is remote_env
+            assert kwargs["cache_dir"] == profile_home / "cache" / "artifact-bridge"
+            assert kwargs["host_roots"]
+            assert kwargs["container_roots"]
+
+        def push(self, host_path, container_path):
+            pushed.append((str(host_path), container_path))
+
+        def push_tree(self, host_path, container_path):
+            pushed.append((str(host_path), container_path))
+
+    monkeypatch.setattr("tools.environments.artifact_bridge.ArtifactBridge", _Bridge)
+    remote_env = docker_env.DockerEnvironment.__new__(docker_env.DockerEnvironment)
+    remote_env._remote_endpoint = True
+
+    token = set_hermes_home_override(profile_home)
+    try:
+        remote_env._stage_remote_auto_inputs()
+    finally:
+        reset_hermes_home_override(token)
+
+    assert pushed == [
+        (str(credential), "/root/.hermes/token.json"),
+        (str(skill.parents[1]), "/root/.hermes/skills"),
+    ]
+
+
+def test_remote_auto_inputs_stage_from_read_only_source_directory(monkeypatch, tmp_path):
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    profile_home = tmp_path / "profile"
+    source_dir = tmp_path / "read-only-skill"
+    source_dir.mkdir()
+    skill = source_dir / "SKILL.md"
+    skill.write_text("# Read only")
+
+    monkeypatch.setattr(
+        "tools.credential_files.get_credential_file_mounts", lambda: []
+    )
+    monkeypatch.setattr(
+        "tools.credential_files.get_skills_directory_mount",
+        lambda: [{
+            "host_path": str(source_dir),
+            "container_path": "/root/.hermes/skills/read-only",
+        }],
+    )
+
+    files = {}
+    remote_env = docker_env.DockerEnvironment.__new__(docker_env.DockerEnvironment)
+    remote_env._remote_endpoint = True
+    remote_env._container_generation = 1
+    remote_env.fetch_realpath = lambda path: path
+    remote_env.fetch_file_metadata = lambda path: (
+        (len(files[path]), hashlib.sha256(files[path]).hexdigest())
+        if path in files else None
+    )
+    remote_env.fetch_file_metadata_many = lambda paths: {
+        path: remote_env.fetch_file_metadata(path) for path in paths
+    }
+    remote_env.put_file = lambda source, destination: files.__setitem__(
+        destination, Path(source).read_bytes()
+    )
+
+    def put_archive(source, destination):
+        with tarfile.open(source, "r") as archive:
+            for member in archive.getmembers():
+                if member.isfile():
+                    payload = archive.extractfile(member)
+                    assert payload is not None
+                    files[f"{destination}/{member.name}"] = payload.read()
+
+    remote_env.put_archive = put_archive
+
+    def publish_directory_atomic(source, destination):
+        staged = {
+            destination + path.removeprefix(source): payload
+            for path, payload in list(files.items())
+            if path == source or path.startswith(source + "/")
+        }
+        for path in list(files):
+            if path == source or path.startswith(source + "/"):
+                files.pop(path, None)
+        files.update(staged)
+        return False
+
+    remote_env.publish_directory_atomic = publish_directory_atomic
+
+    def execute(command, **_kwargs):
+        if command.startswith("mkdir -p -- "):
+            return {"returncode": 0, "output": ""}
+        if command.startswith("mkdir -m 700 -- "):
+            return {"returncode": 0, "output": ""}
+        if command.startswith("mv -f -- "):
+            source, destination = command.removeprefix("mv -f -- ").split(" ", 1)
+            files[destination] = files.pop(source)
+            return {"returncode": 0, "output": ""}
+        if command.startswith("rm -f -- "):
+            files.pop(command.removeprefix("rm -f -- "), None)
+            return {"returncode": 0, "output": ""}
+        if command.startswith("rm -rf -- "):
+            for prefix in shlex.split(command)[3:]:
+                for path in list(files):
+                    if path == prefix or path.startswith(prefix + "/"):
+                        files.pop(path, None)
+            return {"returncode": 0, "output": ""}
+        raise AssertionError(f"unexpected command: {command}")
+
+    remote_env.execute = execute
+    token = set_hermes_home_override(profile_home)
+    source_dir.chmod(0o500)
+    try:
+        remote_env._stage_remote_auto_inputs()
+    finally:
+        source_dir.chmod(0o700)
+        reset_hermes_home_override(token)
+
+    assert files["/root/.hermes/skills/read-only/SKILL.md"] == b"# Read only"
+    assert list((profile_home / "cache" / "artifact-bridge").iterdir()) == []
+
+
+def test_reuse_query_requires_mount_fingerprint(monkeypatch):
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+    env = _make_dummy_env(persist_across_processes=False)
+    calls.clear()
+
+    env._find_reusable_container("task", "default", "off", "mount-hash")
+
+    ps_cmd = next(cmd for cmd, _ in calls if cmd[1:3] == ["ps", "-a"])
+    assert "label=hermes-mounts=mount-hash" in ps_cmd
+
+
+def test_mount_config_change_invalidates_reuse_fingerprint(monkeypatch):
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    _mock_subprocess_run(monkeypatch)
+
+    first = _make_dummy_env(volumes=["board-output-v1:/output"])
+    second = _make_dummy_env(volumes=["board-output-v2:/output"])
+
+    assert first._labels["hermes-mounts"] != second._labels["hermes-mounts"]
 
 
 def test_shared_container_key_replaces_profile_identity(monkeypatch):
     """Trusted profiles using the same explicit key share the reuse label."""
     monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
-    monkeypatch.setattr(docker_env, "_get_active_profile_name", lambda: "research")
+    profiles = iter(["research", "finance"])
+    monkeypatch.setattr(docker_env, "_get_active_profile_name", lambda: next(profiles))
     _mock_subprocess_run(monkeypatch)
 
     a = _make_dummy_env(task_id="abc", shared_container_key="team/workspace")
@@ -750,6 +1077,41 @@ def test_shared_container_key_replaces_profile_identity(monkeypatch):
     assert a._labels["hermes-profile"] == b._labels["hermes-profile"]
     assert a._labels["hermes-profile"] != "research"
     assert a._labels["hermes-profile"].startswith("team_workspace-")
+    assert (
+        a._labels[docker_env._PROFILE_KEY_LABEL_KEY]
+        == b._labels[docker_env._PROFILE_KEY_LABEL_KEY]
+    )
+
+
+def test_remote_shared_container_key_reuses_named_volumes_across_profiles(monkeypatch):
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(docker_env, "docker_endpoint_is_remote", lambda _exe: True)
+    monkeypatch.setattr(docker_env.DockerEnvironment, "init_session", lambda _self: None)
+    monkeypatch.setattr(
+        docker_env.DockerEnvironment, "_stage_remote_auto_inputs", lambda _self: None
+    )
+    profiles = iter(["research", "finance"])
+    monkeypatch.setattr(docker_env, "_get_active_profile_name", lambda: next(profiles))
+    calls = _mock_subprocess_run(monkeypatch)
+
+    for _ in range(2):
+        _make_dummy_env(
+            task_id="shared:team/workspace",
+            shared_container_key="team/workspace",
+            persistent_filesystem=True,
+            persist_across_processes=False,
+        )
+
+    run_commands = [cmd for cmd, _kwargs in calls if cmd[1] == "run"]
+
+    def named_mounts(command):
+        return [
+            command[index + 1]
+            for index, value in enumerate(command[:-1])
+            if value == "--mount"
+        ]
+
+    assert named_mounts(run_commands[0]) == named_mounts(run_commands[1])
 
 
 def test_distinct_shared_keys_never_collide(monkeypatch):
@@ -784,6 +1146,135 @@ def test_empty_shared_container_key_preserves_profile_isolation(monkeypatch):
     env = _make_dummy_env(task_id="abc", shared_container_key="")
 
     assert env._labels["hermes-profile"] == "research"
+
+
+def test_stale_immutable_config_container_is_removed(monkeypatch):
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+    env = _make_dummy_env(persist_across_processes=False)
+    calls.clear()
+
+    def _run(cmd, **kwargs):
+        calls.append((list(cmd), kwargs))
+        if cmd[1:3] == ["ps", "-a"]:
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout=(
+                    "old-cid\told-mounts\toff\t"
+                    f"{env._labels[docker_env._TASK_KEY_LABEL_KEY]}\t"
+                    f"{env._labels[docker_env._PROFILE_KEY_LABEL_KEY]}\n"
+                ),
+                stderr="",
+            )
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(docker_env.subprocess, "run", _run)
+
+    env._remove_stale_config_containers("task", "default", "off", "new-mounts")
+
+    assert any(cmd[1:4] == ["rm", "-f", "old-cid"] for cmd, _ in calls)
+
+
+def test_pre_identity_label_container_blocks_unsafe_upgrade(monkeypatch):
+    """An identity-unknown container must not be removed, reused, or raced."""
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+    env = _make_dummy_env(
+        task_id="session/tenant", persist_across_processes=False
+    )
+    calls.clear()
+
+    def _run(cmd, **kwargs):
+        calls.append((list(cmd), kwargs))
+        if cmd[1:3] == ["ps", "-a"]:
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout="legacy-cid\tnew-mounts\toff\t\t\n",
+                stderr="",
+            )
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(docker_env.subprocess, "run", _run)
+
+    with pytest.raises(RuntimeError, match="exact task/profile identity"):
+        env._remove_stale_config_containers(
+            "session_tenant", "default", "off", "new-mounts"
+        )
+
+    ps_cmd = next(cmd for cmd, _ in calls if cmd[1:3] == ["ps", "-a"])
+    assert not any("hermes-task-key=" in part for part in ps_cmd)
+    assert not any("hermes-profile-key=" in part for part in ps_cmd)
+    assert not any(cmd[1:4] == ["rm", "-f", "legacy-cid"] for cmd, _ in calls)
+
+
+def test_stale_cleanup_preserves_exact_identity_collision(monkeypatch):
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+    env = _make_dummy_env(task_id="session/tenant", persist_across_processes=False)
+    calls.clear()
+
+    def _run(cmd, **kwargs):
+        calls.append((list(cmd), kwargs))
+        if cmd[1:3] == ["ps", "-a"]:
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout=(
+                    "foreign-cid\told-mounts\toff\t"
+                    f"{docker_env._identity_label_value('session_tenant')}\t"
+                    f"{env._labels[docker_env._PROFILE_KEY_LABEL_KEY]}\n"
+                ),
+                stderr="",
+            )
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(docker_env.subprocess, "run", _run)
+
+    env._remove_stale_config_containers(
+        "session_tenant", "default", "off", "new-mounts"
+    )
+
+    assert not any(cmd[1:4] == ["rm", "-f", "foreign-cid"] for cmd, _ in calls)
+
+
+def test_bounded_exec_tar_pull_accepts_single_large_file(monkeypatch, tmp_path):
+    payload = b"x" * (9 * 1024 * 1024)
+    archive_bytes = BytesIO()
+    with tarfile.open(fileobj=archive_bytes, mode="w") as archive:
+        member = tarfile.TarInfo("report.docx")
+        member.size = len(payload)
+        archive.addfile(member, BytesIO(payload))
+
+    class TarProcess:
+        def __init__(self):
+            self.stdout = BytesIO(archive_bytes.getvalue())
+            self.returncode = None
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            self.returncode = 0
+            return 0
+
+        def kill(self):
+            self.returncode = -9
+
+    env = docker_env.DockerEnvironment.__new__(docker_env.DockerEnvironment)
+    env._container_id = "container-id"
+    env._docker_exe = "/usr/bin/docker"
+    monkeypatch.setattr(docker_env.subprocess, "Popen", lambda *_a, **_k: TarProcess())
+    destination = tmp_path / "report.docx"
+
+    env._fetch_file_with_tar(
+        "/workspace/report.docx",
+        str(destination),
+        max_bytes=10 * 1024 * 1024,
+    )
+
+    assert destination.read_bytes() == payload
 
 
 # ── Cross-process container reuse (issue #20561) ──────────────────
@@ -851,6 +1342,7 @@ def test_reuse_attaches_to_running_container_without_docker_run(monkeypatch):
     assert env._container_id == "reused-cid", (
         f"expected reused container id, got {env._container_id!r}"
     )
+    assert env.container_generation == 1
     # And it must NOT have run `docker run`.
     run_invocations = [c for c in calls if isinstance(c[0], list) and len(c[0]) >= 2 and c[0][1] == "run"]
     assert not run_invocations, (
@@ -889,7 +1381,8 @@ def test_egress_enabled_does_not_reuse_pre_egress_container(monkeypatch):
             if sub == "ps":
                 # Simulate an old pre-egress container: without the egress label
                 # filter it would match; with the filter Docker returns no match.
-                assert any(str(part).startswith("label=hermes-egress=") for part in cmd)
+                if any(str(part).startswith("label=hermes-mounts=") for part in cmd):
+                    assert any(str(part).startswith("label=hermes-egress=") for part in cmd)
                 return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
             if sub == "run":
                 return subprocess.CompletedProcess(cmd, 0, stdout="fresh-cid\n", stderr="")
@@ -900,6 +1393,7 @@ def test_egress_enabled_does_not_reuse_pre_egress_container(monkeypatch):
     env = _make_dummy_env(task_id="reuse-egress")
 
     assert env._container_id == "fresh-cid"
+    assert env.container_generation == 1
     run_invocations = [
         c for c in calls
         if isinstance(c[0], list) and len(c[0]) >= 2 and c[0][1] == "run"
@@ -1030,6 +1524,9 @@ def test_find_reusable_handles_empty_label_string(monkeypatch):
     container.  Regression test for the egilewski review on #48073."""
     monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
     monkeypatch.setattr(docker_env, "_get_active_profile_name", lambda: "default")
+    monkeypatch.setattr(
+        docker_env.DockerEnvironment, "_stage_remote_auto_inputs", lambda self: None
+    )
 
     def _run(cmd, **kwargs):
         if isinstance(cmd, list) and len(cmd) >= 2:
@@ -1569,6 +2066,24 @@ def test_execute_does_not_recover_when_not_persistent(monkeypatch):
 
     result = env.execute("echo hi")
     assert result.get("returncode") == 1, "the original error must pass through unchanged"
+
+
+def test_recreate_container_increments_generation(monkeypatch):
+    env = docker_env.DockerEnvironment.__new__(docker_env.DockerEnvironment)
+    env._container_id = "gone-cid"
+    env._container_generation = 1
+    env._labels = {
+        "hermes-task-id": "task",
+        "hermes-profile": "default",
+        docker_env._EGRESS_LABEL_KEY: "off",
+    }
+    env._find_reusable_container = lambda *_args: ("replacement-cid", "running")
+    env._snapshot_ready = True
+    env.init_session = lambda: None
+
+    assert env._recreate_container() is True
+    assert env._container_id == "replacement-cid"
+    assert env.container_generation == 2
 
 
 def test_execute_does_not_recover_on_ordinary_failure(monkeypatch):

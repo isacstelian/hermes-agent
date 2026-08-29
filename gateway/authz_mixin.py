@@ -256,6 +256,48 @@ class GatewayAuthorizationMixin:
             getattr(source, "profile", None),
         )
 
+    def _telegram_bot_origin_allowed(self, event) -> bool:
+        """Apply Telegram's bot-origin guard before hooks or session state."""
+        from gateway.run import logger
+
+        source = getattr(event, "source", None)
+        if getattr(source, "platform", None) != Platform.TELEGRAM:
+            return True
+
+        adapter = self._adapter_for_source(source)
+        guard = getattr(adapter, "_bot_loop_guard", None) if adapter is not None else None
+        if guard is None:
+            if getattr(source, "is_bot", False):
+                logger.warning(
+                    "Telegram bot guard decision=drop reason=state_error count=1"
+                )
+                return False
+            return True
+
+        bot = getattr(adapter, "_bot", None)
+        receiver_bot_id = str(getattr(bot, "id", "") or "")
+        username_fn = getattr(adapter, "_current_bot_username", None)
+        receiver_username = (
+            str(username_fn() or "")
+            if callable(username_fn)
+            else str(getattr(bot, "username", "") or "")
+        )
+        try:
+            return bool(
+                guard.evaluate(
+                    event,
+                    receiver_bot_id=receiver_bot_id,
+                    receiver_username=receiver_username,
+                ).allowed
+            )
+        except Exception:
+            if getattr(source, "is_bot", False):
+                logger.warning(
+                    "Telegram bot guard decision=drop reason=state_error count=1"
+                )
+                return False
+            return True
+
     def _registered_transport_adapter(self, source: SessionSource):
         """Return the registered adapter that created *source*, if retained.
 
@@ -560,12 +602,58 @@ class GatewayAuthorizationMixin:
         # documented behavior matches reality
         # (website/docs/reference/environment-variables.md,
         # website/docs/user-guide/messaging/telegram.md).
+        telegram_trusted_adder_mode = False
         if source.chat_type in {"group", "forum", "channel"} and source.chat_id:
+            adapter = None
+            try:
+                adapter = self._adapter_for_source(source)
+            except Exception:
+                pass
+            if source.platform == Platform.TELEGRAM and adapter is not None:
+                adapter_extra = (
+                    getattr(getattr(adapter, "config", None), "extra", None) or {}
+                )
+                telegram_trusted_adder_mode = (
+                    adapter_extra.get("auto_allow_groups_from_trusted_adders") is True
+                )
+                trusted_adder_mode = getattr(
+                    adapter,
+                    "_telegram_auto_allow_groups_from_trusted_adders",
+                    None,
+                )
+                if callable(trusted_adder_mode):
+                    try:
+                        telegram_trusted_adder_mode = trusted_adder_mode() is True
+                    except Exception:
+                        # A configured strict profile must not fall back to a
+                        # process-global allowlist because its helper failed.
+                        pass
+
+                if telegram_trusted_adder_mode:
+                    effective_admission = getattr(
+                        adapter,
+                        "_telegram_group_admission_chats",
+                        None,
+                    )
+                    try:
+                        admitted_chats = (
+                            effective_admission()
+                            if callable(effective_admission)
+                            else set()
+                        )
+                    except Exception:
+                        admitted_chats = set()
+                    if source.chat_id not in admitted_chats:
+                        return False
+
             chat_allowlist_env = {
                 Platform.TELEGRAM: "TELEGRAM_GROUP_ALLOWED_CHATS",
                 Platform.QQBOT: "QQ_GROUP_ALLOWED_USERS",
             }.get(source.platform, "")
-            if chat_allowlist_env:
+            # Strict trusted-adder profiles must use their adapter-local effective
+            # allowlist. A process-global legacy env value may belong to another
+            # profile in the same multiplex gateway.
+            if chat_allowlist_env and not telegram_trusted_adder_mode:
                 raw_chat_allowlist = _platform_gate_env(chat_allowlist_env)
                 if raw_chat_allowlist:
                     allowed_group_ids = {
@@ -583,12 +671,27 @@ class GatewayAuthorizationMixin:
             # so the env-var-only check above misses config.yaml-configured
             # allowlists.  Read the live adapter's config.extra as a fallback.
             try:
-                adapter = self._adapter_for_source(source)
+                if adapter is None:
+                    adapter = self._adapter_for_source(source)
                 if adapter is not None:
                     extra = getattr(getattr(adapter, "config", None), "extra", None) or {}
-                    adapter_group_allowed = extra.get("group_allowed_chats")
+                    adapter_group_allowed = None
+                    if source.platform == Platform.TELEGRAM:
+                        effective_group_allowed = getattr(
+                            adapter,
+                            "_telegram_group_allowed_chats",
+                            None,
+                        )
+                        if callable(effective_group_allowed):
+                            adapter_group_allowed = effective_group_allowed()
+                    if adapter_group_allowed is None:
+                        adapter_group_allowed = extra.get("group_allowed_chats")
                     if adapter_group_allowed:
-                        allowed = _coerce_allow_set(adapter_group_allowed)
+                        allowed = (
+                            adapter_group_allowed
+                            if isinstance(adapter_group_allowed, set)
+                            else _coerce_allow_set(adapter_group_allowed)
+                        )
                         if "*" in allowed or source.chat_id in allowed:
                             return True
             except Exception:
@@ -607,8 +710,21 @@ class GatewayAuthorizationMixin:
             Platform.SLACK: "SLACK_ALLOW_BOTS",
         }
         if getattr(source, "is_bot", False):
+            if source.platform == Platform.TELEGRAM:
+                try:
+                    adapter = self._adapter_for_source(source)
+                    live_guard = getattr(adapter, "_bot_loop_guard", None)
+                    if live_guard is not None:
+                        return getattr(live_guard, "policy", "none") in {
+                            "mentions",
+                            "all",
+                        }
+                except Exception:
+                    return False
             allow_bots_var = platform_allow_bots_map.get(source.platform)
-            if allow_bots_var and _platform_gate_env(allow_bots_var, "none").lower().strip() in {"mentions", "all"}:
+            if allow_bots_var and _platform_gate_env(
+                allow_bots_var, "none"
+            ).lower().strip() in {"mentions", "all"}:
                 return True
 
         if not user_id:
@@ -717,7 +833,10 @@ class GatewayAuthorizationMixin:
         group_chat_allowlist = ""
         if source.chat_type in {"group", "forum"}:
             group_user_allowlist = _auth_env(platform_group_user_env_map.get(source.platform, ""))
-            group_chat_allowlist = _auth_env(platform_group_chat_env_map.get(source.platform, ""))
+            if not telegram_trusted_adder_mode:
+                group_chat_allowlist = _auth_env(
+                    platform_group_chat_env_map.get(source.platform, "")
+                )
         global_allowlist = _auth_env("GATEWAY_ALLOWED_USERS")
 
         if not platform_allowlist and not group_user_allowlist and not group_chat_allowlist and not global_allowlist:
@@ -840,6 +959,7 @@ class GatewayAuthorizationMixin:
         # TELEGRAM_GROUP_ALLOWED_CHATS.
         if (
             source.platform == Platform.TELEGRAM
+            and not telegram_trusted_adder_mode
             and group_user_allowlist
             and source.chat_type in {"group", "forum"}
             and source.chat_id

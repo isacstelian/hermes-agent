@@ -100,6 +100,7 @@ _fake_telegram_ext.Application = object
 _fake_telegram_ext.CommandHandler = object
 _fake_telegram_ext.CallbackQueryHandler = object
 _fake_telegram_ext.InlineQueryHandler = object
+_fake_telegram_ext.ChatMemberHandler = object
 _fake_telegram_ext.MessageHandler = object
 _fake_telegram_ext.TypeHandler = object
 _fake_telegram_ext.ContextTypes = SimpleNamespace(DEFAULT_TYPE=object)
@@ -723,5 +724,4 @@ async def test_thread_fallback_only_fires_once():
     # Second chunk: should use thread_id=None directly (effective_thread_id
     # was cleared per-chunk but the metadata doesn't change between chunks)
     # The key point: the message was delivered despite the invalid thread
-
 

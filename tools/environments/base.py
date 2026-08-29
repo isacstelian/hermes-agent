@@ -6,6 +6,8 @@ re-sourced before each command. CWD persists via in-band stdout markers (remote)
 or a temp file (local).
 """
 
+import base64
+import binascii
 import codecs
 import json
 import logging
@@ -604,6 +606,20 @@ def _export_dump_excluding_session_vars(
 
 
 # ---------------------------------------------------------------------------
+# File extraction (backend -> host)
+# ---------------------------------------------------------------------------
+
+
+class FileFetchError(RuntimeError):
+    """A file could not be extracted from the backend filesystem."""
+
+
+# Extraction of a large file over a slow exec channel (base64 on Modal /
+# Singularity) can legitimately outlast the per-command terminal timeout.
+_FETCH_TIMEOUT_SECONDS = 300
+
+
+# ---------------------------------------------------------------------------
 # BaseEnvironment
 # ---------------------------------------------------------------------------
 
@@ -633,6 +649,11 @@ class BaseEnvironment(ABC):
     # through the active profile scope. Other backends keep their existing
     # snapshot semantics until they implement the same resolver contract.
     _profile_scoped_passthrough: bool = False
+
+    # Base64 is a compatibility transport for backends without a native byte
+    # stream. Keep its memory amplification bounded; Docker overrides this
+    # with archive/tar streaming for normal transfers.
+    _base64_transfer_limit_bytes = 8 * 1024 * 1024
 
     def get_temp_dir(self) -> str:
         """Return the backend temp directory used for session artifacts.
@@ -1427,6 +1448,189 @@ class BaseEnvironment(ABC):
     # ------------------------------------------------------------------
     # Hooks
     # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # File extraction (backend -> host)
+    # ------------------------------------------------------------------
+
+    @property
+    def remote_home(self) -> str | None:
+        """Home directory on the machine where commands actually run, if known.
+
+        Used by delivery-path security checks to resolve ``~``-relative
+        credential locations (``~/.ssh``, ``~/.hermes/.env``) against the
+        backend filesystem. ``None`` means unknown, and callers must fall
+        back to conservative matching.
+        """
+        return getattr(self, "_remote_home", None)
+
+    def fetch_file_size(self, remote_path: str) -> int | None:
+        """Return the byte size of *remote_path* in the backend, or ``None``
+        when the path does not exist or is not a regular file.
+
+        Default transport: ``wc -c`` over the exec channel.
+        """
+        quoted = shlex.quote(remote_path)
+        result = self.execute(
+            f"[ -f {quoted} ] && wc -c < {quoted}",
+            rewrite_compound_background=False,
+        )
+        if int(result.get("returncode") or 0) != 0:
+            return None
+        # Take the last all-digit token so stray login-shell noise in the
+        # merged stdout/stderr stream can't corrupt the parse.
+        for token in reversed((result.get("output") or "").split()):
+            if token.isdigit():
+                return int(token)
+        return None
+
+    def fetch_file_metadata(self, remote_path: str) -> tuple[int, str] | None:
+        """Return ``(size, sha256)`` for one regular backend file.
+
+        Size and digest are produced by one shell probe so callers can detect
+        a file changing across a transfer by probing before and after it.
+        """
+        quoted = shlex.quote(remote_path)
+        result = self.execute(
+            f"test -f {quoted} && size=$(wc -c < {quoted}) && "
+            "if command -v sha256sum >/dev/null 2>&1; then "
+            f"digest=$(sha256sum {quoted} 2>/dev/null | awk '{{print $1}}'); "
+            "elif command -v shasum >/dev/null 2>&1; then "
+            f"digest=$(shasum -a 256 {quoted} 2>/dev/null | awk '{{print $1}}'); "
+            "elif command -v openssl >/dev/null 2>&1; then "
+            f"digest=$(openssl dgst -sha256 {quoted} 2>/dev/null | awk '{{print $NF}}'); "
+            "else exit 127; fi && "
+            "printf '%s %s\\n' \"$size\" \"$digest\"",
+            rewrite_compound_background=False,
+        )
+        if int(result.get("returncode") or 0) != 0:
+            return None
+        pattern = re.compile(r"^([0-9]+) ([0-9a-fA-F]{64})$")
+        for line in reversed((result.get("output") or "").splitlines()):
+            match = pattern.fullmatch(line.strip())
+            if match:
+                return int(match.group(1)), match.group(2).lower()
+        return None
+
+    def fetch_file_metadata_many(
+        self, remote_paths: Iterable[str]
+    ) -> dict[str, tuple[int, str] | None]:
+        """Return verified metadata for several backend files.
+
+        Backends with a high-latency control plane should override this with
+        one remote probe. The default preserves compatibility.
+        """
+        return {path: self.fetch_file_metadata(path) for path in remote_paths}
+
+    def fetch_realpath(self, remote_path: str) -> str | None:
+        """Resolve symlinks of *remote_path* inside the backend, best-effort.
+
+        Returns the resolved absolute path, or ``None`` when the backend
+        cannot resolve it (missing ``readlink``/``realpath``, dead path).
+        Callers re-run the denylist check on the target so a link planted at
+        an innocuous path can't smuggle out a credential.
+        """
+        quoted = shlex.quote(remote_path)
+        result = self.execute(
+            f"readlink -f {quoted} 2>/dev/null || realpath {quoted} 2>/dev/null",
+            rewrite_compound_background=False,
+        )
+        if int(result.get("returncode") or 0) != 0:
+            return None
+        for line in reversed((result.get("output") or "").splitlines()):
+            line = line.strip()
+            if line.startswith("/"):
+                return line
+        return None
+
+    def fetch_file(
+        self,
+        remote_path: str,
+        local_dest: str,
+        max_bytes: int | None = None,
+    ) -> None:
+        """Copy *remote_path* out of the backend to *local_dest* on the host.
+
+        Raises :class:`FileFetchError` on any failure. Default transport is
+        base64 over the exec channel, which works on any backend that can run
+        a shell; backends with a cheaper native transport override it (Docker
+        reads its bind-mount view or falls back to ``docker cp``).
+
+        The payload is fenced between unique markers so login-shell noise in
+        the merged stdout/stderr stream can never corrupt the decode.
+        """
+        marker = f"__HERMES_FETCH_{uuid.uuid4().hex[:12]}__"
+        quoted = shlex.quote(remote_path)
+        if max_bytes is not None:
+            if max_bytes < 0:
+                raise FileFetchError("transfer limit must be non-negative")
+            block_size = 64 * 1024
+            block_count = ((max_bytes + 1) + block_size - 1) // block_size
+            payload_command = (
+                f"dd if={quoted} bs={block_size} count={block_count} 2>/dev/null | base64"
+            )
+        else:
+            payload_command = f"base64 < {quoted} 2>/dev/null"
+        result = self.execute(
+            f"[ -f {quoted} ] && echo {marker} && "
+            f"{payload_command} && echo {marker}",
+            timeout=_FETCH_TIMEOUT_SECONDS,
+            rewrite_compound_background=False,
+        )
+        if int(result.get("returncode") or 0) != 0:
+            raise FileFetchError(
+                f"could not read {remote_path!r} in the backend "
+                f"(missing, not a regular file, or unreadable)"
+            )
+        output = result.get("output") or ""
+        first = output.find(marker)
+        last = output.rfind(marker)
+        if first == -1 or last <= first:
+            raise FileFetchError(f"transfer of {remote_path!r} produced no payload")
+        payload = "".join(output[first + len(marker):last].split())
+        try:
+            data = base64.b64decode(payload, validate=True)
+        except (ValueError, binascii.Error) as exc:
+            raise FileFetchError(
+                f"transfer of {remote_path!r} was corrupted in transit: {exc}"
+            ) from exc
+        if max_bytes is not None and len(data) > max_bytes:
+            raise FileFetchError(
+                f"{remote_path!r} exceeds the {max_bytes}-byte transfer limit"
+            )
+        Path(local_dest).write_bytes(data)
+
+    def put_file(self, local_source: str, remote_dest: str) -> None:
+        """Copy one host file into the backend via a capped base64 fallback.
+
+        Streaming backends should override this method. The cap is deliberate:
+        base64 expands the payload and ``execute`` carries it as an in-memory
+        string, so it is only a last-resort compatibility path.
+        """
+        source = Path(local_source)
+        try:
+            size = source.stat().st_size
+        except OSError as exc:
+            raise FileFetchError(f"could not read host file {local_source!r}") from exc
+        if not source.is_file():
+            raise FileFetchError(f"{local_source!r} is not a regular file")
+        if size > self._base64_transfer_limit_bytes:
+            raise FileFetchError(
+                f"{local_source!r} exceeds the base64 fallback limit "
+                f"of {self._base64_transfer_limit_bytes} bytes"
+            )
+
+        encoded = base64.b64encode(source.read_bytes()).decode("ascii")
+        result = self.execute(
+            f"base64 -d > {shlex.quote(remote_dest)}",
+            stdin_data=encoded,
+            timeout=_FETCH_TIMEOUT_SECONDS,
+            rewrite_compound_background=False,
+        )
+        if int(result.get("returncode") or 0) != 0:
+            raise FileFetchError(
+                f"could not write {remote_dest!r} in the backend"
+            )
 
     def _before_execute(self) -> None:
         """Hook called before each command execution.

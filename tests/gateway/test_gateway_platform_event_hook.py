@@ -672,14 +672,15 @@ class TestRegisterHandlers:
         app = MagicMock()
         a._register_handlers(app)
 
-        # Six core handlers (default group, no group kwarg — incl. the
-        # inline command picker) plus the gateway_platform_event observer
-        # alone in group 99, so it observes alongside rather than
-        # displacing the core handlers.
+        # Core handlers land in the default group (no group kwarg) and the
+        # gateway_platform_event observer is alone in group 99, so it observes
+        # alongside rather than displacing the core handlers. The core count is
+        # derived, not hardcoded: the trusted-group-adder patch registers extra
+        # core handlers, and this test guards the observer's isolation, not how
+        # many core handlers happen to exist.
         calls = app.add_handler.call_args_list
-        assert len(calls) == 7
         assert len([c for c in calls if c.kwargs.get("group") == 99]) == 1
-        assert len([c for c in calls if not c.kwargs]) == 6
+        assert len([c for c in calls if not c.kwargs]) == len(calls) - 1
 
     def test_rebuild_re_registers_observer(self):
         """A second call on a fresh app (e.g. a future rebuild) re-registers
@@ -691,7 +692,7 @@ class TestRegisterHandlers:
         a._register_handlers(first_app)
         a._register_handlers(rebuilt_app)  # the rebuild path
 
-        assert rebuilt_app.add_handler.call_count == 7
+        assert rebuilt_app.add_handler.call_count == first_app.add_handler.call_count
         assert len(self._observer_calls(rebuilt_app)) == 1
 
     def test_transient_init_rebuild_uses_shared_registration(self, monkeypatch):

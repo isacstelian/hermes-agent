@@ -1393,6 +1393,13 @@ def build_environment_hints() -> str:
                 f"them, probe directly with a terminal call like "
                 f"`uname -a && whoami && pwd`."
             )
+        hints.append(
+            f"File delivery from this backend: a MEDIA:/absolute/path "
+            f"directive refers to a file inside the {backend} environment. "
+            f"It is fetched out of the backend automatically before being "
+            f"sent to the user (subject to a size cap), so you can deliver "
+            f"files you created there without copying them anywhere first."
+        )
 
     if is_wsl():
         hints.append(WSL_ENVIRONMENT_HINT)

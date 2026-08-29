@@ -56,6 +56,7 @@ def _adapter():
         send_image_file=AsyncMock(return_value=SendResult(success=True, message_id="image")),
         send_video=AsyncMock(return_value=SendResult(success=True, message_id="video")),
         send_multiple_images=AsyncMock(return_value=SendResult(success=True, message_id="imgs")),
+        send=AsyncMock(return_value=SendResult(success=True, message_id="notice")),
     )
 
 
@@ -110,4 +111,21 @@ async def test_explicit_media_tag_still_delivers_post_stream(tmp_path, monkeypat
     assert images_kwargs["chat_id"] == "C123CHAN"
     assert str(media_file) in images_kwargs["images"][0][0]
 
+
+@pytest.mark.asyncio
+async def test_failed_document_upload_gets_user_visible_notice(tmp_path, monkeypatch):
+    media_file = _allowed_media_path(tmp_path, monkeypatch, "report.pdf")
+    adapter = _adapter()
+    adapter.send_document.return_value = SendResult(success=False, error="upload rejected")
+
+    await GatewayRunner._deliver_media_from_response(
+        _fake_runner({}),
+        f"MEDIA:{media_file}",
+        _event(),
+        adapter,
+    )
+
+    adapter.send.assert_awaited_once()
+    assert "Couldn't deliver" in adapter.send.await_args.kwargs["content"]
+    assert "report.pdf" in adapter.send.await_args.kwargs["content"]
 
