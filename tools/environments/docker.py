@@ -53,8 +53,10 @@ _docker_executable: Optional[str] = None  # resolved once, cached
 _ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _EGRESS_LABEL_KEY = "hermes-egress"
 _MOUNTS_LABEL_KEY = "hermes-mounts"
+_NETWORK_LABEL_KEY = "hermes-network"
 _TASK_KEY_LABEL_KEY = "hermes-task-key"
 _PROFILE_KEY_LABEL_KEY = "hermes-profile-key"
+_REMOTE_CREDENTIAL_MANIFEST = "/root/.hermes/.hermes-managed-credentials.json"
 _podman_cli_cache: dict[str, bool] = {}
 
 
@@ -184,6 +186,21 @@ _sandbox_dir_name = sanitize_task_id_for_path
 def _identity_label_value(value: str) -> str:
     """Return a collision-resistant Docker label for an application identity."""
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:32]
+
+
+def _deterministic_container_name(
+    task_key: str,
+    profile_key: str,
+    egress_label: str,
+    mounts_label: str,
+) -> str:
+    """Return the shared container name for one exact immutable identity."""
+    digest = hashlib.sha256(
+        "\0".join(
+            (task_key, profile_key, egress_label, mounts_label)
+        ).encode("utf-8")
+    ).hexdigest()[:32]
+    return f"hermes-{digest}"
 
 
 def _get_active_profile_name() -> str:
@@ -1088,6 +1105,8 @@ class DockerEnvironment(BaseEnvironment):
         self._labels: dict[str, str] = {}
         self._image: str = ""
         self._container_name: str = ""
+        self._name_mount_fingerprint = ""
+        self._network_disabled = not network
         self._image_uses_s6_init: bool = False
         self._all_run_args: list[str] = []
         self._run_env_values: dict[str, str] = {}
@@ -1608,23 +1627,33 @@ class DockerEnvironment(BaseEnvironment):
             + validated_extra
         )
         logger.info("Docker run_args: %s", all_run_args)
-        mount_fingerprint = hashlib.sha256(
+        mount_identity = {
+            "remote_endpoint": self._remote_endpoint,
+            "security_args": security_args,
+            "user_args": user_args,
+            "writable_args": writable_args,
+            "volume_args": volume_args,
+            "extra_args": validated_extra,
+        }
+        mounts_label = hashlib.sha256(
             json.dumps(
-                {
-                    "remote_endpoint": self._remote_endpoint,
-                    "security_args": security_args,
-                    "user_args": user_args,
-                    "writable_args": writable_args,
-                    "volume_args": volume_args,
-                    "extra_args": validated_extra,
-                },
+                mount_identity,
                 sort_keys=True,
                 separators=(",", ":"),
             ).encode("utf-8")
         ).hexdigest()[:16]
+        mount_name_identity = dict(mount_identity)
+        if not network:
+            mount_name_identity["network_mode"] = "none"
+        mount_fingerprint = hashlib.sha256(
+            json.dumps(
+                mount_name_identity,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()[:16]
+        network_label = "none" if not network else "default"
 
-        # Start the container directly via `docker run -d`.
-        container_name = f"hermes-{uuid.uuid4().hex[:8]}"
         # Labels make hermes-created containers identifiable to:
         #   * the orphan reaper (`hermes-agent=1` for the global sweep filter)
         #   * future cross-process reuse (`hermes-task-id`, `hermes-profile`)
@@ -1635,6 +1664,13 @@ class DockerEnvironment(BaseEnvironment):
         task_label = _sanitize_label_value(task_id)
         task_key = _identity_label_value(task_id)
         profile_key = _identity_label_value(profile_identity)
+        container_name = (
+            _deterministic_container_name(
+                task_key, profile_key, egress_label, mount_fingerprint
+            )
+            if persist_across_processes
+            else f"hermes-{uuid.uuid4().hex[:8]}"
+        )
         label_args = [
             "--label", "hermes-agent=1",
             "--label", f"hermes-task-id={task_label}",
@@ -1642,11 +1678,13 @@ class DockerEnvironment(BaseEnvironment):
             "--label", f"{_TASK_KEY_LABEL_KEY}={task_key}",
             "--label", f"{_PROFILE_KEY_LABEL_KEY}={profile_key}",
             "--label", f"{_EGRESS_LABEL_KEY}={egress_label}",
-            "--label", f"{_MOUNTS_LABEL_KEY}={mount_fingerprint}",
+            "--label", f"{_MOUNTS_LABEL_KEY}={mounts_label}",
+            "--label", f"{_NETWORK_LABEL_KEY}={network_label}",
         ]
         # Save args for container recreation on "No such container" recovery.
         self._image = image
         self._container_name = container_name
+        self._name_mount_fingerprint = mount_fingerprint
         self._image_uses_s6_init = image_uses_s6_init
         self._all_run_args = all_run_args
 
@@ -1657,7 +1695,8 @@ class DockerEnvironment(BaseEnvironment):
             _TASK_KEY_LABEL_KEY: task_key,
             _PROFILE_KEY_LABEL_KEY: profile_key,
             _EGRESS_LABEL_KEY: egress_label,
-            _MOUNTS_LABEL_KEY: mount_fingerprint,
+            _MOUNTS_LABEL_KEY: mounts_label,
+            _NETWORK_LABEL_KEY: network_label,
         }
 
         # Cross-process container reuse (issue #20561 — docs claim "ONE long-lived
@@ -1674,76 +1713,25 @@ class DockerEnvironment(BaseEnvironment):
         reused = False
         if persist_across_processes:
             self._remove_stale_config_containers(
-                task_label, profile_name, egress_label, mount_fingerprint
+                task_label,
+                profile_name,
+                egress_label,
+                mounts_label,
             )
-            existing = self._find_reusable_container(
-                task_label, profile_name, egress_label, mount_fingerprint,
+            existing = self._find_network_compatible_container(
+                task_label,
+                profile_name,
+                egress_label,
+                mounts_label,
+                context=f"task={task_label}, profile={profile_name}",
             )
             if existing is not None:
-                container_id, state = existing
-                # Network-mode guard: reuse must not silently defeat an
-                # egress lockdown.  A container created before the operator
-                # set ``docker_network: false`` keeps its original bridge
-                # NetworkMode, so label-only reuse would hand the agent a
-                # networked container despite the config.  On mismatch we
-                # remove the stale container and start fresh — leaving it in
-                # place would let the next label-based reuse pick it up again.
-                # Only the lockdown direction is guarded: a ``none``-mode
-                # container under a default-network config is left alone so
-                # operators using ``docker_extra_args: ["--network=none"]``
-                # don't get their container churned on every startup.
-                mode_mismatch = False
-                actual_mode = None
-                if not network:
-                    actual_mode = self._container_network_mode(container_id)
-                    mode_mismatch = actual_mode != "none"
-                if mode_mismatch:
-                    logger.warning(
-                        "Existing container %s has NetworkMode=%s but "
-                        "docker_network=false requests an air-gapped "
-                        "container — removing it and starting fresh "
-                        "(task=%s, profile=%s).",
-                        container_id[:12], actual_mode or "unknown",
-                        task_label, profile_name,
-                    )
-                    try:
-                        subprocess.run(
-                            [self._docker_exe, "rm", "-f", container_id],
-                            capture_output=True,
-                            text=True, encoding="utf-8", errors="replace",
-                            timeout=30,
-                            check=False,
-                            stdin=subprocess.DEVNULL,
-                        )
-                    except (subprocess.TimeoutExpired, OSError) as e:
-                        logger.warning("Failed to remove mismatched container %s: %s", container_id[:12], e)
-                    existing = None
-            if existing is not None:
-                container_id, state = existing
-                self._container_id = container_id
-                if state != "running":
-                    try:
-                        subprocess.run(
-                            [self._docker_exe, "start", container_id],
-                            capture_output=True,
-                            text=True, encoding='utf-8', errors='replace',
-                            timeout=30,
-                            check=True,
-                            stdin=subprocess.DEVNULL,
-                        )
-                    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-                        logger.warning(
-                            "Failed to start existing container %s (state=%s): "
-                            "%s — falling back to a fresh container.",
-                            container_id[:12], state, e,
-                        )
-                        self._container_id = None
-                if self._container_id:
-                    logger.info(
-                        "Reusing container %s (task=%s, profile=%s, prior state=%s)",
-                        container_id[:12], task_label, profile_name, state,
-                    )
-                    reused = True
+                reused = self._attach_reusable_container(
+                    existing,
+                    context=(
+                        f"task={task_label}, profile={profile_name}"
+                    ),
+                )
 
         if not reused:
             # tini/catatonit as PID 1 reaps zombie children — but s6-overlay
@@ -1771,26 +1759,49 @@ class DockerEnvironment(BaseEnvironment):
                     stdin=subprocess.DEVNULL,
                     env=self._docker_client_env(self._run_env_values),
                 )
-            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-                # Docker may create the container object before `docker run`
-                # fails to start it (e.g. exit code 125 when the daemon isn't
-                # ready, or a timeout mid-pull). That orphan is left in
-                # "Created" state — which the exited-only orphan reaper
-                # (reap_orphan_containers, status=exited) never catches, so it
-                # leaks permanently. Remove it by its known name before
-                # re-raising. See #7439.
-                logger.warning(
-                    "docker run failed for %s, cleaning up orphaned container: %s",
-                    container_name, e,
+            except (
+                subprocess.CalledProcessError,
+                subprocess.TimeoutExpired,
+                OSError,
+            ) as e:
+                if persist_across_processes:
+                    winner = self._find_network_compatible_container(
+                        task_label,
+                        profile_name,
+                        egress_label,
+                        mounts_label,
+                        context=f"docker run race for {container_name}",
+                    )
+                    if winner is not None and self._attach_reusable_container(
+                        winner,
+                        context=f"docker run race for {container_name}",
+                    ):
+                        reused = True
+                    else:
+                        logger.warning("docker run failed for %s: %s", container_name, e)
+                        raise
+                else:
+                    if isinstance(e, OSError):
+                        raise
+                    logger.warning(
+                        "docker run failed for %s, cleaning up orphaned container: %s",
+                        container_name,
+                        e,
+                    )
+                    subprocess.run(
+                        [self._docker_exe, "rm", "-f", container_name],
+                        capture_output=True,
+                        timeout=10,
+                        stdin=subprocess.DEVNULL,
+                    )
+                    raise
+            if not reused:
+                self._container_id = result.stdout.strip()
+                logger.info(
+                    "Started container %s (%s)",
+                    container_name,
+                    self._container_id[:12],
                 )
-                subprocess.run(
-                    [self._docker_exe, "rm", "-f", container_name],
-                    capture_output=True, timeout=10,
-                    stdin=subprocess.DEVNULL,
-                )
-                raise
-            self._container_id = result.stdout.strip()
-            logger.info("Started container %s (%s)", container_name, self._container_id[:12])
 
         # A generation identifies the exact container attachment represented
         # by this environment, whether it was newly created or reused.
@@ -1888,25 +1899,98 @@ class DockerEnvironment(BaseEnvironment):
             ArtifactTransferError,
         )
         bridge_cache = get_hermes_home() / "cache" / "artifact-bridge"
-        entries = {
-            entry["container_path"]: entry["host_path"]
-            for entry in get_credential_file_mounts()
-        }
+        entries = {}
+        for entry in get_credential_file_mounts():
+            container_path = posixpath.normpath(entry["container_path"])
+            if not container_path.startswith("/root/.hermes/") or (
+                container_path == _REMOTE_CREDENTIAL_MANIFEST
+            ):
+                raise RuntimeError(
+                    "Docker remote credential path must stay under /root/.hermes: "
+                    f"{entry['container_path']}"
+                )
+            source = Path(entry["host_path"])
+            if source.is_file():
+                entries[container_path] = source
+
+        if getattr(self, "_persistent", False):
+            previous_paths: set[str] = set()
+            metadata = self.fetch_file_metadata(_REMOTE_CREDENTIAL_MANIFEST)
+            if metadata is not None:
+                if metadata[0] > 64 * 1024:
+                    raise RuntimeError(
+                        "Docker remote credential manifest exceeds 64 KiB"
+                    )
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    local_manifest = Path(temp_dir) / "credentials.json"
+                    self.fetch_file(
+                        _REMOTE_CREDENTIAL_MANIFEST,
+                        str(local_manifest),
+                        max_bytes=64 * 1024,
+                    )
+                    try:
+                        manifest = json.loads(local_manifest.read_text())
+                    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                        raise RuntimeError(
+                            "Docker remote credential manifest is unreadable"
+                        ) from exc
+                if not isinstance(manifest, list) or any(
+                    not isinstance(path, str)
+                    or posixpath.normpath(path) != path
+                    or not path.startswith("/root/.hermes/")
+                    or path == _REMOTE_CREDENTIAL_MANIFEST
+                    for path in manifest
+                ):
+                    raise RuntimeError(
+                        "Docker remote credential manifest contains an unsafe path"
+                    )
+                previous_paths = set(manifest)
+
+            stale_paths = sorted(previous_paths - entries.keys())
+            if stale_paths:
+                remove_result = self.execute(
+                    "rm -f -- "
+                    + " ".join(shlex.quote(path) for path in stale_paths),
+                    timeout=30,
+                )
+                if remove_result.get("returncode", 1) != 0:
+                    raise RuntimeError(
+                        "Docker remote credential revocation failed: "
+                        + remove_result.get("output", "").strip()
+                    )
+
         for container_path, host_path in entries.items():
-            source = Path(host_path)
-            if not source.is_file():
-                continue
             try:
                 ArtifactBridge(
                     self,
                     cache_dir=bridge_cache,
-                    host_roots=(source.parent,),
+                    host_roots=(host_path.parent,),
                     container_roots=(posixpath.dirname(container_path) or "/",),
-                ).push(source, container_path)
+                ).push(host_path, container_path)
             except (ArtifactTransferError, OSError, ValueError) as exc:
                 raise RuntimeError(
                     f"Docker remote input staging failed for {container_path}: {exc}"
                 ) from exc
+
+        if getattr(self, "_persistent", False):
+            bridge_cache.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory(dir=bridge_cache) as temp_dir:
+                local_manifest = Path(temp_dir) / "credentials.json"
+                local_manifest.write_text(json.dumps(sorted(entries)))
+                try:
+                    ArtifactBridge(
+                        self,
+                        cache_dir=bridge_cache,
+                        host_roots=(local_manifest.parent,),
+                        container_roots=(
+                            posixpath.dirname(_REMOTE_CREDENTIAL_MANIFEST),
+                        ),
+                    ).push(local_manifest, _REMOTE_CREDENTIAL_MANIFEST)
+                except (ArtifactTransferError, OSError, ValueError) as exc:
+                    raise RuntimeError(
+                        "Docker remote credential manifest staging failed: "
+                        f"{exc}"
+                    ) from exc
 
         for entry in get_skills_directory_mount():
             source = Path(entry["host_path"])
@@ -2740,26 +2824,15 @@ class DockerEnvironment(BaseEnvironment):
         # 1. Try label-based reuse (another process may have recreated it).
         task_label = self._labels.get("hermes-task-id", "")
         profile_label = self._labels.get("hermes-profile", "")
-        existing = self._find_reusable_container(
-            task_label, profile_label, self._labels.get(_EGRESS_LABEL_KEY, "off"),
+        existing = self._find_network_compatible_container(
+            task_label,
+            profile_label,
+            self._labels.get(_EGRESS_LABEL_KEY, "off"),
             self._labels.get(_MOUNTS_LABEL_KEY, ""),
+            context="recovery probe",
         )
         if existing is not None:
-            cid, state = existing
-            if state == "running":
-                self._container_id = cid
-                logger.info("Recovery: reusing running container %s", cid[:12])
-            else:
-                try:
-                    subprocess.run(
-                        [self._docker_exe, "start", cid],
-                        capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=30, check=True,
-                        stdin=subprocess.DEVNULL,
-                    )
-                    self._container_id = cid
-                    logger.info("Recovery: restarted container %s", cid[:12])
-                except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-                    logger.warning("Recovery: failed to start container %s: %s", cid[:12], e)
+            self._attach_reusable_container(existing, context="recovery probe")
 
         # 2. No reusable container — create a fresh one.
         if not self._container_id:
@@ -2767,8 +2840,13 @@ class DockerEnvironment(BaseEnvironment):
                 logger.error("Recovery: no saved image name, cannot recreate container")
                 return False
             try:
-                import uuid as _uuid
-                new_name = f"hermes-{_uuid.uuid4().hex[:8]}"
+                new_name = getattr(self, "_container_name", "") or _deterministic_container_name(
+                    self._labels.get(_TASK_KEY_LABEL_KEY, ""),
+                    self._labels.get(_PROFILE_KEY_LABEL_KEY, ""),
+                    self._labels.get(_EGRESS_LABEL_KEY, "off"),
+                    getattr(self, "_name_mount_fingerprint", "")
+                    or self._labels.get(_MOUNTS_LABEL_KEY, ""),
+                )
                 init_args = [] if self._image_uses_s6_init else ["--init"]
                 label_args = []
                 for k, v in self._labels.items():
@@ -2795,8 +2873,19 @@ class DockerEnvironment(BaseEnvironment):
                     new_name, self._container_id[:12],
                 )
             except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as e:
-                logger.error("Recovery: failed to create new container: %s", e)
-                return False
+                winner = self._find_network_compatible_container(
+                    task_label,
+                    profile_label,
+                    self._labels.get(_EGRESS_LABEL_KEY, "off"),
+                    self._labels.get(_MOUNTS_LABEL_KEY, ""),
+                    context=f"recovery docker run race for {new_name}",
+                )
+                if winner is None or not self._attach_reusable_container(
+                    winner,
+                    context=f"recovery docker run race for {new_name}",
+                ):
+                    logger.error("Recovery: failed to create new container: %s", e)
+                    return False
 
         # 3. Re-initialize session snapshot in the (re)created container.
         self._container_generation += 1
@@ -2919,6 +3008,135 @@ class DockerEnvironment(BaseEnvironment):
         mode = result.stdout.strip()
         return mode or None
 
+    def _attach_reusable_container(
+        self,
+        existing: tuple[str, str],
+        *,
+        context: str,
+    ) -> bool:
+        """Attach to an exact-identity container, starting it when needed."""
+        container_id, state = existing
+        self._container_id = container_id
+        if state != "running":
+            try:
+                subprocess.run(
+                    [self._docker_exe, "start", container_id],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=30,
+                    check=True,
+                    stdin=subprocess.DEVNULL,
+                )
+            except (
+                subprocess.CalledProcessError,
+                subprocess.TimeoutExpired,
+                OSError,
+            ) as exc:
+                logger.warning(
+                    "Failed to start existing container %s (state=%s, %s): %s",
+                    container_id[:12],
+                    state,
+                    context,
+                    exc,
+                )
+                self._container_id = None
+        if not self._container_id:
+            return False
+        logger.info(
+            "Reusing container %s (prior state=%s, %s)",
+            container_id[:12],
+            state,
+            context,
+        )
+        return True
+
+    def _find_network_compatible_container(
+        self,
+        task_label: str,
+        profile_label: str,
+        egress_label: str,
+        mounts_label: str,
+        *,
+        context: str,
+    ) -> Optional[tuple[str, str]]:
+        """Find a reusable container, including pre-network-label upgrades."""
+        existing = self._find_reusable_container(
+            task_label,
+            profile_label,
+            egress_label,
+            mounts_label,
+        )
+        if existing is None and getattr(self, "_network_disabled", False):
+            existing = self._find_reusable_container(
+                task_label,
+                profile_label,
+                egress_label,
+                mounts_label,
+                require_network_label=False,
+            )
+        if existing is None:
+            return None
+        if not self._container_matches_network(existing, context=context):
+            return None
+        return existing
+
+    def _container_matches_network(
+        self,
+        existing: tuple[str, str],
+        *,
+        context: str,
+    ) -> bool:
+        """Return whether an existing container honors network lockdown."""
+        if not getattr(self, "_network_disabled", False):
+            return True
+        container_id, _state = existing
+        actual_mode = self._container_network_mode(container_id)
+        if actual_mode == "none":
+            return True
+        self._remove_container_for_recreation(
+            container_id,
+            context=(
+                f"NetworkMode={actual_mode or 'unknown'} does not satisfy "
+                f"docker_network=false ({context})"
+            ),
+        )
+        return False
+
+    def _remove_container_for_recreation(
+        self,
+        container_id: str,
+        *,
+        context: str,
+    ) -> None:
+        """Remove an owned persistent container before a config-safe rebuild."""
+        try:
+            removed = subprocess.run(
+                [self._docker_exe, "rm", "-f", container_id],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=30,
+                check=False,
+                stdin=subprocess.DEVNULL,
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            raise RuntimeError(
+                f"could not remove Docker container {container_id[:12]}: {exc}"
+            ) from exc
+        if removed.returncode != 0:
+            raise RuntimeError(
+                "could not remove Docker container "
+                f"{container_id[:12]}: {removed.stderr.strip()}"
+            )
+        logger.info(
+            "Removed Docker container %s before recreation: %s",
+            container_id[:12],
+            context,
+        )
+
     def _remove_stale_config_containers(
         self,
         task_label: str,
@@ -2928,7 +3146,7 @@ class DockerEnvironment(BaseEnvironment):
     ) -> None:
         """Remove same-owner containers with immutable config mismatches."""
         fmt = (
-            '{{.ID}}\t{{.Label "'
+            '{{.ID}}\t{{.State}}\t{{.Label "'
             + _MOUNTS_LABEL_KEY
             + '"}}\t{{.Label "'
             + _EGRESS_LABEL_KEY
@@ -2975,10 +3193,11 @@ class DockerEnvironment(BaseEnvironment):
 
         for line in result.stdout.splitlines():
             parts = line.split("\t")
-            if len(parts) != 5:
+            if len(parts) != 6:
                 continue
             (
                 container_id,
+                actual_state,
                 actual_mounts,
                 actual_egress,
                 actual_task_key,
@@ -2995,12 +3214,11 @@ class DockerEnvironment(BaseEnvironment):
                 continue
             legacy_identity = task_key_missing and profile_key_missing
             if legacy_identity:
-                raise RuntimeError(
-                    "found a legacy Hermes Docker container whose exact task/profile "
-                    f"identity cannot be verified ({container_id[:12]}). Remove or "
-                    "reset that container before retrying; Hermes will not reuse, "
-                    "replace, or race an identity-unknown container."
+                self._remove_container_for_recreation(
+                    container_id,
+                    context="legacy container lacks exact identity labels",
                 )
+                continue
             if not legacy_identity and (
                 actual_task_key != task_key or actual_profile_key != profile_key
             ):
@@ -3014,8 +3232,15 @@ class DockerEnvironment(BaseEnvironment):
             )
             if actual_mounts == mounts_label and egress_matches:
                 continue
+            if actual_state.lower() == "running":
+                logger.warning(
+                    "Keeping running Docker container %s despite immutable "
+                    "config mismatch because no cross-process ownership lease exists",
+                    container_id[:12],
+                )
+                continue
             removed = subprocess.run(
-                [self._docker_exe, "rm", "-f", container_id],
+                [self._docker_exe, "rm", container_id],
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
@@ -3040,6 +3265,8 @@ class DockerEnvironment(BaseEnvironment):
         profile_label: str,
         egress_label: str,
         mounts_label: str,
+        *,
+        require_network_label: bool = True,
     ) -> Optional[tuple[str, str]]:
         """Look for an existing container labeled for this (task, profile).
 
@@ -3069,6 +3296,13 @@ class DockerEnvironment(BaseEnvironment):
             if profile_key:
                 filters.extend(
                     ["--filter", f"label={_PROFILE_KEY_LABEL_KEY}={profile_key}"]
+                )
+            if (
+                require_network_label
+                and getattr(self, "_network_disabled", False)
+            ):
+                filters.extend(
+                    ["--filter", f"label={_NETWORK_LABEL_KEY}=none"]
                 )
             if egress_label != "off":
                 filters.extend(["--filter", f"label={_EGRESS_LABEL_KEY}={egress_label}"])
