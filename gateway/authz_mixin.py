@@ -264,6 +264,12 @@ class GatewayAuthorizationMixin:
         if getattr(source, "platform", None) != Platform.TELEGRAM:
             return True
 
+        if (
+            getattr(event, "_hermes_startup_restore_replay", False) is True
+            and getattr(event, "_hermes_telegram_bot_guard_accepted", False) is True
+        ):
+            return True
+
         adapter = self._adapter_for_source(source)
         guard = getattr(adapter, "_bot_loop_guard", None) if adapter is not None else None
         if guard is None:
@@ -283,13 +289,23 @@ class GatewayAuthorizationMixin:
             else str(getattr(bot, "username", "") or "")
         )
         try:
-            return bool(
+            allowed = bool(
                 guard.evaluate(
                     event,
                     receiver_bot_id=receiver_bot_id,
                     receiver_username=receiver_username,
                 ).allowed
             )
+            if (
+                allowed
+                and getattr(source, "is_bot", False)
+                and getattr(self, "_startup_restore_in_progress", False)
+            ):
+                try:
+                    setattr(event, "_hermes_telegram_bot_guard_accepted", True)
+                except Exception:
+                    pass
+            return allowed
         except Exception:
             if getattr(source, "is_bot", False):
                 logger.warning(

@@ -632,6 +632,52 @@ async def test_native_bot_reply_at_depth_two_stops_before_plugin_dispatch() -> N
     invoke_hook.assert_not_called()
 
 
+@pytest.mark.asyncio
+async def test_startup_restore_replay_dispatches_preaccepted_bot_event_once() -> None:
+    guard = _guard("mentions")
+    adapter = _adapter_with_guard(guard)
+    runner = _bare_runner(adapter)
+    runner._profile_adapters = {PROFILE: {Platform.TELEGRAM: adapter}}
+    runner._startup_restore_in_progress = True
+    runner._startup_restore_queue = []
+    runner._scale_to_zero_note_real_inbound = MagicMock()
+    event = _event()
+
+    async def replay(replayed: MessageEvent) -> None:
+        await runner._handle_message(replayed)
+
+    adapter.handle_message = replay
+
+    with patch(
+        "hermes_cli.lifecycle.invoke_hook",
+        return_value=[{"action": "skip", "reason": "test"}],
+    ) as invoke_hook:
+        assert await runner._handle_message(event) is None
+        assert runner._startup_restore_queue == [event]
+        assert await runner._drain_startup_restore_queue() == 1
+
+    invoke_hook.assert_called_once()
+    assert guard.counters["accept"] == 1
+    assert guard.counters.get("duplicate_drop", 0) == 0
+
+
+@pytest.mark.asyncio
+async def test_startup_restore_rejects_disallowed_bot_before_queue() -> None:
+    guard = _guard("none")
+    adapter = _adapter_with_guard(guard)
+    runner = _bare_runner(adapter)
+    runner._profile_adapters = {PROFILE: {Platform.TELEGRAM: adapter}}
+    runner._startup_restore_in_progress = True
+    runner._startup_restore_queue = []
+
+    with patch("hermes_cli.lifecycle.invoke_hook") as invoke_hook:
+        assert await runner._handle_message(_event()) is None
+
+    assert runner._startup_restore_queue == []
+    invoke_hook.assert_not_called()
+    assert guard.counters["mention_drop"] == 1
+
+
 def test_startup_refuses_enabled_policy_without_guard() -> None:
     from plugins.platforms.telegram.adapter import TelegramAdapter
 

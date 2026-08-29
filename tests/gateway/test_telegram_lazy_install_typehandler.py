@@ -48,6 +48,7 @@ def fake_telegram_sdk(monkeypatch):
             "CommandHandler",
             "CallbackQueryHandler",
             "InlineQueryHandler",
+            "ChatMemberHandler",
             "MessageHandler",
             "TypeHandler",
             "HTTPXRequest",
@@ -71,6 +72,7 @@ def fake_telegram_sdk(monkeypatch):
         "CommandHandler",
         "CallbackQueryHandler",
         "InlineQueryHandler",
+        "ChatMemberHandler",
         "MessageHandler",
         "TypeHandler",
     ):
@@ -122,6 +124,7 @@ def test_lazy_install_rebinds_every_placeholder(monkeypatch, fake_telegram_sdk):
         "CommandHandler",
         "CallbackQueryHandler",
         "InlineQueryHandler",
+        "ChatMemberHandler",
         "TelegramMessageHandler",
         "TypeHandler",
         "ContextTypes",
@@ -145,4 +148,5 @@ def test_lazy_install_rebinds_every_placeholder(monkeypatch, fake_telegram_sdk):
     # that is no longer the placeholder.
     assert adapter.TypeHandler is fake_telegram_sdk["TypeHandler"]
     assert adapter.Update is fake_telegram_sdk["Update"]
+    assert adapter.ChatMemberHandler is fake_telegram_sdk["ChatMemberHandler"]
     assert adapter.TelegramMessageHandler is fake_telegram_sdk["MessageHandler"]
