@@ -17,7 +17,7 @@
 
 import type * as HermesSdk from '@hermes/plugin-sdk'
 import { fireEvent, render, screen } from '@testing-library/react'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { BotRow } from './bot-row'
 import { translateBots } from './i18n-test-helper'
@@ -71,19 +71,32 @@ beforeEach(() => {
   requestProfile.mockResolvedValue({})
 })
 
+afterEach(() => {
+  vi.useRealTimers()
+})
+
 describe('pre-warm is hover-scoped, never roster-wide', () => {
   it('warms nothing on paint and exactly the hovered bot on pointer entry', async () => {
+    vi.useFakeTimers()
     const row = renderRow({ name: 'alpha' } as RosterRow)
 
     expect(warmProfile).not.toHaveBeenCalled()
 
     fireEvent.pointerEnter(row)
+    expect(warmProfile).not.toHaveBeenCalled()
+
+    await vi.advanceTimersByTimeAsync(149)
+    expect(warmProfile).not.toHaveBeenCalled()
+
+    await vi.advanceTimersByTimeAsync(1)
 
     expect(warmProfile.mock.calls).toEqual([['alpha']])
     expect(warmAgent).not.toHaveBeenCalled()
   })
 
   it('pre-dials a source-scoped row on its own source', async () => {
+    vi.useFakeTimers()
+
     const row = renderRow({
       connectionId: 'work',
       connectionLabel: 'Work',
@@ -93,9 +106,53 @@ describe('pre-warm is hover-scoped, never roster-wide', () => {
     } as RosterRow)
 
     fireEvent.pointerEnter(row)
+    await vi.advanceTimersByTimeAsync(150)
 
     expect(warmAgent.mock.calls).toEqual([['work', 'research']])
     expect(warmProfile).not.toHaveBeenCalled()
+  })
+
+  it('does not warm a roster while the pointer scrolls across its rows', async () => {
+    vi.useFakeTimers()
+
+    render(
+      <>
+        {Array.from({ length: 31 }, (_, index) => (
+          <BotRow
+            bot={
+              {
+                connectionId: 'imac',
+                connectionKind: 'ssh',
+                connectionLabel: 'iMac',
+                name: `agent-${index}`,
+                sourceScoped: true
+              } as RosterRow
+            }
+            key={index}
+            onDelete={noop}
+            onEdit={noop}
+            onGroup={noop}
+          />
+        ))}
+      </>
+    )
+
+    const rows = screen.getAllByRole('button')
+
+    for (const row of rows) {
+      fireEvent.pointerEnter(row)
+      fireEvent.pointerLeave(row)
+    }
+
+    await vi.advanceTimersByTimeAsync(150)
+    expect(warmAgent).not.toHaveBeenCalled()
+
+    fireEvent.pointerEnter(rows[12])
+    await vi.advanceTimersByTimeAsync(149)
+    expect(warmAgent).not.toHaveBeenCalled()
+
+    await vi.advanceTimersByTimeAsync(1)
+    expect(warmAgent.mock.calls).toEqual([['imac', 'agent-12']])
   })
 })
 
