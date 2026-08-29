@@ -25,6 +25,7 @@ import {
   useI18n,
   useValue
 } from '@hermes/plugin-sdk'
+import { useEffect, useRef } from 'react'
 
 import { avatarColor, botAppearance, BotFace } from './avatar'
 import { isBackfilledFacePng } from './avatar-image'
@@ -62,6 +63,8 @@ import { openRosterBot } from './roster-actions'
 import { botRosterMeta, botWorkspaceOwnerKey, setBotsWorkspaceOwner } from './routing'
 import { A2A_PREFIX_RE, botCanonicalSessionId, botRowOwnsWorkspace, previewKind, workerActiveAt } from './row-helpers'
 import type { GroupMember, RosterRow, SidebarRowLabels } from './types'
+
+const BOT_ROW_PREWARM_DWELL_MS = 150
 
 // ── bot row ──────────────────────────────────────────────────────────────────
 
@@ -159,6 +162,17 @@ export function BotRow({ bot, onDelete, onEdit, onGroup, showHandle }: BotRowPro
     attentionByKey[`${bot?.connectionId || activeConnectionId}::${bot?.name || 'default'}`] ||
     null
 
+  const warmTimer = useRef<null | ReturnType<typeof setTimeout>>(null)
+
+  const cancelWarm = () => {
+    if (warmTimer.current !== null) {
+      clearTimeout(warmTimer.current)
+      warmTimer.current = null
+    }
+  }
+
+  useEffect(() => cancelWarm, [])
+
   // WHO sent the last message (bot-to-bot DM vs human) — the full stored
   // history lives in the canonical chat, not inline.
   // Preview identity must match click identity (#88200): when the backend
@@ -181,26 +195,31 @@ export function BotRow({ bot, onDelete, onEdit, onGroup, showHandle }: BotRowPro
     .join(' · ')
 
   const warm = () => {
-    // Multi-source row: pre-dial the agent's OWN source (feature-detected).
-    if (bot.sourceScoped && typeof host.warmAgent === 'function') {
+    cancelWarm()
+    warmTimer.current = setTimeout(() => {
+      warmTimer.current = null
+
+      // Multi-source row: pre-dial the agent's OWN source (feature-detected).
+      if (bot.sourceScoped && typeof host.warmAgent === 'function') {
+        try {
+          host.warmAgent(bot.connectionId, bot.name)
+        } catch {
+          /* warm is best-effort */
+        }
+
+        return
+      }
+
+      if (typeof host.warmProfile !== 'function') {
+        return
+      }
+
       try {
-        host.warmAgent(bot.connectionId, bot.name)
+        host.warmProfile(bot.name)
       } catch {
         /* warm is best-effort */
       }
-
-      return
-    }
-
-    if (typeof host.warmProfile !== 'function') {
-      return
-    }
-
-    try {
-      host.warmProfile(bot.name)
-    } catch {
-      /* warm is best-effort */
-    }
+    }, BOT_ROW_PREWARM_DWELL_MS)
   }
 
   // Rows and Active Now share the exact-owner open path; only that path may
@@ -217,6 +236,7 @@ export function BotRow({ bot, onDelete, onEdit, onGroup, showHandle }: BotRowPro
       )}
       onClick={open}
       onPointerEnter={warm}
+      onPointerLeave={cancelWarm}
     >
       <div className={cn('shrink-0', !sourceStatus.available && 'grayscale opacity-60')}>
         <BotFace
