@@ -694,12 +694,13 @@ export function useRoster() {
       // Multi-source desktops (hermes-agent #86875) also expose the union
       // agent roster across every registered connection. Merge agents from
       // OTHER sources in as additional rows. Feature-detected + best-effort:
-      // an older Desktop build (no host.agents) or a roster hiccup leaves
-      // the local list exactly as it was.
+      // an older Desktop build has no host.agents; a transient roster failure
+      // retains only identities already proven on this exact ambient route.
       if (typeof host.agents === 'function') {
+        const previous: RosterRow[] = $lastRoster.get().filter(row => !row?.ghost)
+
         try {
           const union = await host.agents()
-          const previous: RosterRow[] = $lastRoster.get().filter(row => !row?.ghost)
           const exactActiveConnectionId = String(union?.activeConnectionId || '').trim()
 
           const merged = mergeMultiSourceRoster(
@@ -720,7 +721,22 @@ export function useRoster() {
             fetchedAt: issuedAt
           }
         } catch {
-          /* older build or roster failure — single-source list stands */
+          // Preserve exact identities and previously-painted other sources
+          // through a transient roster failure. The ambient connection key
+          // prevents an idless descriptor for B from inheriting A.
+          const merged = mergeMultiSourceRoster(
+            local,
+            null,
+            activeConnectionId,
+            previous,
+            activeConnectionMode,
+            activeConnectionKey
+          )
+
+          return {
+            ...merged,
+            fetchedAt: issuedAt
+          }
         }
       }
 
@@ -872,8 +888,30 @@ function mergeMultiSourceRoster(
     }
 
     if (!activeByName.has(name)) {
+      const previousIdentity =
+        activeId && ambientKey
+          ? previous.find(
+              row =>
+                row?.ambientSource === true &&
+                row.ambientConnectionKey === ambientKey &&
+                row.name === name &&
+                String(row.connectionId || '').trim() === activeId
+            )
+          : null
+
       activeByName.set(name, {
         ...profile,
+        ...(previousIdentity
+          ? {
+              connectionId: previousIdentity.connectionId,
+              connectionKind: previousIdentity.connectionKind,
+              connectionLabel: previousIdentity.connectionLabel,
+              handle: previousIdentity.handle,
+              route: previousIdentity.route,
+              sourceScoped: previousIdentity.sourceScoped,
+              targetProfile: previousIdentity.targetProfile
+            }
+          : {}),
         ...(ambientKey ? { ambientConnectionKey: ambientKey } : {}),
         ambientSource: true,
         name

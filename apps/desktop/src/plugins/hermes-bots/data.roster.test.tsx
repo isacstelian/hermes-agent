@@ -149,6 +149,69 @@ describe('no union roster', () => {
 
     expect(identities(rows)).toEqual(['undefined:default'])
   })
+
+  it('preserves the proven ambient owner and other sources through host.agents failure', async () => {
+    $lastRoster.set([
+      {
+        ambientConnectionKey: 'remote:ssh:active-old',
+        ambientSource: true,
+        connectionId: 'active-old',
+        connectionKind: 'ssh',
+        name: 'default',
+        route: {
+          connectionId: 'active-old',
+          mode: 'remote',
+          profile: 'default',
+          targetProfile: 'default'
+        },
+        sourceScoped: true
+      },
+      {
+        connectionId: 'other',
+        connectionKind: 'ssh',
+        name: 'research',
+        remoteSource: true,
+        sourceScoped: true
+      }
+    ])
+
+    const rows = await mergedRoster(
+      { profiles: [{ last_session: { id: 'rich-active' }, name: 'default' }] },
+      null,
+      null,
+      'remote',
+      'remote:ssh:active-old'
+    )
+
+    expect(rows.find(row => row.name === 'default')).toMatchObject({
+      connectionId: 'active-old',
+      last_session: { id: 'rich-active' },
+      sourceScoped: true
+    })
+    expect(rows.find(row => row.name === 'research')).toMatchObject({ connectionId: 'other', remoteSource: true })
+  })
+
+  it('does not carry an ambient owner across a descriptor-key change during host.agents failure', async () => {
+    $lastRoster.set([
+      {
+        ambientConnectionKey: 'remote:ssh:host-a',
+        ambientSource: true,
+        connectionId: 'host-a',
+        name: 'default',
+        sourceScoped: true
+      }
+    ])
+
+    const rows = await mergedRoster(
+      { profiles: [{ last_session: { id: 'rich-host-b' }, name: 'default' }] },
+      null,
+      null,
+      'remote',
+      'remote:ssh:host-b'
+    )
+
+    expect(rows.find(row => row.name === 'default')?.connectionId).toBeUndefined()
+  })
 })
 
 describe('the active source annotates; other sources append', () => {
