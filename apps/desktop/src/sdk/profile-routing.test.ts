@@ -104,8 +104,6 @@ vi.mock('@/store/gateway', async () => {
     ensureGatewayForAgent: vi.fn(),
     openGatewayForAgent: vi.fn(),
     openGatewayForProfile: vi.fn(),
-    prewarmGatewayForAgent: vi.fn(),
-    prewarmGatewayForProfile: vi.fn(),
     requestGatewayForAgent: vi.fn(
       async (connectionId: string, profile: string, method: string, params: Record<string, unknown>) => ({
         connectionId,
@@ -132,8 +130,6 @@ const {
   activeGatewayConnectionId,
   openGatewayForAgent,
   openGatewayForProfile,
-  prewarmGatewayForAgent,
-  prewarmGatewayForProfile,
   requestGatewayForAgent,
   requestGatewayForProfile,
   retireLocalProfileGateways
@@ -204,12 +200,12 @@ afterEach(() => {
 })
 
 describe('connection-aware plugin host APIs', () => {
-  it('routes profile and agent warm-ups through the shared speculative gate', () => {
+  it('does not start backends from profile or agent warm-up hints', () => {
+    Array.from({ length: 31 }, (_, index) => host.warmAgent('imac', `agent-${index}`))
     host.warmProfile('research')
-    host.warmAgent('imac', 'cmo')
 
-    expect(prewarmGatewayForProfile).toHaveBeenCalledWith('research')
-    expect(prewarmGatewayForAgent).toHaveBeenCalledWith('imac', 'cmo')
+    expect(openGatewayForAgent).not.toHaveBeenCalled()
+    expect(openGatewayForProfile).not.toHaveBeenCalled()
   })
 
   it('retires a profile gateway before deleting it', async () => {

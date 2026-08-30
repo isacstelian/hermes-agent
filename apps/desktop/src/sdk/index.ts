@@ -47,8 +47,6 @@ import {
   activeGatewayConnectionId,
   openGatewayForAgent,
   openGatewayForProfile,
-  prewarmGatewayForAgent,
-  prewarmGatewayForProfile,
   requestGatewayForAgent,
   requestGatewayForProfile,
   retainGatewayForAgent,
@@ -635,21 +633,12 @@ export const host = {
     window.location.hash = path.startsWith('#') ? path : `#${path}`
   },
 
-  /** Pre-dial a profile's gateway socket in the background — pool-only, no
-   *  activation, no navigation, no scope change (openGatewayForProfile; it
-   *  already no-ops for shared-remote routes and the primary). Roster UIs
-   *  call this after mount so the FIRST click on an agent doesn't pay the
-   *  whole backend spawn + socket dial latency. Fire-and-forget: failures
-   *  are swallowed — the click path re-runs its own ensure and surfaces
-   *  errors properly. */
-  warmProfile: (profile: string): void => {
-    const name = (profile ?? '').trim()
-
-    if (!name || name === $activeGatewayProfile.get()) {
-      return
-    }
-
-    prewarmGatewayForProfile(name)
+  /** Compatibility door for older plugins. Speculative gateway starts are
+   *  disabled because renderer-local throttles cannot bound work app-wide
+   *  when Desktop has more than one window. */
+  warmProfile: (_profile: string): void => {
+    // Compatibility no-op. Speculative backend starts are unsafe across
+    // multiple renderer windows; the explicit click owns the cold start.
   },
 
   /** Delete a profile THROUGH the desktop's teardown-routed REST path — the
@@ -784,12 +773,9 @@ export const host = {
     return roster()
   },
 
-  /** Pre-dial an agent's socket on ITS source — the (connection, profile)
-   *  analogue of warmProfile. Fire-and-forget, same semantics.
-   *  `undefined` is accepted alongside `null` because a roster row's
-   *  `connectionId` is optional; both mean "no explicit source". */
-  warmAgent: (connectionId: null | string | undefined, profile: string): void => {
-    prewarmGatewayForAgent(connectionId ?? null, (profile ?? '').trim() || 'default')
+  /** Agent-scoped compatibility twin of warmProfile. */
+  warmAgent: (_connectionId: null | string | undefined, _profile: string): void => {
+    // Same contract as warmProfile: keep the plugin API, start no backend.
   },
 
   /** Activate an agent's gateway (dialing it if needed) so subsequent

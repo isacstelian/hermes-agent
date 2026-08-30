@@ -54,7 +54,6 @@ const {
   configureGatewayRegistry,
   ensureGatewayForProfile,
   openGatewayForAgent,
-  prewarmGatewayForAgent,
   pruneSecondaryGateways,
   setPrimaryGateway
 } = await import('./gateway')
@@ -323,36 +322,6 @@ describe('connection-scoped dial failure identity (#95421)', () => {
     } finally {
       errorSpy.mockRestore()
     }
-  })
-})
-
-describe('speculative gateway warm-up concurrency', () => {
-  it('accepts only one agent pre-warm while the first dial is in flight', async () => {
-    let releaseConnect: () => void = () => undefined
-    gatewayMocks.connect.mockImplementationOnce(
-      () =>
-        new Promise<void>(resolve => {
-          releaseConnect = resolve
-        })
-    )
-
-    const getConnectionFor = vi.fn(async ({ connectionId, profile }: { connectionId: string; profile: string }) => ({
-      authMode: 'token',
-      connectionId,
-      profile,
-      wsUrl: `wss://${connectionId}.invalid/${profile}`
-    }))
-
-    installDesktop({ getConnectionFor })
-
-    const accepted = Array.from({ length: 31 }, (_, index) =>
-      prewarmGatewayForAgent('imac', `agent-${index}`)
-    )
-
-    expect(accepted).toEqual([true, ...Array.from({ length: 30 }, () => false)])
-    await vi.waitFor(() => expect(getConnectionFor).toHaveBeenCalledTimes(1))
-
-    releaseConnect()
   })
 })
 

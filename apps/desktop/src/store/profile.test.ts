@@ -8,15 +8,13 @@ import type { ProfileInfo } from '@/types/hermes'
 // the REST query client must not run for real in a unit test.
 const ensureGatewayForProfile = vi.fn(async () => undefined)
 const ensureGatewayForAgent = vi.fn(async () => undefined)
-const prewarmGatewayForProfile = vi.fn((_profile: string) => true)
 const $gateway = atom<unknown>({ id: 'live-socket' })
 const resetStarmapGraph = vi.fn()
 
 vi.mock('@/store/gateway', () => ({
   $gateway,
   ensureGatewayForAgent,
-  ensureGatewayForProfile,
-  prewarmGatewayForProfile
+  ensureGatewayForProfile
 }))
 vi.mock('@/hermes', () => ({
   getProfiles: vi.fn(async () => ({ profiles: [] })),
@@ -59,8 +57,6 @@ const getConnection = vi.fn<(profile?: string | null) => Promise<HermesConnectio
 beforeEach(() => {
   getConnection.mockReset()
   ensureGatewayForProfile.mockClear()
-  prewarmGatewayForProfile.mockClear()
-  prewarmGatewayForProfile.mockReturnValue(true)
   $gateway.set({ id: 'live-socket' })
   $activeGatewayProfile.set('default')
   $connection.set(localConn())
@@ -132,40 +128,11 @@ describe('profile-scoped cache invalidation', () => {
   })
 })
 
-describe('prewarmProfileBackend (hover-intent pool spawn)', () => {
-  it('opens the gateway (spawn + connect, no activation) for a non-active profile', () => {
+describe('prewarmProfileBackend compatibility door', () => {
+  it('does not start a backend from hover intent', () => {
     prewarmProfileBackend('warm-basic')
 
-    expect(prewarmGatewayForProfile).toHaveBeenCalledWith('warm-basic')
-    // Pre-warm must never activate — that's the click's job.
     expect(ensureGatewayForProfile).not.toHaveBeenCalled()
-  })
-
-  it('skips the profile the gateway is already on', () => {
-    $activeGatewayProfile.set('warm-active')
-
-    prewarmProfileBackend('warm-active')
-
-    expect(prewarmGatewayForProfile).not.toHaveBeenCalled()
-  })
-
-  it('throttles repeat pre-warms for the same profile within the interval', () => {
-    prewarmProfileBackend('warm-throttle-a')
-    prewarmProfileBackend('warm-throttle-a')
-    prewarmProfileBackend('warm-throttle-b')
-
-    const calls = prewarmGatewayForProfile.mock.calls.map(([name]) => name)
-    expect(calls.filter(name => name === 'warm-throttle-a')).toHaveLength(1)
-    expect(calls.filter(name => name === 'warm-throttle-b')).toHaveLength(1)
-  })
-
-  it('does not throttle a pre-warm that the shared speculative slot declines', () => {
-    prewarmGatewayForProfile.mockReturnValueOnce(false)
-
-    prewarmProfileBackend('warm-declined')
-    prewarmProfileBackend('warm-declined')
-
-    expect(prewarmGatewayForProfile).toHaveBeenCalledTimes(2)
   })
 })
 
