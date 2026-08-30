@@ -466,12 +466,18 @@ describe('secondary connection timeout (#93454)', () => {
     expect(cancelBootstrap).toHaveBeenCalledWith({ connectionId: 'imac', profile: 'cmo' })
   })
 
-  it('uses the cold budget while the registry kind is still loading', async () => {
+  it('loads the registry kind before choosing the cold SSH budget', async () => {
     vi.useFakeTimers()
     $connectionsRegistry.set(null)
 
     const getConnectionFor = vi.fn(() => new Promise(() => undefined))
-    installDesktop({ connections: { list: vi.fn() }, getConnectionFor })
+
+    const list = vi.fn(async () => ({
+      connections: [{ id: 'imac', kind: 'ssh', label: 'iMac' }],
+      primary: 'imac'
+    }))
+
+    installDesktop({ connections: { list }, getConnectionFor })
 
     const connection = openGatewayForAgent('imac', 'cmo')
     let settled = false
@@ -491,7 +497,35 @@ describe('secondary connection timeout (#93454)', () => {
 
     await vi.advanceTimersByTimeAsync(SECONDARY_BACKEND_BOOT_WAIT_TIMEOUT_MS - RECONNECT_ATTEMPT_TIMEOUT_MS)
     await pending
+    expect(list).toHaveBeenCalledTimes(1)
   })
+
+  it.each(['cloud', 'local', 'remote'] as const)(
+    'keeps the short cold budget for a %s route while the registry cache is loading',
+    async kind => {
+      vi.useFakeTimers()
+      $connectionsRegistry.set(null)
+
+      const getConnectionFor = vi.fn(() => new Promise(() => undefined))
+
+      const list = vi.fn(async () => ({
+        connections: [{ id: 'target', kind, label: 'Target' }],
+        primary: 'target'
+      }))
+
+      installDesktop({ connections: { list }, getConnectionFor })
+
+      const pending = expect(openGatewayForAgent('target', 'cmo')).rejects.toThrow(
+        'Timed out connecting to profile "cmo"'
+      )
+
+      await vi.advanceTimersByTimeAsync(RECONNECT_ATTEMPT_TIMEOUT_MS - 1)
+      expect(getConnectionFor).toHaveBeenCalledTimes(1)
+
+      await vi.advanceTimersByTimeAsync(1)
+      await pending
+    }
+  )
 
   it('uses the short reconnect budget after an SSH secondary was pruned and recreated', async () => {
     gatewayMocks.connect.mockImplementation(async () => undefined)

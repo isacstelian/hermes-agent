@@ -439,23 +439,32 @@ function clearTimer(entry: Secondary): void {
   }
 }
 
-function coldDescriptorTimeoutMs(entry: Secondary): number {
+async function coldDescriptorTimeoutMs(entry: Secondary): Promise<number> {
   const connectionId = entry.connectionId?.trim()
-  const registry = $connectionsRegistry.get()
+  let registry = $connectionsRegistry.get()
+
+  if (connectionId && !registry) {
+    const list = window.hermesDesktop?.connections?.list
+
+    if (list) {
+      try {
+        registry = await withTimeout(
+          list(),
+          RECONNECT_ATTEMPT_TIMEOUT_MS,
+          `Timed out resolving connection kind for "${connectionId}"`
+        )
+        $connectionsRegistry.set(registry)
+      } catch {
+        return RECONNECT_ATTEMPT_TIMEOUT_MS
+      }
+    }
+  }
 
   const connection = connectionId
     ? registry?.connections.find(candidate => candidate.id === connectionId)
     : null
 
-  // The registry bridge exists before its asynchronous cache load. During
-  // that short window the id is authoritative but its kind is not available;
-  // use the cold budget so an SSH click cannot be misclassified as a 20s URL
-  // dial. Once the registry is loaded, non-SSH routes keep the short bound.
-  const registryKindPending = Boolean(connectionId && !registry && window.hermesDesktop?.connections?.list)
-
-  return connection?.kind === 'ssh' || registryKindPending
-    ? SECONDARY_BACKEND_BOOT_WAIT_TIMEOUT_MS
-    : RECONNECT_ATTEMPT_TIMEOUT_MS
+  return connection?.kind === 'ssh' ? SECONDARY_BACKEND_BOOT_WAIT_TIMEOUT_MS : RECONNECT_ATTEMPT_TIMEOUT_MS
 }
 
 async function openSecondary(entry: Secondary): Promise<void> {
@@ -485,10 +494,6 @@ async function openSecondary(entry: Secondary): Promise<void> {
     const openedScopes = openedSecondaryScopes()
     const reconnectingSocket = entry.openedOnce || entry.connection !== null || openedScopes.has(entry.scope)
     const resettingRuntimeBindings = reconnectingSocket || openedScopes.has(entry.scope)
-
-    const descriptorTimeoutMs = reconnectingSocket
-      ? RECONNECT_ATTEMPT_TIMEOUT_MS
-      : coldDescriptorTimeoutMs(entry)
 
     let reconcileBusyAfterOpen: null | (() => void) = null
 
@@ -528,21 +533,26 @@ async function openSecondary(entry: Secondary): Promise<void> {
     // this secondary (SSH terminal, messaging DELETE, session send, …) never
     // settles either. Bound the same way use-gateway-boot.ts bounds the
     // primary's equivalent awaits.
+    const descriptorStartedAt = Date.now()
+
+    const descriptorPromise =
+      entry.connectionId && desktop.getConnectionFor
+        ? desktop.getConnectionFor({ connectionId: entry.connectionId, profile: entry.profile })
+        : desktop.getConnection(entry.profile)
+
+    const descriptorBudgetMs = reconnectingSocket
+      ? RECONNECT_ATTEMPT_TIMEOUT_MS
+      : await coldDescriptorTimeoutMs(entry)
+
+    const descriptorTimeoutMs = Math.max(0, descriptorBudgetMs - (Date.now() - descriptorStartedAt))
     let conn: HermesConnection
 
     try {
-      conn =
-        entry.connectionId && desktop.getConnectionFor
-          ? await withTimeout(
-              desktop.getConnectionFor({ connectionId: entry.connectionId, profile: entry.profile }),
-              descriptorTimeoutMs,
-              `Timed out connecting to profile "${entry.profile}"`
-            )
-          : await withTimeout(
-              desktop.getConnection(entry.profile),
-              descriptorTimeoutMs,
-              `Timed out connecting to profile "${entry.profile}"`
-            )
+      conn = await withTimeout(
+        descriptorPromise,
+        descriptorTimeoutMs,
+        `Timed out connecting to profile "${entry.profile}"`
+      )
     } catch (error) {
       if (entry.connectionId && isTimeoutError(error)) {
         try {
