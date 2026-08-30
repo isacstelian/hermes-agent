@@ -25,10 +25,12 @@ describe('applyConnectionChange', () => {
       const events: string[] = []
 
       const run = applyConnectionChange({
-        cancelAndWait: async () => {
+        cancelAndWait: async (_scope, whileDrained) => {
           events.push('cancel')
           await gate.promise
           events.push('drained')
+          await whileDrained()
+          events.push('released')
         },
         isPrimary: true,
         scope: '',
@@ -46,15 +48,17 @@ describe('applyConnectionChange', () => {
       expect(events).toEqual(['cancel'])
       gate.resolve()
       await run
-      expect(events).toEqual(['cancel', 'drained', 'ssh', 'primary', 'applied'])
+      expect(events).toEqual(['cancel', 'drained', 'ssh', 'primary', 'applied', 'released'])
     }
   )
 
   it('tears down only a non-primary scope without applying the primary connection', async () => {
     const events: string[] = []
     await applyConnectionChange({
-      cancelAndWait: async scope => {
+      cancelAndWait: async (scope, whileDrained) => {
         events.push(`cancel:${scope}`)
+        await whileDrained()
+        events.push('released')
       },
       isPrimary: false,
       scope: 'worker',
@@ -67,7 +71,7 @@ describe('applyConnectionChange', () => {
         events.push(`ssh:${scope}`)
       }
     })
-    expect(events).toEqual(['cancel:worker', 'ssh:worker', 'pool:worker'])
+    expect(events).toEqual(['cancel:worker', 'ssh:worker', 'pool:worker', 'released'])
   })
 })
 

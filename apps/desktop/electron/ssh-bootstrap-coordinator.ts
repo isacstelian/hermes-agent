@@ -70,7 +70,7 @@ function createBootstrapCoordinator({
   const active = new Set<any>()
   const pending = new Map<string, any>()
   const generations = new Map<string, number>()
-  const drains = new Map<string, Promise<void>>()
+  const drains = new Map<string, any>()
   const concurrency = Number.isFinite(maxConcurrent) ? Math.max(1, Math.floor(maxConcurrent)) : Number.POSITIVE_INFINITY
 
   const requestedPrimaryReservation = Number.isFinite(reservedPrimarySlots)
@@ -243,8 +243,8 @@ function createBootstrapCoordinator({
       }
     }
 
-    const drain = drains.get(scope) || Promise.resolve()
-    const predecessor = current ? Promise.allSettled([current.promise, drain]) : drain
+    const drainBarrier = drains.get(scope)?.barrier || Promise.resolve()
+    const predecessor = current ? Promise.allSettled([current.promise, drainBarrier]) : drainBarrier
     const entryMetadata = metadata && typeof metadata === 'object' ? metadata : {}
 
     const entry: any = {
@@ -291,11 +291,27 @@ function createBootstrapCoordinator({
     }
   }
 
+  function enqueueDrainCallback(drain, callback): Promise<{ error: unknown | null }> {
+    if (typeof callback !== 'function') {
+      return Promise.resolve({ error: null })
+    }
+
+    return new Promise(resolve => {
+      drain.callbacks.push({ resolve, run: callback })
+    })
+  }
+
   async function cancelAndWait(scope, whileDrained = null) {
     const existingDrain = drains.get(scope)
 
     if (existingDrain) {
-      await existingDrain
+      const callbackResult = enqueueDrainCallback(existingDrain, whileDrained)
+      await existingDrain.barrier
+      const result = await callbackResult
+
+      if (result.error) {
+        throw result.error
+      }
 
       return
     }
@@ -305,6 +321,13 @@ function createBootstrapCoordinator({
     const barrier = new Promise<void>(resolve => {
       release = resolve
     })
+
+    const drain = {
+      barrier,
+      callbacks: []
+    }
+
+    const callbackResult = enqueueDrainCallback(drain, whileDrained)
 
     const entries = [...active].filter(
       entry => entry.scope === scope || entry.metadata?.cancelScopes?.includes(scope)
@@ -316,7 +339,7 @@ function createBootstrapCoordinator({
     ])
 
     for (const drainScope of drainScopes) {
-      drains.set(drainScope, barrier)
+      drains.set(drainScope, drain)
     }
 
     for (const entry of entries) {
@@ -331,17 +354,30 @@ function createBootstrapCoordinator({
       await Promise.allSettled(entries.flatMap(entry => [...entry.forceCleanups]).map(cleanup => cleanup()))
       await Promise.allSettled(entries.map(entry => entry.promise))
 
-      if (typeof whileDrained === 'function') {
-        await whileDrained()
+      while (drain.callbacks.length > 0) {
+        const callback = drain.callbacks.shift()
+
+        try {
+          await callback.run()
+          callback.resolve({ error: null })
+        } catch (error) {
+          callback.resolve({ error })
+        }
       }
     } finally {
       for (const drainScope of drainScopes) {
-        if (drains.get(drainScope) === barrier) {
+        if (drains.get(drainScope) === drain) {
           drains.delete(drainScope)
         }
       }
 
       release()
+    }
+
+    const result = await callbackResult
+
+    if (result.error) {
+      throw result.error
     }
   }
 

@@ -11277,8 +11277,7 @@ async function ensureRegistryBackend(connectionId, profile, managedUpdateCorrela
           await stopPoolBackend(key)
 
           if (source.kind === 'ssh') {
-            await sshBootstrapCoordinator.cancelAndWait(key)
-            await teardownSshConnection(key)
+            await sshBootstrapCoordinator.cancelAndWait(key, () => teardownSshConnection(key))
           }
         }
       })
@@ -11905,8 +11904,7 @@ async function stopRegistryConnectionBackends(connectionId) {
 
   await Promise.all(
     [...sshScopes].map(async scope => {
-      await sshBootstrapCoordinator.cancelAndWait(scope)
-      await teardownSshConnection(scope)
+      await sshBootstrapCoordinator.cancelAndWait(scope, () => teardownSshConnection(scope))
     })
   )
 }
@@ -14305,8 +14303,7 @@ ipcMain.handle('hermes:connection:revalidate', async () => {
 
       if (conn?.remoteKind === 'ssh') {
         const profile = primaryProfileKey()
-        await sshBootstrapCoordinator.cancelAndWait(sshScopeKey(profile))
-        await teardownSshConnection(profile)
+        await sshBootstrapCoordinator.cancelAndWait(sshScopeKey(profile), () => teardownSshConnection(profile))
       }
     }
 
@@ -14363,8 +14360,7 @@ function revalidateSuspectPoolAfterResume() {
         // The pool key doubles as the SSH scope for registry SSH backends and
         // resolves through sshScopeKey() for bare-profile remotes; both
         // teardown calls no-op when the scope holds no SSH state.
-        await sshBootstrapCoordinator.cancelAndWait(poolKey)
-        await teardownSshConnection(poolKey)
+        await sshBootstrapCoordinator.cancelAndWait(poolKey, () => teardownSshConnection(poolKey))
       },
       tracker: remoteLiveness
     })
@@ -15483,7 +15479,7 @@ ipcMain.handle('hermes:connection-config:apply', async (_event, payload) => {
     writeRegistry: writeDesktopConnectionsRegistry,
     apply: () =>
       applyConnectionChange({
-        cancelAndWait: value => sshBootstrapCoordinator.cancelAndWait(value),
+        cancelAndWait: (value, whileDrained) => sshBootstrapCoordinator.cancelAndWait(value, whileDrained),
         isPrimary: !key || key === primaryProfileKey(),
         rehomePrimary: () =>
           rehomePrimaryConnection({
@@ -15937,7 +15933,7 @@ async function teardownConnectionScopedProfileBackend(connectionId, profile) {
   const key = backendScopeKey(connectionId, profile)
   await Promise.all([
     poolStopper.stop(key),
-    sshBootstrapCoordinator.cancelAndWait(key).then(() => teardownSshConnection(key))
+    sshBootstrapCoordinator.cancelAndWait(key, () => teardownSshConnection(key))
   ])
 }
 

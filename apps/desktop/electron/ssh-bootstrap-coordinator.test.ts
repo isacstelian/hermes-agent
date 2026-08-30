@@ -524,6 +524,69 @@ test('concurrent cancellation callers share one drain and one force cleanup', as
   assert.equal(nextStarted, true)
 })
 
+test('a teardown callback joining an existing drain finishes before replacement starts', async () => {
+  const coordinator = createBootstrapCoordinator()
+  const cleanupGate = deferred()
+  const runGate = deferred()
+  const teardownGate = deferred()
+  const teardownStarted = deferred()
+  const alias = 'conn:imac::default'
+  const events: string[] = []
+  let firstDone = false
+  let nextStarted = false
+
+  const running = coordinator.start(
+    '',
+    'same',
+    async lease => {
+      lease.onForceCleanup(async () => {
+        events.push('cleanup')
+        runGate.resolve()
+        await cleanupGate.promise
+        events.push('cleanup-done')
+      })
+      await runGate.promise
+      lease.assertCurrent()
+    },
+    { cancelScopes: [alias], managedScope: 'primary' }
+  )
+
+  await Promise.resolve()
+
+  const first = coordinator.cancelAndWait(alias).then(() => {
+    firstDone = true
+  })
+
+  const second = coordinator.cancelAndWait(alias, async () => {
+    events.push('teardown')
+    teardownStarted.resolve()
+    await teardownGate.promise
+    events.push('teardown-done')
+  })
+
+  const next = coordinator.start('', 'next', async () => {
+    nextStarted = true
+  })
+
+  await Promise.resolve()
+  assert.deepEqual(events, ['cleanup'])
+  assert.equal(firstDone, false)
+  assert.equal(nextStarted, false)
+
+  cleanupGate.resolve()
+  await teardownStarted.promise
+  assert.deepEqual(events, ['cleanup', 'cleanup-done', 'teardown'])
+  assert.equal(firstDone, false)
+  assert.equal(nextStarted, false)
+
+  teardownGate.resolve()
+  await Promise.all([first, second])
+  await assert.rejects(running, (error: any) => error.kind === 'superseded')
+  await next
+  assert.deepEqual(events, ['cleanup', 'cleanup-done', 'teardown', 'teardown-done'])
+  assert.equal(nextStarted, true)
+})
+
 test('cancelAndWait force-cleans pending resources before awaiting rollback', async () => {
   const coordinator = createBootstrapCoordinator()
   const gate = deferred()

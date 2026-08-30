@@ -8,23 +8,24 @@ async function applyConnectionChange({
   teardownPrimary,
   teardownSsh
 }) {
-  await cancelAndWait(scope)
-  await teardownSsh(scope)
+  await cancelAndWait(scope, async () => {
+    await teardownSsh(scope)
 
-  if (!isPrimary) {
-    stopPool(scope)
+    if (!isPrimary) {
+      await stopPool(scope)
 
-    return
-  }
+      return
+    }
 
-  if (rehomePrimary) {
-    await rehomePrimary()
+    if (rehomePrimary) {
+      await rehomePrimary()
 
-    return
-  }
+      return
+    }
 
-  await teardownPrimary()
-  sendApplied()
+    await teardownPrimary()
+    sendApplied()
+  })
 }
 
 function commitConnectionFailure(current, starting, commit) {
