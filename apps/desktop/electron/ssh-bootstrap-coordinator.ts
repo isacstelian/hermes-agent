@@ -25,12 +25,20 @@ function supersededError(message = 'SSH bootstrap was superseded by newer connec
   return error
 }
 
+function busyError() {
+  const error: any = new Error('SSH bootstrap queue is busy. Retry after another agent finishes starting.')
+  error.kind = 'busy'
+
+  return error
+}
+
 function bootstrapPriority(metadata) {
   return metadata?.managedScope === 'primary' ? 1 : 0
 }
 
 function createBootstrapCoordinator({
   maxConcurrent = Number.POSITIVE_INFINITY,
+  maxQueuedNonPrimary = Number.POSITIVE_INFINITY,
   reservedPrimarySlots = 0
 } = {}) {
   const active = new Set<any>()
@@ -46,6 +54,10 @@ function createBootstrapCoordinator({
   const primaryReservation = Number.isFinite(concurrency)
     ? Math.min(concurrency, requestedPrimaryReservation)
     : 0
+
+  const nonPrimaryQueueLimit = Number.isFinite(maxQueuedNonPrimary)
+    ? Math.max(0, Math.floor(maxQueuedNonPrimary))
+    : Number.POSITIVE_INFINITY
 
   // Reservation gates new non-primary work only. Active bootstraps are never
   // preempted or cancelled to make room for a later primary.
@@ -101,12 +113,22 @@ function createBootstrapCoordinator({
       return Promise.reject(supersededError())
     }
 
+    const primary = metadata?.managedScope === 'primary'
+
+    if (
+      !primary &&
+      waiters.filter(waiter => !waiter.primary && !waiter.cancelled && !waiter.signal.aborted).length >=
+        nonPrimaryQueueLimit
+    ) {
+      return Promise.reject(busyError())
+    }
+
     return new Promise((resolve, reject) => {
       const waiter: any = {
         cancelled: false,
         launch: null,
         onAbort: null,
-        primary: metadata?.managedScope === 'primary',
+        primary,
         priority: bootstrapPriority(metadata),
         sequence: waiterSequence++,
         signal

@@ -464,6 +464,65 @@ describe('secondary connection timeout (#93454)', () => {
     await pending
   })
 
+  it('uses the cold budget while the registry kind is still loading', async () => {
+    vi.useFakeTimers()
+    $connectionsRegistry.set(null)
+
+    const getConnectionFor = vi.fn(() => new Promise(() => undefined))
+    installDesktop({ connections: { list: vi.fn() }, getConnectionFor })
+
+    const connection = openGatewayForAgent('imac', 'cmo')
+    let settled = false
+    const pending = expect(connection).rejects.toThrow('Timed out connecting to profile "cmo"')
+
+    void connection.then(
+      () => {
+        settled = true
+      },
+      () => {
+        settled = true
+      }
+    )
+
+    await vi.advanceTimersByTimeAsync(RECONNECT_ATTEMPT_TIMEOUT_MS)
+    expect(settled).toBe(false)
+
+    await vi.advanceTimersByTimeAsync(SECONDARY_BACKEND_BOOT_WAIT_TIMEOUT_MS - RECONNECT_ATTEMPT_TIMEOUT_MS)
+    await pending
+  })
+
+  it('uses the short reconnect budget after an SSH secondary was pruned and recreated', async () => {
+    gatewayMocks.connect.mockImplementation(async () => undefined)
+    $connectionsRegistry.set({
+      connections: [
+        { id: 'local', kind: 'local', label: 'This device' },
+        { id: 'imac', kind: 'ssh', label: 'iMac' }
+      ],
+      primary: 'local'
+    } as never)
+
+    const getConnectionFor = vi.fn().mockResolvedValueOnce({
+      connectionId: 'imac',
+      profile: 'cmo',
+      wsUrl: 'wss://imac.invalid/ws'
+    })
+
+    installDesktop({ getConnectionFor })
+    await openGatewayForAgent('imac', 'cmo')
+
+    pruneSecondaryGateways(new Set())
+    expect(gatewayMocks.instances[0].close).toHaveBeenCalled()
+
+    vi.useFakeTimers()
+    getConnectionFor.mockImplementationOnce(() => new Promise(() => undefined))
+
+    const connection = openGatewayForAgent('imac', 'cmo')
+    const pending = expect(connection).rejects.toThrow('Timed out connecting to profile "cmo"')
+
+    await vi.advanceTimersByTimeAsync(RECONNECT_ATTEMPT_TIMEOUT_MS)
+    await pending
+  })
+
   it('does not let a wedged shared-primary-route probe block the secondary dial forever', async () => {
     // Same unbounded-IPC hazard as above, but for sharedPrimaryRoute's own
     // getConnection() probe, which runs BEFORE openSecondary on every route —

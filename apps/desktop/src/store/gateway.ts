@@ -440,12 +440,21 @@ function clearTimer(entry: Secondary): void {
 
 function coldDescriptorTimeoutMs(entry: Secondary): number {
   const connectionId = entry.connectionId?.trim()
+  const registry = $connectionsRegistry.get()
 
   const connection = connectionId
-    ? $connectionsRegistry.get()?.connections.find(candidate => candidate.id === connectionId)
+    ? registry?.connections.find(candidate => candidate.id === connectionId)
     : null
 
-  return connection?.kind === 'ssh' ? SECONDARY_BACKEND_BOOT_WAIT_TIMEOUT_MS : RECONNECT_ATTEMPT_TIMEOUT_MS
+  // The registry bridge exists before its asynchronous cache load. During
+  // that short window the id is authoritative but its kind is not available;
+  // use the cold budget so an SSH click cannot be misclassified as a 20s URL
+  // dial. Once the registry is loaded, non-SSH routes keep the short bound.
+  const registryKindPending = Boolean(connectionId && !registry && window.hermesDesktop?.connections?.list)
+
+  return connection?.kind === 'ssh' || registryKindPending
+    ? SECONDARY_BACKEND_BOOT_WAIT_TIMEOUT_MS
+    : RECONNECT_ATTEMPT_TIMEOUT_MS
 }
 
 async function openSecondary(entry: Secondary): Promise<void> {
@@ -473,7 +482,7 @@ async function openSecondary(entry: Secondary): Promise<void> {
     // open. Awaiting it is intentional: correctness at the generation boundary
     // outranks the single local-module microtask this adds to a reconnect.
     const openedScopes = openedSecondaryScopes()
-    const reconnectingSocket = entry.openedOnce || entry.connection !== null
+    const reconnectingSocket = entry.openedOnce || entry.connection !== null || openedScopes.has(entry.scope)
     const resettingRuntimeBindings = reconnectingSocket || openedScopes.has(entry.scope)
 
     const descriptorTimeoutMs = reconnectingSocket

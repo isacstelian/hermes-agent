@@ -2,7 +2,12 @@ import { atom, computed } from 'nanostores'
 
 import type { DesktopConnectionsRegistry } from '@/global'
 import { persistStringRecord, storedStringRecord } from '@/lib/storage'
-import { BACKEND_BOOT_WAIT_TIMEOUT_MS, isTimeoutError, withTimeout } from '@/lib/with-timeout'
+import {
+  BACKEND_BOOT_WAIT_TIMEOUT_MS,
+  isTimeoutError,
+  SECONDARY_BACKEND_BOOT_WAIT_TIMEOUT_MS,
+  withTimeout
+} from '@/lib/with-timeout'
 import { $connectionsRegistry } from '@/store/connection-registry-state'
 import {
   beginGatewaySwitch,
@@ -339,7 +344,7 @@ export async function selectConnection(connectionId: string, options: SelectConn
     // and a registry primary can differ from a legacy per-profile override.
     await withTimeout(
       openGatewayAgent(connectionId, targetProfile),
-      SWITCH_DIAL_TIMEOUT_MS,
+      targetConnection.kind === 'ssh' ? SECONDARY_BACKEND_BOOT_WAIT_TIMEOUT_MS : SWITCH_DIAL_TIMEOUT_MS,
       `Timed out connecting to "${targetConnection.label}".`
     )
 

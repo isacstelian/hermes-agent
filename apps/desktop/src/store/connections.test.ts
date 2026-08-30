@@ -2,6 +2,7 @@ import { atom } from 'nanostores'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { DesktopConnectionsRegistry } from '@/global'
+import { SECONDARY_BACKEND_BOOT_WAIT_TIMEOUT_MS } from '@/lib/with-timeout'
 
 import { deferred } from '../test/deferred'
 
@@ -552,6 +553,44 @@ describe('selectConnection', () => {
 
       expect(ensureGatewayAgent).toHaveBeenCalledWith('homelab', 'default', expect.anything())
       expect($connection.get()?.connectionId).toBe('homelab')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('lets a cold SSH source use the queue-aware descriptor budget', async () => {
+    vi.useFakeTimers()
+
+    try {
+      const sshRegistry: DesktopConnectionsRegistry = {
+        ...registry,
+        connections: [
+          registry.connections[0],
+          { id: 'imac', kind: 'ssh', label: 'iMac', tokenPreview: null, tokenSet: false }
+        ]
+      }
+
+      setConnectionsRegistry(sshRegistry)
+      $connection.set({ connectionId: 'local', mode: 'local' })
+      openGatewayAgent.mockImplementationOnce(() => new Promise<void>(() => undefined))
+
+      const outcome = selectConnection('imac').then(
+        () => 'resolved',
+        (error: Error) => error.message
+      )
+
+      let settled = false
+      void outcome.then(() => {
+        settled = true
+      })
+
+      await vi.advanceTimersByTimeAsync(20_000)
+      expect(settled).toBe(false)
+
+      await vi.advanceTimersByTimeAsync(SECONDARY_BACKEND_BOOT_WAIT_TIMEOUT_MS - 20_000)
+      expect(await outcome).toMatch(/Timed out connecting to "iMac"/)
+      expect(beginGatewaySwitch).not.toHaveBeenCalled()
+      expect($pendingConnectionId.get()).toBeNull()
     } finally {
       vi.useRealTimers()
     }

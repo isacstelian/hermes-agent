@@ -198,6 +198,59 @@ test('a reserved primary permit stays available while profile prewarms are queue
   assert.equal(maxRunning, 2)
 })
 
+test('caps the non-primary queue so the renderer cold timeout cannot orphan a later boot', async () => {
+  const coordinator = createBootstrapCoordinator({
+    maxConcurrent: 2,
+    maxQueuedNonPrimary: 1,
+    reservedPrimarySlots: 1
+  })
+
+  const firstGate = deferred()
+  const secondGate = deferred()
+  const started: string[] = []
+
+  const first = coordinator.start(
+    'pool-first',
+    'x',
+    async () => {
+      started.push('first')
+      await firstGate.promise
+    },
+    { managedScope: 'pool' }
+  )
+
+  const second = coordinator.start(
+    'pool-second',
+    'x',
+    async () => {
+      started.push('second')
+      await secondGate.promise
+    },
+    { managedScope: 'pool' }
+  )
+
+  const third = coordinator.start(
+    'pool-third',
+    'x',
+    async () => {
+      started.push('third')
+    },
+    { managedScope: 'pool' }
+  )
+
+  await assert.rejects(third, (error: any) => error.kind === 'busy')
+  assert.deepEqual(started, ['first'])
+
+  firstGate.resolve()
+  await first
+  await Promise.resolve()
+  assert.deepEqual(started, ['first', 'second'])
+
+  secondGate.resolve()
+  await second
+  assert.deepEqual(started, ['first', 'second'])
+})
+
 test('changed fingerprint waits for old rollback before starting', async () => {
   const coordinator = createBootstrapCoordinator()
   const gate = deferred()
