@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { RECONNECT_ATTEMPT_TIMEOUT_MS, SECONDARY_BACKEND_BOOT_WAIT_TIMEOUT_MS } from '@/lib/with-timeout'
+
 // Connection lifecycle for registry-scoped secondary gateways:
 //
 //  1. Removing a connection must dispose its secondaries — remote/cloud
@@ -170,10 +172,10 @@ describe('ensureGatewayForProfile — secondary connect failure surfaces (#81094
       settled = true
     })
 
-    await vi.advanceTimersByTimeAsync(20_000)
+    await vi.advanceTimersByTimeAsync(RECONNECT_ATTEMPT_TIMEOUT_MS)
     expect(settled).toBe(false)
 
-    await vi.advanceTimersByTimeAsync(55_000)
+    await vi.advanceTimersByTimeAsync(SECONDARY_BACKEND_BOOT_WAIT_TIMEOUT_MS - RECONNECT_ATTEMPT_TIMEOUT_MS)
     await pending
     expect(failure).toMatchObject({ message: 'Timed out connecting to profile "work"' })
   })
@@ -402,11 +404,26 @@ describe('secondary connection timeout (#93454)', () => {
 
     installDesktop({ getConnection })
 
-    const pending = expect(ensureGatewayForProfile('work')).rejects.toThrow('Timed out connecting to profile "work"')
+    const connection = ensureGatewayForProfile('work')
+    let settled = false
+    const pending = expect(connection).rejects.toThrow('Timed out connecting to profile "work"')
+
+    void connection.then(
+      () => {
+        settled = true
+      },
+      () => {
+        settled = true
+      }
+    )
 
     // The first secondary dial owns a cold backend boot, so it gets the longer
-    // boot budget. It must still reject instead of hanging forever.
-    await vi.advanceTimersByTimeAsync(75_000)
+    // outer budget. It must use the shared budget while still rejecting instead
+    // of hanging forever.
+    await vi.advanceTimersByTimeAsync(SECONDARY_BACKEND_BOOT_WAIT_TIMEOUT_MS - 1)
+    expect(settled).toBe(false)
+
+    await vi.advanceTimersByTimeAsync(1)
     await pending
   })
 
