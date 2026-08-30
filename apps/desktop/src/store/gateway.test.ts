@@ -500,6 +500,43 @@ describe('secondary connection timeout (#93454)', () => {
     expect(list).toHaveBeenCalledTimes(1)
   })
 
+  it('observes a fast descriptor rejection while the registry kind is loading', async () => {
+    $connectionsRegistry.set(null)
+
+    let resolveRegistry!: (registry: unknown) => void
+    const descriptorFailure = new Error('SSH bootstrap failed')
+    const getConnectionFor = vi.fn(() => Promise.reject(descriptorFailure))
+    const list = vi.fn(
+      () =>
+        new Promise(resolve => {
+          resolveRegistry = resolve
+        })
+    )
+    const unhandled: unknown[] = []
+    const onUnhandled = (reason: unknown): void => {
+      unhandled.push(reason)
+    }
+
+    process.on('unhandledRejection', onUnhandled)
+    installDesktop({ connections: { list }, getConnectionFor })
+
+    try {
+      const connection = openGatewayForAgent('imac', 'cmo')
+
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(unhandled).toEqual([])
+
+      resolveRegistry({
+        connections: [{ id: 'imac', kind: 'ssh', label: 'iMac' }],
+        primary: 'imac'
+      })
+
+      await expect(connection).rejects.toBe(descriptorFailure)
+    } finally {
+      process.off('unhandledRejection', onUnhandled)
+    }
+  })
+
   it.each(['cloud', 'local', 'remote'] as const)(
     'keeps the short cold budget for a %s route while the registry cache is loading',
     async kind => {

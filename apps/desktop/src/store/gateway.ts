@@ -540,6 +540,11 @@ async function openSecondary(entry: Secondary): Promise<void> {
         ? desktop.getConnectionFor({ connectionId: entry.connectionId, profile: entry.profile })
         : desktop.getConnection(entry.profile)
 
+    // The registry lookup below may take a full IPC round-trip before
+    // withTimeout attaches its rejection handler. Observe an eager descriptor
+    // failure now; the later await still receives and rethrows the same error.
+    void descriptorPromise.catch(() => {})
+
     const descriptorBudgetMs = reconnectingSocket
       ? RECONNECT_ATTEMPT_TIMEOUT_MS
       : await coldDescriptorTimeoutMs(entry)
