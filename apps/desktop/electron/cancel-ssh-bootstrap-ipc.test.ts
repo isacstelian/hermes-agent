@@ -119,12 +119,33 @@ describe('cancel SSH bootstrap IPC', () => {
   it('maps a published primary alias back to its real SSH scope', () => {
     const scope = backendScopeKey('imac', 'default')
 
-    const states = new Map<string, { primaryRegistryScope?: boolean; registryConnectionId?: string }>([
-      ['', { primaryRegistryScope: false, registryConnectionId: 'imac' }],
-      [scope, { primaryRegistryScope: false, registryConnectionId: 'imac' }],
-      ['unrelated', { primaryRegistryScope: true, registryConnectionId: 'other' }]
+    const states = new Map<
+      string,
+      { cancelScopes?: string[]; primaryRegistryScope?: boolean; registryConnectionId?: string }
+    >([
+      ['', { cancelScopes: [scope], primaryRegistryScope: false, registryConnectionId: 'imac' }],
+      [scope, { cancelScopes: [], primaryRegistryScope: false, registryConnectionId: 'imac' }],
+      ['unrelated', { cancelScopes: [scope], primaryRegistryScope: true, registryConnectionId: 'other' }]
     ])
 
     expect(sshTeardownScopesForRoute(states, 'imac', scope)).toEqual([scope, ''])
+  })
+
+  it('does not tear down a different primary profile on the same SSH connection', () => {
+    const requested = backendScopeKey('imac', 'default')
+    const research = backendScopeKey('imac', 'research')
+
+    const states = new Map([
+      [
+        'research',
+        {
+          cancelScopes: [research],
+          primaryRegistryScope: true,
+          registryConnectionId: 'imac'
+        }
+      ]
+    ])
+
+    expect(sshTeardownScopesForRoute(states, 'imac', requested)).toEqual([requested])
   })
 })

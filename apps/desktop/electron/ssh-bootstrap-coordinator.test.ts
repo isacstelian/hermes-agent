@@ -448,6 +448,82 @@ test('a primary join promotes a pool-first bootstrap and its cancel aliases', as
   assert.deepEqual(metadata.cancelScopes, [alias])
 })
 
+test('a primary join starts a queued pool bootstrap through the reserved slot', async () => {
+  const coordinator = createBootstrapCoordinator({ maxConcurrent: 2, reservedPrimarySlots: 1 })
+  const otherGate = deferred()
+  const targetGate = deferred()
+  let targetRuns = 0
+
+  const otherPool = coordinator.start('other', 'same', async () => otherGate.promise, { managedScope: 'pool' })
+
+  const targetPool = coordinator.start(
+    'target',
+    'same',
+    async () => {
+      targetRuns += 1
+      await targetGate.promise
+    },
+    { managedScope: 'pool' }
+  )
+
+  await Promise.resolve()
+  assert.equal(targetRuns, 0)
+
+  const primary = coordinator.start('target', 'same', async () => assert.fail('must coalesce'), {
+    managedScope: 'primary'
+  })
+
+  assert.equal(primary, targetPool)
+  await Promise.resolve()
+  assert.equal(targetRuns, 1)
+
+  targetGate.resolve()
+  otherGate.resolve()
+  await Promise.all([otherPool, primary])
+})
+
+test('concurrent cancellation callers share one drain and one force cleanup', async () => {
+  const coordinator = createBootstrapCoordinator()
+  const cleanupGate = deferred()
+  const runGate = deferred()
+  const alias = 'conn:imac::default'
+  let cleanupCalls = 0
+  let nextStarted = false
+
+  const running = coordinator.start(
+    '',
+    'same',
+    async lease => {
+      lease.onForceCleanup(async () => {
+        cleanupCalls += 1
+        await cleanupGate.promise
+        runGate.resolve()
+      })
+      await runGate.promise
+      lease.assertCurrent()
+    },
+    { cancelScopes: [alias], managedScope: 'primary' }
+  )
+
+  await Promise.resolve()
+  const first = coordinator.cancelAndWait(alias)
+  const second = coordinator.cancelAndWait(alias)
+
+  const next = coordinator.start('', 'next', async () => {
+    nextStarted = true
+  })
+
+  await Promise.resolve()
+  assert.equal(cleanupCalls, 1)
+  assert.equal(nextStarted, false)
+
+  cleanupGate.resolve()
+  await Promise.all([first, second])
+  await assert.rejects(running, (error: any) => error.kind === 'superseded')
+  await next
+  assert.equal(nextStarted, true)
+})
+
 test('cancelAndWait force-cleans pending resources before awaiting rollback', async () => {
   const coordinator = createBootstrapCoordinator()
   const gate = deferred()

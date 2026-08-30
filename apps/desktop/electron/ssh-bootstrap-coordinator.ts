@@ -149,7 +149,9 @@ function createBootstrapCoordinator({
 
     if (
       !primary &&
-      waiters.filter(waiter => !waiter.primary && !waiter.cancelled && !waiter.signal.aborted).length >=
+      waiters.filter(
+        waiter => waiter.metadata?.managedScope !== 'primary' && !waiter.cancelled && !waiter.signal.aborted
+      ).length >=
         nonPrimaryQueueLimit
     ) {
       return Promise.reject(busyError())
@@ -214,6 +216,7 @@ function createBootstrapCoordinator({
 
     if (current?.fingerprint === fingerprint) {
       mergeBootstrapMetadata(current.metadata, metadata)
+      pump()
 
       return current.promise
     }
@@ -289,6 +292,14 @@ function createBootstrapCoordinator({
   }
 
   async function cancelAndWait(scope) {
+    const existingDrain = drains.get(scope)
+
+    if (existingDrain) {
+      await existingDrain
+
+      return
+    }
+
     let release
 
     const barrier = new Promise<void>(resolve => {

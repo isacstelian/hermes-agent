@@ -32,6 +32,7 @@ interface CancelBootstrapDeps {
 }
 
 interface PublishedSshRouteState {
+  cancelScopes?: string[]
   primaryRegistryScope?: boolean
   registryConnectionId?: string
 }
@@ -46,7 +47,8 @@ function sshTeardownScopesForRoute(
   for (const [scope, state] of published) {
     if (
       (scope === '' || state?.primaryRegistryScope === true) &&
-      String(state.registryConnectionId || '').trim() === connectionId
+      String(state.registryConnectionId || '').trim() === connectionId &&
+      state.cancelScopes?.includes(requestedScope)
     ) {
       scopes.add(scope)
     }

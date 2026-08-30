@@ -10305,6 +10305,7 @@ async function bootstrapSshConnectionInner(profile, sshConfig, reuseToken, sourc
         registryConnectionId:
           metadata.registryConnectionId ||
           (typeof source === 'string' && source.startsWith('registry:') ? source.slice('registry:'.length) : ''),
+        cancelScopes: Array.isArray(metadata.cancelScopes) ? [...metadata.cancelScopes] : [],
         // Never infer primary ownership from a non-composite scope key: legacy
         // per-profile pools also use bare keys. Only startHermes' explicit call
         // site may label a registry-qualified SSH scope as the primary backend.
