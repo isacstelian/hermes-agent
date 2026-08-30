@@ -935,6 +935,8 @@ export interface DesktopRosterAgent {
 }
 
 export interface DesktopAgentRoster {
+  // Exact registry owner serving this window's ambient gateway, when known.
+  activeConnectionId?: string
   agents: DesktopRosterAgent[]
   sources: {
     connectionId: string

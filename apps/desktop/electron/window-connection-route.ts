@@ -6,6 +6,14 @@ export interface WindowConnectionRoute {
   registryScoped: boolean
 }
 
+interface PublishedSshRouteState {
+  registryConnectionId?: string
+}
+
+interface RegistryConnectionIdentity {
+  id: string
+}
+
 export function normalizeWindowConnectionRoute(value: unknown): WindowConnectionRoute | null {
   if (!value || typeof value !== 'object') {
     return null
@@ -38,6 +46,27 @@ export function registrySshScopeForWindowRoute(
   }
 
   return backendScopeKey(route.connectionId, route.profile)
+}
+
+/** Exact registry owner of the backend serving a window's ambient requests.
+ * Registry-scoped routes name themselves. Legacy SSH routes use the identity
+ * captured when that live tunnel was published. The mutable registry primary
+ * is never evidence about an already-running idless descriptor. */
+export function activeRosterConnectionId(
+  route: WindowConnectionRoute | null | undefined,
+  connections: RegistryConnectionIdentity[],
+  sshState: PublishedSshRouteState | null | undefined
+): null | string {
+  const known = new Set(connections.map(connection => String(connection?.id || '').trim()).filter(Boolean))
+  const routed = route?.registryScoped ? String(route.connectionId || '').trim() : ''
+
+  if (routed) {
+    return known.has(routed) ? routed : null
+  }
+
+  const published = String(sshState?.registryConnectionId || '').trim()
+
+  return published && known.has(published) ? published : null
 }
 
 export class WindowConnectionRouteRegistry {

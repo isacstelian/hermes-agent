@@ -623,9 +623,10 @@ interface UnionAgentRow {
   targetProfile?: string
 }
 
-/** The union roster payload. `primaryConnectionId` is served by Electron but
- *  absent from the SDK's `DesktopAgentRoster`, so the merge reads it here. */
+/** Shell-only union fields may lead the plugin SDK type during a Desktop
+ * compatibility rollout, so the merger declares its additive envelope here. */
 interface UnionRoster {
+  activeConnectionId?: string
   agents?: UnionAgentRow[]
   primaryConnectionId?: string
   sources?: GatewaySource[]
@@ -699,11 +700,12 @@ export function useRoster() {
         try {
           const union = await host.agents()
           const previous: RosterRow[] = $lastRoster.get().filter(row => !row?.ghost)
+          const exactActiveConnectionId = String(union?.activeConnectionId || '').trim()
 
           const merged = mergeMultiSourceRoster(
             local,
             union,
-            activeConnectionId,
+            exactActiveConnectionId || activeConnectionId,
             previous,
             activeConnectionMode,
             activeConnectionKey
@@ -772,8 +774,8 @@ export function cachedUnionRoster(): RosterSnapshot | null {
 
 /** Merge the union agent roster (host.agents) over the active gateway's
  *  profiles.list. Active-source rows — matched by the LIVE connection id,
- *  falling back to the roster's primaryConnectionId, then the legacy
- *  kind==='local' rule on older desktops — are the agents profiles.list
+ *  then a uniquely provable legacy source, then the kind==='local' rule on
+ *  older desktops — are the agents profiles.list
  *  already returned: they only ANNOTATE the rich rows (handle, connection
  *  fields); rich fields stay authoritative and they are NOT duplicated.
  *  Rows from other sources become new roster entries tagged with their
@@ -813,12 +815,11 @@ function mergeMultiSourceRoster(
 
   let activeId = liveId || previousAmbientId || (liveProvided ? '' : String(union?.primaryConnectionId || '').trim())
 
-  // Migrated remote-primary windows can still expose a legacy remote
-  // descriptor without connectionId. That produces a null live id even
-  // though profiles.list is answering from the registry primary. Infer the
-  // primary only when its inventory matches the rich rows and the local
-  // inventory does not. A genuinely local window has a matching local row,
-  // so it keeps the null-is-local behavior used after clicking This device.
+  // Older Desktop builds cannot publish the exact source serving an idless
+  // remote descriptor. Infer their primary only when it is the sole remote
+  // source whose inventory matches the rich rows. Settings can change the
+  // registry primary while the old gateway remains active, so a matching but
+  // non-unique primary is not proof of ownership.
   if (!activeId && liveProvided) {
     const primaryId = String(union?.primaryConnectionId || '').trim()
     const richNames = new Set(localProfiles.map(profile => String(profile?.name || '').trim()).filter(Boolean))
@@ -832,10 +833,23 @@ function mergeMultiSourceRoster(
         String(agent?.connectionId || '').trim() === primaryId && richNames.has(String(agent?.profile || '').trim())
     )
 
+    const matchingRemoteIds = new Set(
+      agents
+        .filter(agent => agent?.connectionKind !== 'local' && richNames.has(String(agent?.profile || '').trim()))
+        .map(agent => String(agent?.connectionId || '').trim())
+        .filter(Boolean)
+    )
+
     const descriptorIdentifiesRemote = activeConnectionMode === 'remote'
     const descriptorModeUnavailable = activeConnectionMode == null
+    const primaryIsOnlyMatchingRemote = matchingRemoteIds.size === 1 && matchingRemoteIds.has(primaryId)
 
-    if (primaryId && primaryMatches && (descriptorIdentifiesRemote || (descriptorModeUnavailable && !localMatches))) {
+    if (
+      primaryId &&
+      primaryMatches &&
+      primaryIsOnlyMatchingRemote &&
+      (descriptorIdentifiesRemote || (descriptorModeUnavailable && !localMatches))
+    ) {
       activeId = primaryId
     }
   }

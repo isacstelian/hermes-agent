@@ -400,7 +400,11 @@ import {
 import { fetchMarketplaceThemes, searchMarketplaceThemes } from './vscode-marketplace'
 import { createWakeIndicatorWindowController } from './wake-indicator-window'
 import { enumerateWindowsFrontToBack, enumerationFailed, readWindowBelow } from './window-below'
-import { registrySshScopeForWindowRoute, WindowConnectionRouteRegistry } from './window-connection-route'
+import {
+  activeRosterConnectionId,
+  registrySshScopeForWindowRoute,
+  WindowConnectionRouteRegistry
+} from './window-connection-route'
 import { installWindowRendererLifecycle } from './window-renderer-lifecycle'
 import { createWindowRevealController } from './window-reveal'
 import {
@@ -15111,17 +15115,25 @@ async function enumerateRegistryAgentSources(registry = readDesktopConnectionsRe
   )
 }
 
-ipcMain.handle('hermes:agents:roster', async () => {
+ipcMain.handle('hermes:agents:roster', async event => {
   const registry = readDesktopConnectionsRegistry()
   const enumerations = await enumerateRegistryAgentSources(registry)
+  const windowRoute = windowConnectionRoutes.get(event.sender.id)
+
+  const activeSshState = windowRoute?.registryScoped
+    ? null
+    : sshConnections.get(sshScopeKey(windowRoute?.profile ?? primaryProfileKey()))
+
+  const activeConnectionId = activeRosterConnectionId(windowRoute, registry.connections, activeSshState)
 
   return {
     agents: buildAgentRoster(enumerations, { primaryConnectionId: registry.primary }),
-    // The active gateway owns the renderer's profiles.list — union agents
-    // that report THIS connection are the same identities, not extra rows.
-    // Expose the primary id so the plugin merger can annotate them in place
-    // instead of appending duplicates (remote-only desktops doubled every
-    // bot otherwise; see #88344).
+    // Exact owner of this window's already-running ambient gateway. A legacy
+    // idless SSH descriptor keeps the source captured when its tunnel was
+    // published, even if Settings changes the mutable registry primary.
+    ...(activeConnectionId ? { activeConnectionId } : {}),
+    // Compatibility hint for older renderer mergers that predate exact
+    // per-window ownership.
     primaryConnectionId: registry.primary,
     sources: enumerations.map(({ connection, error, installId, profiles }) => ({
       connectionId: connection.id,

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { test } from 'vitest'
 
 import {
+  activeRosterConnectionId,
   normalizeWindowConnectionRoute,
   registrySshScopeForWindowRoute,
   WindowConnectionRouteRegistry
@@ -119,4 +120,30 @@ test('uses the canonical default profile scope when a registry SSH route has no 
     ),
     'conn:source-b::default'
   )
+})
+
+test('reports the exact registry-scoped owner of a window roster', () => {
+  assert.equal(
+    activeRosterConnectionId(
+      { connectionId: 'source-b', profile: 'default', registryScoped: true },
+      [{ id: 'source-a' }, { id: 'source-b' }],
+      { registryConnectionId: 'source-a' }
+    ),
+    'source-b'
+  )
+})
+
+test('keeps a live legacy SSH owner after Settings changes registry primary', () => {
+  assert.equal(
+    activeRosterConnectionId(
+      { connectionId: null, profile: 'default', registryScoped: false },
+      [{ id: 'active-old' }, { id: 'new-primary' }],
+      { registryConnectionId: 'active-old' }
+    ),
+    'active-old'
+  )
+})
+
+test('does not publish a retired route identity', () => {
+  assert.equal(activeRosterConnectionId(null, [{ id: 'new-primary' }], { registryConnectionId: 'active-old' }), null)
 })

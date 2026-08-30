@@ -67,6 +67,7 @@ interface UnionAgent {
 }
 
 interface Union {
+  activeConnectionId?: string
   agents: UnionAgent[]
   primaryConnectionId?: string
   sources?: Array<{ connectionId: string; error?: string; kind: string; reachable?: boolean }>
@@ -566,7 +567,7 @@ describe('a null live id', () => {
 
     const first = await mergedRoster(
       { profiles: [{ last_session: { id: 'rich-from-active-old' }, name: 'default' }] },
-      { agents, primaryConnectionId: 'active-old' },
+      { activeConnectionId: 'active-old', agents, primaryConnectionId: 'active-old' },
       null,
       'remote',
       connectionKey
@@ -576,7 +577,7 @@ describe('a null live id', () => {
 
     const afterPrimaryEdit = await mergedRoster(
       { profiles: [{ last_session: { id: 'rich-from-active-old' }, name: 'default' }] },
-      { agents, primaryConnectionId: 'new-primary' },
+      { activeConnectionId: 'active-old', agents, primaryConnectionId: 'new-primary' },
       null,
       'remote',
       connectionKey
@@ -588,6 +589,65 @@ describe('a null live id', () => {
       last_session: { id: 'rich-from-active-old' }
     })
     expect(afterPrimaryEdit.find(row => row.connectionId === 'new-primary')).toMatchObject({ remoteSource: true })
+  })
+
+  it('uses Electron live ownership on the first idless roster after Settings changes primary', async () => {
+    const rows = await mergedRoster(
+      { profiles: [{ last_session: { id: 'rich-from-active-old' }, name: 'default' }] },
+      {
+        activeConnectionId: 'active-old',
+        agents: [
+          {
+            connectionId: 'active-old',
+            connectionKind: 'remote',
+            connectionLabel: 'Old',
+            handle: 'default-old',
+            profile: 'default'
+          },
+          {
+            connectionId: 'new-primary',
+            connectionKind: 'remote',
+            connectionLabel: 'New',
+            handle: 'default-new',
+            profile: 'default'
+          }
+        ],
+        primaryConnectionId: 'new-primary'
+      },
+      null,
+      'remote',
+      'remote:ssh:active-old'
+    )
+
+    expect(rows.find(row => !row.remoteSource)).toMatchObject({
+      connectionId: 'active-old',
+      last_session: { id: 'rich-from-active-old' }
+    })
+    expect(rows.find(row => row.connectionId === 'new-primary')).toMatchObject({ remoteSource: true })
+  })
+
+  it('does not guess the new primary when an older shell cannot prove idless ownership', async () => {
+    const rows = await mergedRoster(
+      { profiles: [{ last_session: { id: 'rich-from-active-old' }, name: 'default' }] },
+      {
+        agents: [
+          { connectionId: 'active-old', connectionKind: 'remote', handle: 'default-old', profile: 'default' },
+          { connectionId: 'new-primary', connectionKind: 'remote', handle: 'default-new', profile: 'default' }
+        ],
+        primaryConnectionId: 'new-primary'
+      },
+      null,
+      'remote',
+      'remote:ssh:active-old'
+    )
+
+    const ambient = rows.find(row => !row.remoteSource)
+
+    expect(ambient).toMatchObject({
+      ambientSource: true,
+      last_session: { id: 'rich-from-active-old' }
+    })
+    expect(ambient?.connectionId).toBeUndefined()
   })
 
   it('does not reuse the previous idless remote identity after the descriptor changes', async () => {
@@ -603,6 +663,7 @@ describe('a null live id', () => {
     const rows = await mergedRoster(
       { profiles: [{ last_session: { id: 'rich-from-host-b' }, name: 'default' }] },
       {
+        activeConnectionId: 'host-b',
         agents: [
           { connectionId: 'host-a', connectionKind: 'remote', handle: 'default-a', profile: 'default' },
           { connectionId: 'host-b', connectionKind: 'remote', handle: 'default-b', profile: 'default' }
