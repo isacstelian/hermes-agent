@@ -137,6 +137,7 @@ import {
   parseBackendScopeKey,
   reconcileAppliedGlobalConnection,
   reconcileRegistryDrift,
+  registryOwnedSshScopes,
   registrySourceOwnsPrimaryBackend,
   rememberSshEnumeration,
   removeConnection,
@@ -11905,22 +11906,13 @@ async function resumeManagedSshRecoveries() {
 async function stopRegistryConnectionBackends(connectionId) {
   const prefix = backendScopePrefix(connectionId)
 
-  for (const key of [...backendPool.keys()]) {
-    if (String(key).startsWith(prefix)) {
-      stopPoolBackend(key)
-    }
-  }
+  const poolStops = [...backendPool.keys()]
+    .filter(key => String(key).startsWith(prefix))
+    .map(key => stopPoolBackend(key))
 
-  const sshScopes = new Set([
-    ...[...sshConnections.keys()].filter(scope => String(scope).startsWith(prefix)),
-    ...[...sshBootstrapCoordinator.active].map(entry => entry.scope).filter(scope => String(scope).startsWith(prefix))
-  ])
+  const sshScopes = registryOwnedSshScopes(sshConnections, sshBootstrapCoordinator.active, connectionId)
 
-  await Promise.all(
-    [...sshScopes].map(async scope => {
-      await cancelSshScopesAndWait(scope, connectionId)
-    })
-  )
+  await Promise.all([...poolStops, ...sshScopes.map(scope => cancelSshScopesAndWait(scope, connectionId))])
 }
 
 // Mark a pool profile as recently used so the idle reaper spares it. The
