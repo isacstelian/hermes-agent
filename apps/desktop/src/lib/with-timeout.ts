@@ -15,11 +15,12 @@ export const BACKEND_BOOT_WAIT_TIMEOUT_MS = 45_000
 // caller forever. Every caller of these bounds them with this shared budget.
 export const RECONNECT_ATTEMPT_TIMEOUT_MS = 20_000
 
-// A secondary's FIRST descriptor request can wait behind one 75s queued SSH
-// bootstrap, then own its own 75s ready window plus fingerprint, dial, and
-// platform-probe overhead. This outer renderer budget must outlive that work;
-// it does not change the inner SSH ready or dispatch-probe timeouts. Keep later
-// re-dials on the short reconnect budget above.
+// A registry SSH secondary's FIRST descriptor request can wait behind one 75s
+// queued SSH bootstrap, then own its own 75s ready window plus fingerprint,
+// dial, and platform-probe overhead. This outer renderer budget must outlive
+// that work; it does not change the inner SSH ready or dispatch-probe timeouts.
+// Non-SSH cold descriptors and every later re-dial keep the short reconnect
+// budget above.
 export const SECONDARY_BACKEND_BOOT_WAIT_TIMEOUT_MS = 180_000
 
 /** Rejection raised by withTimeout. The bounded work is NOT cancelled — the

@@ -9,6 +9,7 @@ import {
   SECONDARY_BACKEND_BOOT_WAIT_TIMEOUT_MS,
   withTimeout
 } from '@/lib/with-timeout'
+import { $connectionsRegistry } from '@/store/connection-registry-state'
 import { markNativeNotifyBaseline } from '@/store/notify-baseline'
 import { setConnection, setGatewayState } from '@/store/session'
 
@@ -437,6 +438,16 @@ function clearTimer(entry: Secondary): void {
   }
 }
 
+function coldDescriptorTimeoutMs(entry: Secondary): number {
+  const connectionId = entry.connectionId?.trim()
+
+  const connection = connectionId
+    ? $connectionsRegistry.get()?.connections.find(candidate => candidate.id === connectionId)
+    : null
+
+  return connection?.kind === 'ssh' ? SECONDARY_BACKEND_BOOT_WAIT_TIMEOUT_MS : RECONNECT_ATTEMPT_TIMEOUT_MS
+}
+
 async function openSecondary(entry: Secondary): Promise<void> {
   const desktop = window.hermesDesktop
 
@@ -467,7 +478,7 @@ async function openSecondary(entry: Secondary): Promise<void> {
 
     const descriptorTimeoutMs = reconnectingSocket
       ? RECONNECT_ATTEMPT_TIMEOUT_MS
-      : SECONDARY_BACKEND_BOOT_WAIT_TIMEOUT_MS
+      : coldDescriptorTimeoutMs(entry)
 
     let reconcileBusyAfterOpen: null | (() => void) = null
 

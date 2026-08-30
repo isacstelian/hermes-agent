@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { RECONNECT_ATTEMPT_TIMEOUT_MS, SECONDARY_BACKEND_BOOT_WAIT_TIMEOUT_MS } from '@/lib/with-timeout'
+import { $connectionsRegistry } from '@/store/connection-registry-state'
 
 // Connection lifecycle for registry-scoped secondary gateways:
 //
@@ -69,6 +70,7 @@ beforeEach(() => {
 
 afterEach(() => {
   closeSecondaryGateways()
+  $connectionsRegistry.set(null)
   gatewayMocks.instances.length = 0
   vi.clearAllMocks()
   vi.useRealTimers()
@@ -131,7 +133,7 @@ describe('ensureGatewayForProfile — secondary connect failure surfaces (#81094
     expect(gatewayMocks.instances[0].close).toHaveBeenCalledTimes(1)
   })
 
-  it('gives a recreated secondary the cold-boot budget after pruning', async () => {
+  it('keeps the short descriptor budget for a recreated non-SSH secondary', async () => {
     vi.useFakeTimers()
 
     let redial = false
@@ -173,10 +175,10 @@ describe('ensureGatewayForProfile — secondary connect failure surfaces (#81094
       settled = true
     })
 
-    await vi.advanceTimersByTimeAsync(RECONNECT_ATTEMPT_TIMEOUT_MS)
+    await vi.advanceTimersByTimeAsync(RECONNECT_ATTEMPT_TIMEOUT_MS - 1)
     expect(settled).toBe(false)
 
-    await vi.advanceTimersByTimeAsync(SECONDARY_BACKEND_BOOT_WAIT_TIMEOUT_MS - RECONNECT_ATTEMPT_TIMEOUT_MS)
+    await vi.advanceTimersByTimeAsync(1)
     await pending
     expect(failure).toMatchObject({ message: 'Timed out connecting to profile "work"' })
   })
@@ -448,10 +450,45 @@ describe('secondary connection timeout (#93454)', () => {
       }
     )
 
-    // The first secondary dial owns a cold backend boot, so it gets the longer
-    // outer budget. It must use the shared budget while still rejecting instead
-    // of hanging forever.
-    await vi.advanceTimersByTimeAsync(SECONDARY_BACKEND_BOOT_WAIT_TIMEOUT_MS - 1)
+    // Local, URL, and cloud routes retain the original short IPC bound. Only a
+    // registry SSH cold boot gets the longer queue-aware budget.
+    await vi.advanceTimersByTimeAsync(RECONNECT_ATTEMPT_TIMEOUT_MS - 1)
+    expect(settled).toBe(false)
+
+    await vi.advanceTimersByTimeAsync(1)
+    await pending
+  })
+
+  it('keeps the longer cold descriptor budget only for registry SSH routes', async () => {
+    vi.useFakeTimers()
+    $connectionsRegistry.set({
+      connections: [{ id: 'imac', kind: 'ssh', label: 'iMac' }],
+      lastUsed: 'imac',
+      primary: 'imac'
+    } as never)
+
+    const getConnectionFor = vi.fn(() => new Promise(() => undefined))
+    installDesktop({ getConnectionFor })
+
+    const connection = openGatewayForAgent('imac', 'cmo')
+    let settled = false
+    const pending = expect(connection).rejects.toThrow('Timed out connecting to profile "cmo"')
+
+    void connection.then(
+      () => {
+        settled = true
+      },
+      () => {
+        settled = true
+      }
+    )
+
+    await vi.advanceTimersByTimeAsync(RECONNECT_ATTEMPT_TIMEOUT_MS)
+    expect(settled).toBe(false)
+
+    await vi.advanceTimersByTimeAsync(
+      SECONDARY_BACKEND_BOOT_WAIT_TIMEOUT_MS - RECONNECT_ATTEMPT_TIMEOUT_MS - 1
+    )
     expect(settled).toBe(false)
 
     await vi.advanceTimersByTimeAsync(1)
