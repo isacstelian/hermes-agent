@@ -22,6 +22,7 @@ const { ensureBotMetadataMock, hostMock, storageMock } = vi.hoisted(() => ({
     requestProfile: vi.fn(),
     state: {
       connectionId: { get: vi.fn(() => 'local') },
+      connectionMode: { get: vi.fn<() => null | 'local' | 'remote'>(() => 'local') },
       focusedSessionOwner: null,
       profile: { get: () => 'default' }
     }
@@ -54,6 +55,7 @@ beforeEach(() => {
   $botMeta.set({})
   storageMock.set.mockResolvedValue(undefined)
   hostMock.state.connectionId.get.mockReturnValue('local')
+  hostMock.state.connectionMode.get.mockReturnValue('local')
   hostMock.request.mockImplementation(async (method: string, params: Record<string, unknown>) => {
     calls.push({ method, params: structuredClone(params ?? {}) })
 
@@ -166,6 +168,10 @@ describe('duplicating a bot', () => {
 })
 
 describe('roster avatar sync routing', () => {
+  beforeEach(() => {
+    hostMock.state.connectionMode.get.mockReturnValue('remote')
+  })
+
   it('keeps active-source avatar reads on the ambient gateway for a 31-profile roster', () => {
     const roster = Array.from({ length: 31 }, (_, index) => {
       const name = `agent-${index}`
@@ -255,6 +261,12 @@ describe('roster avatar sync routing', () => {
       connectionId: 'imac-hermes',
       has_avatar: true,
       name: 'legacy-agent',
+      route: {
+        connectionId: 'imac-hermes',
+        mode: 'remote' as const,
+        profile: 'legacy-agent',
+        targetProfile: 'legacy-agent'
+      },
       sourceScoped: true
     } as RosterRow
 
@@ -268,6 +280,37 @@ describe('roster avatar sync routing', () => {
       name: 'legacy-agent'
     })
     expect(hostMock.requestProfile).not.toHaveBeenCalled()
+  })
+
+  it('does not read a stale legacy remote avatar after switching to an idless local gateway', () => {
+    const bot = {
+      ambientSource: true,
+      connectionId: 'imac-hermes',
+      has_avatar: true,
+      name: 'legacy-agent',
+      route: {
+        connectionId: 'imac-hermes',
+        mode: 'remote' as const,
+        profile: 'legacy-agent',
+        targetProfile: 'legacy-agent'
+      },
+      sourceScoped: true
+    } as RosterRow
+
+    hostMock.state.connectionId.get.mockReturnValue('')
+    hostMock.state.connectionMode.get.mockReturnValue('local')
+
+    pullServerAvatars([bot])
+
+    expect(hostMock.request).not.toHaveBeenCalled()
+
+    hostMock.state.connectionMode.get.mockReturnValue('remote')
+    pullServerAvatars([bot])
+
+    expect(hostMock.request).toHaveBeenCalledWith('profiles.get_asset', {
+      asset: 'avatar',
+      name: 'legacy-agent'
+    })
   })
 
   it('does not push a stale local avatar onto the newly active gateway', () => {

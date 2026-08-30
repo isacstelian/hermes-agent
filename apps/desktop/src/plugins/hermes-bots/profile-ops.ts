@@ -50,6 +50,15 @@ function usesRemoteAvatarGateway(bot: RosterRow) {
 function ambientAvatarGatewayMatches(bot: RosterRow) {
   const ownerId = String(bot.connectionId || '').trim()
   const ambientId = String(host.state.connectionId?.get?.() || '').trim()
+  const ownerMode = bot.route?.mode
+  const ambientMode = host.state.connectionMode?.get?.()
+
+  // Legacy remote descriptors omit their connection id. The transport mode
+  // still changes on remote -> local switches, so fail closed while a stale
+  // remote roster row is waiting for the new source's roster to arrive.
+  if (ownerMode && ambientMode !== ownerMode) {
+    return false
+  }
 
   if (ownerId && ambientId) {
     return ownerId === ambientId
