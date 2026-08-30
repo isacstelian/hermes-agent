@@ -377,6 +377,38 @@ test('cancelAndWait drains only the requested scope', async () => {
   assert.equal(await second, 'second')
 })
 
+test('cancelAndWait drains a primary bootstrap through its registry-scope alias', async () => {
+  const coordinator = createBootstrapCoordinator()
+  const gate = deferred()
+  const alias = 'conn:imac::default'
+
+  const primary = coordinator.start(
+    '',
+    'x',
+    async lease => {
+      await gate.promise
+      lease.assertCurrent()
+    },
+    { cancelScopes: [alias], managedScope: 'primary' }
+  )
+
+  await Promise.resolve()
+  const drain = coordinator.cancelAndWait(alias)
+  let nextStarted = false
+  const next = coordinator.start('', 'next', async () => {
+    nextStarted = true
+  })
+
+  await Promise.resolve()
+  assert.equal(nextStarted, false)
+
+  gate.resolve()
+  await drain
+  await assert.rejects(primary, (error: any) => error.kind === 'superseded')
+  await next
+  assert.equal(nextStarted, true)
+})
+
 test('cancelAndWait force-cleans pending resources before awaiting rollback', async () => {
   const coordinator = createBootstrapCoordinator()
   const gate = deferred()

@@ -87,6 +87,7 @@ import {
   buildBrowserWindowUrl
 } from './browser-windows'
 import { detectBundleSkew } from './bundle-skew'
+import { registerCancelSshBootstrapIpc } from './cancel-ssh-bootstrap-ipc'
 import { applyConnectionChange, teardownSshState } from './connection-apply'
 import {
   apiRequestRegistryConnectionId,
@@ -10431,6 +10432,7 @@ async function resolveRemoteBackend(profile, options: { poolKey?: string; primar
       persistenceSource,
       undefined,
       {
+        cancelScopes: [backendScopeKey(source.id, profileKey)],
         managedScope: 'primary',
         managedUpdateCorrelation: managedPrimary.correlationId,
         primaryRegistryScope: true,
@@ -10471,6 +10473,8 @@ async function resolveRemoteBackend(profile, options: { poolKey?: string; primar
       route.source,
       undefined,
       {
+        cancelScopes:
+          options.primary && route.connectionId ? [backendScopeKey(route.connectionId, profileKey)] : [],
         managedScope: options.primary ? 'primary' : options.poolKey ? 'pool' : 'transient',
         poolKey: options.poolKey || '',
         primaryRegistryScope: options.primary === true && Boolean(route.connectionId),
@@ -14217,23 +14221,12 @@ ipcMain.handle('hermes:connection:for', async (_event, payload) => {
 
   return { ...connection, connectionId: id, registryScoped: true }
 })
-ipcMain.handle('hermes:connections:cancel-bootstrap', async (_event, payload) => {
-  const registry = readDesktopConnectionsRegistry()
-  const connectionId = String(payload?.connectionId || '').trim()
-  const profile = String(payload?.profile || '').trim() || 'default'
-  const source = registry.connections.find(connection => connection.id === connectionId)
-
-  if (!source || source.kind !== 'ssh') {
-    return { cancelled: false, ok: true }
-  }
-
-  const scope = backendScopeKey(connectionId, profile)
-
-  await sshBootstrapCoordinator.cancelAndWait(scope)
-  await stopPoolBackend(scope)
-  await teardownSshConnection(scope)
-
-  return { cancelled: true, ok: true }
+registerCancelSshBootstrapIpc(ipcMain, {
+  cancelAndWait: scope => sshBootstrapCoordinator.cancelAndWait(scope),
+  readRegistry: readDesktopConnectionsRegistry,
+  scopeKey: backendScopeKey,
+  stopPoolBackend,
+  teardownSshConnection
 })
 
 const windowConnectionRoutes = new WindowConnectionRouteRegistry()

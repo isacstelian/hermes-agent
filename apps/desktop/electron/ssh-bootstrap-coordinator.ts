@@ -238,7 +238,11 @@ function createBootstrapCoordinator({
   }
 
   function cancel(scope) {
-    pending.get(scope)?.controller.abort()
+    for (const entry of active) {
+      if (entry.scope === scope || entry.metadata?.cancelScopes?.includes(scope)) {
+        entry.controller.abort()
+      }
+    }
   }
 
   async function cancelAndWait(scope) {
@@ -248,8 +252,17 @@ function createBootstrapCoordinator({
       release = resolve
     })
 
-    drains.set(scope, barrier)
-    const entries = [...active].filter(entry => entry.scope === scope)
+    const entries = [...active].filter(
+      entry => entry.scope === scope || entry.metadata?.cancelScopes?.includes(scope)
+    )
+    const drainScopes = new Set([
+      scope,
+      ...entries.flatMap(entry => [entry.scope, ...(entry.metadata?.cancelScopes || [])])
+    ])
+
+    for (const drainScope of drainScopes) {
+      drains.set(drainScope, barrier)
+    }
 
     for (const entry of entries) {
       entry.controller.abort()
@@ -263,8 +276,10 @@ function createBootstrapCoordinator({
       await Promise.allSettled(entries.flatMap(entry => [...entry.forceCleanups]).map(cleanup => cleanup()))
       await Promise.allSettled(entries.map(entry => entry.promise))
     } finally {
-      if (drains.get(scope) === barrier) {
-        drains.delete(scope)
+      for (const drainScope of drainScopes) {
+        if (drains.get(drainScope) === barrier) {
+          drains.delete(drainScope)
+        }
       }
 
       release()
