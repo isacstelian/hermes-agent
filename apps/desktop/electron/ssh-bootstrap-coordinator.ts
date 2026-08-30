@@ -36,6 +36,32 @@ function bootstrapPriority(metadata) {
   return metadata?.managedScope === 'primary' ? 1 : 0
 }
 
+function mergeBootstrapMetadata(current, incoming) {
+  if (!incoming || current === incoming) {
+    return current
+  }
+
+  const cancelScopes = new Set([...(current.cancelScopes || []), ...(incoming.cancelScopes || [])])
+
+  current.cancelScopes = [...cancelScopes]
+
+  if (bootstrapPriority(incoming) > bootstrapPriority(current)) {
+    current.managedScope = incoming.managedScope
+    current.managedUpdateCorrelation = incoming.managedUpdateCorrelation || current.managedUpdateCorrelation
+    current.registryConnectionId = incoming.registryConnectionId || current.registryConnectionId
+  }
+
+  if (incoming.primaryRegistryScope === true) {
+    current.primaryRegistryScope = true
+  }
+
+  if (!current.registryConnectionId && incoming.registryConnectionId) {
+    current.registryConnectionId = incoming.registryConnectionId
+  }
+
+  return current
+}
+
 function createBootstrapCoordinator({
   maxConcurrent = Number.POSITIVE_INFINITY,
   maxQueuedNonPrimary = Number.POSITIVE_INFINITY,
@@ -80,7 +106,10 @@ function createBootstrapCoordinator({
 
   function pump() {
     while (running < concurrency && waiters.length > 0) {
-      waiters.sort((left, right) => right.priority - left.priority || left.sequence - right.sequence)
+      waiters.sort(
+        (left, right) =>
+          bootstrapPriority(right.metadata) - bootstrapPriority(left.metadata) || left.sequence - right.sequence
+      )
 
       for (let index = waiters.length - 1; index >= 0; index -= 1) {
         const waiter = waiters[index]
@@ -90,7 +119,9 @@ function createBootstrapCoordinator({
         }
       }
 
-      const waiterIndex = waiters.findIndex(waiter => waiter.primary || runningNonPrimary < nonPrimaryConcurrency)
+      const waiterIndex = waiters.findIndex(
+        waiter => waiter.metadata?.managedScope === 'primary' || runningNonPrimary < nonPrimaryConcurrency
+      )
 
       if (waiterIndex < 0) {
         return
@@ -98,13 +129,14 @@ function createBootstrapCoordinator({
 
       const [waiter] = waiters.splice(waiterIndex, 1)
       waiter.signal.removeEventListener('abort', waiter.onAbort)
+      const primary = waiter.metadata?.managedScope === 'primary'
       running += 1
 
-      if (!waiter.primary) {
+      if (!primary) {
         runningNonPrimary += 1
       }
 
-      waiter.launch()
+      waiter.launch(primary)
     }
   }
 
@@ -127,20 +159,19 @@ function createBootstrapCoordinator({
       const waiter: any = {
         cancelled: false,
         launch: null,
+        metadata,
         onAbort: null,
-        primary,
-        priority: bootstrapPriority(metadata),
         sequence: waiterSequence++,
         signal
       }
 
-      waiter.launch = () => {
+      waiter.launch = runningAsPrimary => {
         let result
 
         try {
           result = run()
         } catch (error) {
-          releasePermit(waiter.primary)
+          releasePermit(runningAsPrimary)
           reject(error)
 
           return
@@ -148,11 +179,11 @@ function createBootstrapCoordinator({
 
         Promise.resolve(result).then(
           value => {
-            releasePermit(waiter.primary)
+            releasePermit(runningAsPrimary)
             resolve(value)
           },
           error => {
-            releasePermit(waiter.primary)
+            releasePermit(runningAsPrimary)
             reject(error)
           }
         )
@@ -182,6 +213,8 @@ function createBootstrapCoordinator({
     const current = pending.get(scope)
 
     if (current?.fingerprint === fingerprint) {
+      mergeBootstrapMetadata(current.metadata, metadata)
+
       return current.promise
     }
 
@@ -209,7 +242,17 @@ function createBootstrapCoordinator({
 
     const drain = drains.get(scope) || Promise.resolve()
     const predecessor = current ? Promise.allSettled([current.promise, drain]) : drain
-    const entry: any = { controller, fingerprint, forceCleanups, generation, metadata, promise: null, scope }
+    const entryMetadata = metadata && typeof metadata === 'object' ? metadata : {}
+
+    const entry: any = {
+      controller,
+      fingerprint,
+      forceCleanups,
+      generation,
+      metadata: entryMetadata,
+      promise: null,
+      scope
+    }
 
     const promise = predecessor
       .then(() => {
@@ -219,7 +262,7 @@ function createBootstrapCoordinator({
           lease.assertCurrent()
 
           return run(lease)
-        }, metadata)
+        }, entryMetadata)
       })
       .finally(() => {
         forceCleanups.clear()
@@ -255,6 +298,7 @@ function createBootstrapCoordinator({
     const entries = [...active].filter(
       entry => entry.scope === scope || entry.metadata?.cancelScopes?.includes(scope)
     )
+
     const drainScopes = new Set([
       scope,
       ...entries.flatMap(entry => [entry.scope, ...(entry.metadata?.cancelScopes || [])])

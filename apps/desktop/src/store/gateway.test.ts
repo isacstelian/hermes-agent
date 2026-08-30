@@ -231,6 +231,46 @@ describe('ensureGatewayForProfile — secondary connect failure surfaces (#81094
     expect(failure).toMatchObject({ message: 'Timed out connecting to profile "work"' })
   })
 
+  it('does not globally cancel a shared SSH bootstrap when one renderer reconnect times out', async () => {
+    vi.useFakeTimers()
+    $connectionsRegistry.set({
+      connections: [{ id: 'imac', kind: 'ssh', label: 'iMac' }],
+      lastUsed: 'imac',
+      primary: 'imac'
+    } as never)
+
+    let reconnect = false
+    const cancelBootstrap = vi.fn(async () => ({ cancelled: true, ok: true }))
+
+    const getConnectionFor = vi.fn(() =>
+      reconnect
+        ? new Promise(() => undefined)
+        : Promise.resolve({
+            authMode: 'token',
+            baseUrl: 'https://imac.invalid',
+            connectionId: 'imac',
+            mode: 'remote',
+            profile: 'cmo',
+            token: 'fake-test-token',
+            wsUrl: 'wss://imac.invalid/ws'
+          })
+    )
+
+    installDesktop({ connections: { cancelBootstrap }, getConnectionFor })
+    await openGatewayForAgent('imac', 'cmo')
+    ;(gatewayMocks.instances[0] as { connectionState: string }).connectionState = 'closed'
+    reconnect = true
+
+    const pending = expect(openGatewayForAgent('imac', 'cmo')).rejects.toThrow(
+      'Timed out connecting to profile "cmo"'
+    )
+
+    await vi.advanceTimersByTimeAsync(RECONNECT_ATTEMPT_TIMEOUT_MS)
+    await pending
+
+    expect(cancelBootstrap).not.toHaveBeenCalled()
+  })
+
   it('keeps the reconnect schedule armed so transient failures still self-heal', async () => {
     vi.useFakeTimers()
 
@@ -506,13 +546,16 @@ describe('secondary connection timeout (#93454)', () => {
     let resolveRegistry!: (registry: unknown) => void
     const descriptorFailure = new Error('SSH bootstrap failed')
     const getConnectionFor = vi.fn(() => Promise.reject(descriptorFailure))
+
     const list = vi.fn(
       () =>
         new Promise(resolve => {
           resolveRegistry = resolve
         })
     )
+
     const unhandled: unknown[] = []
+
     const onUnhandled = (reason: unknown): void => {
       unhandled.push(reason)
     }

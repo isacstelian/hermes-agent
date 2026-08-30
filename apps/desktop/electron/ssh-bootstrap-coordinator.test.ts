@@ -395,6 +395,7 @@ test('cancelAndWait drains a primary bootstrap through its registry-scope alias'
   await Promise.resolve()
   const drain = coordinator.cancelAndWait(alias)
   let nextStarted = false
+
   const next = coordinator.start('', 'next', async () => {
     nextStarted = true
   })
@@ -407,6 +408,44 @@ test('cancelAndWait drains a primary bootstrap through its registry-scope alias'
   await assert.rejects(primary, (error: any) => error.kind === 'superseded')
   await next
   assert.equal(nextStarted, true)
+})
+
+test('a primary join promotes a pool-first bootstrap and its cancel aliases', async () => {
+  const coordinator = createBootstrapCoordinator()
+  const gate = deferred()
+  const alias = 'conn:imac::default'
+  const metadata: any = { cancelScopes: [], managedScope: 'pool', primaryRegistryScope: false }
+  let cleaned = 0
+
+  const pool = coordinator.start(
+    '',
+    'same',
+    async lease => {
+      lease.onForceCleanup(() => {
+        cleaned += 1
+        gate.resolve()
+      })
+      await gate.promise
+      lease.assertCurrent()
+    },
+    metadata
+  )
+
+  const primary = coordinator.start('', 'same', async () => assert.fail('must coalesce'), {
+    cancelScopes: [alias],
+    managedScope: 'primary',
+    primaryRegistryScope: true,
+    registryConnectionId: 'imac'
+  })
+
+  assert.equal(primary, pool)
+  await Promise.resolve()
+  await coordinator.cancelAndWait(alias)
+  await assert.rejects(primary, (error: any) => error.kind === 'superseded')
+  assert.equal(cleaned, 1)
+  assert.equal(metadata.managedScope, 'primary')
+  assert.equal(metadata.primaryRegistryScope, true)
+  assert.deepEqual(metadata.cancelScopes, [alias])
 })
 
 test('cancelAndWait force-cleans pending resources before awaiting rollback', async () => {

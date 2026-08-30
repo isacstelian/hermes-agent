@@ -559,7 +559,7 @@ async function openSecondary(entry: Secondary): Promise<void> {
         `Timed out connecting to profile "${entry.profile}"`
       )
     } catch (error) {
-      if (entry.connectionId && isTimeoutError(error)) {
+      if (!reconnectingSocket && entry.connectionId && isTimeoutError(error)) {
         try {
           await desktop.connections?.cancelBootstrap?.({ connectionId: entry.connectionId, profile: entry.profile })
         } catch (cleanupError) {

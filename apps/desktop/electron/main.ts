@@ -87,7 +87,7 @@ import {
   buildBrowserWindowUrl
 } from './browser-windows'
 import { detectBundleSkew } from './bundle-skew'
-import { registerCancelSshBootstrapIpc } from './cancel-ssh-bootstrap-ipc'
+import { registerCancelSshBootstrapIpc, sshTeardownScopesForRoute } from './cancel-ssh-bootstrap-ipc'
 import { applyConnectionChange, teardownSshState } from './connection-apply'
 import {
   apiRequestRegistryConnectionId,
@@ -14226,7 +14226,11 @@ registerCancelSshBootstrapIpc(ipcMain, {
   readRegistry: readDesktopConnectionsRegistry,
   scopeKey: backendScopeKey,
   stopPoolBackend,
-  teardownSshConnection
+  teardownSshRoute: async (connectionId, scope) => {
+    const scopes = sshTeardownScopesForRoute(sshConnections, connectionId, scope)
+
+    await Promise.all(scopes.map(target => teardownSshConnection(target)))
+  }
 })
 
 const windowConnectionRoutes = new WindowConnectionRouteRegistry()

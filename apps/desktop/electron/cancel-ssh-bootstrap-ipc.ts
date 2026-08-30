@@ -28,7 +28,31 @@ interface CancelBootstrapDeps {
   readRegistry(): { connections: Array<{ id: string; kind: string }> }
   scopeKey(connectionId: string, profile: string): string
   stopPoolBackend(scope: string): MaybePromise<unknown>
-  teardownSshConnection(scope: string): MaybePromise<unknown>
+  teardownSshRoute(connectionId: string, scope: string): MaybePromise<unknown>
+}
+
+interface PublishedSshRouteState {
+  primaryRegistryScope?: boolean
+  registryConnectionId?: string
+}
+
+function sshTeardownScopesForRoute(
+  published: Iterable<[string, PublishedSshRouteState]>,
+  connectionId: string,
+  requestedScope: string
+): string[] {
+  const scopes = new Set([requestedScope])
+
+  for (const [scope, state] of published) {
+    if (
+      (scope === '' || state?.primaryRegistryScope === true) &&
+      String(state.registryConnectionId || '').trim() === connectionId
+    ) {
+      scopes.add(scope)
+    }
+  }
+
+  return [...scopes]
 }
 
 function invokeCancelSshBootstrap(
@@ -54,10 +78,15 @@ function registerCancelSshBootstrapIpc(ipcMain: IpcMainLike, deps: CancelBootstr
 
     await deps.cancelAndWait(scope)
     await deps.stopPoolBackend(scope)
-    await deps.teardownSshConnection(scope)
+    await deps.teardownSshRoute(connectionId, scope)
 
     return { cancelled: true, ok: true }
   })
 }
 
-export { CANCEL_SSH_BOOTSTRAP_CHANNEL, invokeCancelSshBootstrap, registerCancelSshBootstrapIpc }
+export {
+  CANCEL_SSH_BOOTSTRAP_CHANNEL,
+  invokeCancelSshBootstrap,
+  registerCancelSshBootstrapIpc,
+  sshTeardownScopesForRoute
+}

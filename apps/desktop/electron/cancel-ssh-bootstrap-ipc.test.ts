@@ -3,7 +3,8 @@ import { describe, expect, it, vi } from 'vitest'
 import {
   CANCEL_SSH_BOOTSTRAP_CHANNEL,
   invokeCancelSshBootstrap,
-  registerCancelSshBootstrapIpc
+  registerCancelSshBootstrapIpc,
+  sshTeardownScopesForRoute
 } from './cancel-ssh-bootstrap-ipc'
 import { backendScopeKey } from './connection-registry'
 import { createBootstrapCoordinator } from './ssh-bootstrap-coordinator'
@@ -40,6 +41,7 @@ describe('cancel SSH bootstrap IPC', () => {
     const calls: string[] = []
     let markStarted!: () => void
     let finishBootstrap!: () => void
+
     const started = new Promise<void>(resolve => {
       markStarted = resolve
     })
@@ -64,10 +66,12 @@ describe('cancel SSH bootstrap IPC', () => {
       calls.push('cancel')
       await coordinator.cancelAndWait(targetScope)
     })
+
     const stopPoolBackend = vi.fn(async () => {
       calls.push('stop')
     })
-    const teardownSshConnection = vi.fn(async () => {
+
+    const teardownSshRoute = vi.fn(async () => {
       calls.push('teardown')
     })
 
@@ -76,7 +80,7 @@ describe('cancel SSH bootstrap IPC', () => {
       readRegistry: () => ({ connections: [{ id: 'imac', kind: 'ssh' }] }),
       scopeKey: backendScopeKey,
       stopPoolBackend,
-      teardownSshConnection
+      teardownSshRoute
     })
 
     await started
@@ -89,7 +93,7 @@ describe('cancel SSH bootstrap IPC', () => {
 
     expect(cancelAndWait).toHaveBeenCalledWith(scope)
     expect(stopPoolBackend).toHaveBeenCalledWith(scope)
-    expect(teardownSshConnection).toHaveBeenCalledWith(scope)
+    expect(teardownSshRoute).toHaveBeenCalledWith('imac', scope)
     expect(coordinator.pending.has('')).toBe(false)
     expect(calls).toEqual(['cancel', 'cleanup', 'stop', 'teardown'])
   })
@@ -103,12 +107,24 @@ describe('cancel SSH bootstrap IPC', () => {
       readRegistry: () => ({ connections: [{ id: 'local', kind: 'local' }] }),
       scopeKey: backendScopeKey,
       stopPoolBackend: vi.fn(),
-      teardownSshConnection: vi.fn()
+      teardownSshRoute: vi.fn()
     })
 
     await expect(
       invokeCancelSshBootstrap(ipc.ipcRenderer, { connectionId: 'local', profile: 'default' })
     ).resolves.toEqual({ cancelled: false, ok: true })
     expect(cancelAndWait).not.toHaveBeenCalled()
+  })
+
+  it('maps a published primary alias back to its real SSH scope', () => {
+    const scope = backendScopeKey('imac', 'default')
+
+    const states = new Map<string, { primaryRegistryScope?: boolean; registryConnectionId?: string }>([
+      ['', { primaryRegistryScope: false, registryConnectionId: 'imac' }],
+      [scope, { primaryRegistryScope: false, registryConnectionId: 'imac' }],
+      ['unrelated', { primaryRegistryScope: true, registryConnectionId: 'other' }]
+    ])
+
+    expect(sshTeardownScopesForRoute(states, 'imac', scope)).toEqual([scope, ''])
   })
 })
