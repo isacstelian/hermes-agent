@@ -587,6 +587,35 @@ test('a teardown callback joining an existing drain finishes before replacement 
   assert.equal(nextStarted, true)
 })
 
+test('a published alias and primary scope share one drain without an active bootstrap entry', async () => {
+  const coordinator = createBootstrapCoordinator()
+  const teardownGate = deferred()
+  const teardownStarted = deferred()
+  const alias = 'conn:imac::default'
+  let replacementStarted = false
+
+  const aliasDrain = coordinator.cancelAndWait([alias, ''], async () => {
+    teardownStarted.resolve()
+    await teardownGate.promise
+  })
+
+  await teardownStarted.promise
+
+  const primaryDrain = coordinator.cancelAndWait('')
+
+  const replacement = coordinator.start('', 'next', async () => {
+    replacementStarted = true
+  })
+
+  await Promise.resolve()
+  assert.equal(replacementStarted, false)
+
+  teardownGate.resolve()
+  await Promise.all([aliasDrain, primaryDrain])
+  await replacement
+  assert.equal(replacementStarted, true)
+})
+
 test('cancelAndWait force-cleans pending resources before awaiting rollback', async () => {
   const coordinator = createBootstrapCoordinator()
   const gate = deferred()

@@ -9930,6 +9930,20 @@ async function teardownSshConnection(profile) {
   )
 }
 
+function resolvePublishedSshTeardownScopes(scope, connectionId = '') {
+  return sshTeardownScopesForRoute(sshConnections, connectionId, sshScopeKey(scope))
+}
+
+async function teardownSshScopes(scopes) {
+  await Promise.all(scopes.map(scope => teardownSshConnection(scope)))
+}
+
+async function cancelSshScopesAndWait(scope, connectionId = '', whileDrained = teardownSshScopes) {
+  const scopes = resolvePublishedSshTeardownScopes(scope, connectionId)
+
+  await sshBootstrapCoordinator.cancelAndWait(scopes, () => whileDrained(scopes))
+}
+
 // CRITICAL: this must mirror resolveRemoteBackend's precedence, not just return
 // any cached SSH state. A per-profile token/OAuth override wins over a global
 // SSH connection — so if the active profile resolves to a NON-SSH backend, the
@@ -11277,7 +11291,7 @@ async function ensureRegistryBackend(connectionId, profile, managedUpdateCorrela
           await stopPoolBackend(key)
 
           if (source.kind === 'ssh') {
-            await sshBootstrapCoordinator.cancelAndWait(key, () => teardownSshConnection(key))
+            await cancelSshScopesAndWait(key, id)
           }
         }
       })
@@ -11904,7 +11918,7 @@ async function stopRegistryConnectionBackends(connectionId) {
 
   await Promise.all(
     [...sshScopes].map(async scope => {
-      await sshBootstrapCoordinator.cancelAndWait(scope, () => teardownSshConnection(scope))
+      await cancelSshScopesAndWait(scope, connectionId)
     })
   )
 }
@@ -14228,13 +14242,10 @@ ipcMain.handle('hermes:connection:for', async (_event, payload) => {
 registerCancelSshBootstrapIpc(ipcMain, {
   cancelAndWait: (scope, whileDrained) => sshBootstrapCoordinator.cancelAndWait(scope, whileDrained),
   readRegistry: readDesktopConnectionsRegistry,
+  resolveSshScopes: (connectionId, scope) => resolvePublishedSshTeardownScopes(scope, connectionId),
   scopeKey: backendScopeKey,
   stopPoolBackend,
-  teardownSshRoute: async (connectionId, scope) => {
-    const scopes = sshTeardownScopesForRoute(sshConnections, connectionId, scope)
-
-    await Promise.all(scopes.map(target => teardownSshConnection(target)))
-  }
+  teardownSshScopes
 })
 
 const windowConnectionRoutes = new WindowConnectionRouteRegistry()
@@ -14303,7 +14314,7 @@ ipcMain.handle('hermes:connection:revalidate', async () => {
 
       if (conn?.remoteKind === 'ssh') {
         const profile = primaryProfileKey()
-        await sshBootstrapCoordinator.cancelAndWait(sshScopeKey(profile), () => teardownSshConnection(profile))
+        await cancelSshScopesAndWait(sshScopeKey(profile), conn.connectionId || '')
       }
     }
 
@@ -14360,7 +14371,7 @@ function revalidateSuspectPoolAfterResume() {
         // The pool key doubles as the SSH scope for registry SSH backends and
         // resolves through sshScopeKey() for bare-profile remotes; both
         // teardown calls no-op when the scope holds no SSH state.
-        await sshBootstrapCoordinator.cancelAndWait(poolKey, () => teardownSshConnection(poolKey))
+        await cancelSshScopesAndWait(poolKey, parseBackendScopeKey(poolKey).connectionId || '')
       },
       tracker: remoteLiveness
     })
@@ -15479,7 +15490,8 @@ ipcMain.handle('hermes:connection-config:apply', async (_event, payload) => {
     writeRegistry: writeDesktopConnectionsRegistry,
     apply: () =>
       applyConnectionChange({
-        cancelAndWait: (value, whileDrained) => sshBootstrapCoordinator.cancelAndWait(value, whileDrained),
+        cancelAndWait: (value, whileDrained) =>
+          cancelSshScopesAndWait(value, '', () => whileDrained()),
         isPrimary: !key || key === primaryProfileKey(),
         rehomePrimary: () =>
           rehomePrimaryConnection({
@@ -15933,7 +15945,7 @@ async function teardownConnectionScopedProfileBackend(connectionId, profile) {
   const key = backendScopeKey(connectionId, profile)
   await Promise.all([
     poolStopper.stop(key),
-    sshBootstrapCoordinator.cancelAndWait(key, () => teardownSshConnection(key))
+    cancelSshScopesAndWait(key, connectionId)
   ])
 }
 

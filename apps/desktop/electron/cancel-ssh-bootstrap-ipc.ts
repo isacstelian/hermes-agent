@@ -24,11 +24,12 @@ interface IpcRendererLike {
 }
 
 interface CancelBootstrapDeps {
-  cancelAndWait(scope: string, whileDrained?: () => MaybePromise<void>): Promise<void>
+  cancelAndWait(scopes: string | string[], whileDrained?: () => MaybePromise<void>): Promise<void>
   readRegistry(): { connections: Array<{ id: string; kind: string }> }
+  resolveSshScopes(connectionId: string, scope: string): string[]
   scopeKey(connectionId: string, profile: string): string
   stopPoolBackend(scope: string): MaybePromise<unknown>
-  teardownSshRoute(connectionId: string, scope: string): MaybePromise<unknown>
+  teardownSshScopes(scopes: string[]): MaybePromise<unknown>
 }
 
 interface PublishedSshRouteState {
@@ -45,12 +46,18 @@ function sshTeardownScopesForRoute(
   const scopes = new Set([requestedScope])
 
   for (const [scope, state] of published) {
+    const cancelScopes = state.cancelScopes || []
+
     if (
       (scope === '' || state?.primaryRegistryScope === true) &&
-      String(state.registryConnectionId || '').trim() === connectionId &&
-      state.cancelScopes?.includes(requestedScope)
+      (!connectionId || String(state.registryConnectionId || '').trim() === connectionId) &&
+      (scope === requestedScope || cancelScopes.includes(requestedScope))
     ) {
       scopes.add(scope)
+
+      for (const cancelScope of cancelScopes) {
+        scopes.add(cancelScope)
+      }
     }
   }
 
@@ -77,10 +84,11 @@ function registerCancelSshBootstrapIpc(ipcMain: IpcMainLike, deps: CancelBootstr
     }
 
     const scope = deps.scopeKey(connectionId, profile)
+    const scopes = deps.resolveSshScopes(connectionId, scope)
 
-    await deps.cancelAndWait(scope, async () => {
+    await deps.cancelAndWait(scopes, async () => {
       await deps.stopPoolBackend(scope)
-      await deps.teardownSshRoute(connectionId, scope)
+      await deps.teardownSshScopes(scopes)
     })
 
     return { cancelled: true, ok: true }

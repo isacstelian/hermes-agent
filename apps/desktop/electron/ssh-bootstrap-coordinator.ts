@@ -207,6 +207,18 @@ function createBootstrapCoordinator({
     })
   }
 
+  async function waitForScopeDrain(scope, signal) {
+    while (!signal.aborted) {
+      const drain = drains.get(scope)
+
+      if (!drain) {
+        return
+      }
+
+      await drain.barrier
+    }
+  }
+
   function start(scope, fingerprint, run, metadata = null) {
     if (shutdownRequested) {
       return Promise.reject(supersededError('SSH bootstrap was cancelled because Desktop is quitting.'))
@@ -243,7 +255,7 @@ function createBootstrapCoordinator({
       }
     }
 
-    const drainBarrier = drains.get(scope)?.barrier || Promise.resolve()
+    const drainBarrier = waitForScopeDrain(scope, controller.signal)
     const predecessor = current ? Promise.allSettled([current.promise, drainBarrier]) : drainBarrier
     const entryMetadata = metadata && typeof metadata === 'object' ? metadata : {}
 
@@ -301,10 +313,33 @@ function createBootstrapCoordinator({
     })
   }
 
-  async function cancelAndWait(scope, whileDrained = null) {
-    const existingDrain = drains.get(scope)
+  async function cancelAndWait(scopeOrScopes, whileDrained = null) {
+    const requestedScopes = [...new Set(Array.isArray(scopeOrScopes) ? scopeOrScopes : [scopeOrScopes])]
+    const requestedScopeSet = new Set(requestedScopes)
 
-    if (existingDrain) {
+    const entries = [...active].filter(
+      entry =>
+        requestedScopeSet.has(entry.scope) ||
+        entry.metadata?.cancelScopes?.some(cancelScope => requestedScopeSet.has(cancelScope))
+    )
+
+    const drainScopes = new Set([
+      ...requestedScopes,
+      ...entries.flatMap(entry => [entry.scope, ...(entry.metadata?.cancelScopes || [])])
+    ])
+
+    const existingDrains = [
+      ...new Set([...drainScopes].map(drainScope => drains.get(drainScope)).filter(Boolean))
+    ]
+
+    const existingDrain = existingDrains.length === 1 ? existingDrains[0] : null
+
+    const existingDrainOwnsRequest =
+      existingDrain &&
+      [...drainScopes].every(drainScope => drains.get(drainScope) === existingDrain) &&
+      entries.every(entry => existingDrain.entries.has(entry))
+
+    if (existingDrainOwnsRequest) {
       const callbackResult = enqueueDrainCallback(existingDrain, whileDrained)
       await existingDrain.barrier
       const result = await callbackResult
@@ -324,19 +359,12 @@ function createBootstrapCoordinator({
 
     const drain = {
       barrier,
-      callbacks: []
+      callbacks: [],
+      entries: new Set(entries)
     }
 
     const callbackResult = enqueueDrainCallback(drain, whileDrained)
-
-    const entries = [...active].filter(
-      entry => entry.scope === scope || entry.metadata?.cancelScopes?.includes(scope)
-    )
-
-    const drainScopes = new Set([
-      scope,
-      ...entries.flatMap(entry => [entry.scope, ...(entry.metadata?.cancelScopes || [])])
-    ])
+    const predecessorDrains = existingDrains.map(predecessor => predecessor.barrier)
 
     for (const drainScope of drainScopes) {
       drains.set(drainScope, drain)
@@ -347,6 +375,8 @@ function createBootstrapCoordinator({
     }
 
     try {
+      await Promise.allSettled(predecessorDrains)
+
       // Cancellation alone only invalidates the lease; it does not interrupt a
       // child process currently blocked in SSH connect/config resolution. Close
       // registered resources first so rollback can settle promptly while the

@@ -71,16 +71,17 @@ describe('cancel SSH bootstrap IPC', () => {
       calls.push('stop')
     })
 
-    const teardownSshRoute = vi.fn(async () => {
+    const teardownSshScopes = vi.fn(async () => {
       calls.push('teardown')
     })
 
     registerCancelSshBootstrapIpc(ipc.ipcMain, {
       cancelAndWait,
       readRegistry: () => ({ connections: [{ id: 'imac', kind: 'ssh' }] }),
+      resolveSshScopes: () => [scope, ''],
       scopeKey: backendScopeKey,
       stopPoolBackend,
-      teardownSshRoute
+      teardownSshScopes
     })
 
     await started
@@ -91,9 +92,9 @@ describe('cancel SSH bootstrap IPC', () => {
     ).resolves.toEqual({ cancelled: true, ok: true })
     await running
 
-    expect(cancelAndWait).toHaveBeenCalledWith(scope, expect.any(Function))
+    expect(cancelAndWait).toHaveBeenCalledWith([scope, ''], expect.any(Function))
     expect(stopPoolBackend).toHaveBeenCalledWith(scope)
-    expect(teardownSshRoute).toHaveBeenCalledWith('imac', scope)
+    expect(teardownSshScopes).toHaveBeenCalledWith([scope, ''])
     expect(coordinator.pending.has('')).toBe(false)
     expect(calls).toEqual(['cancel', 'cleanup', 'stop', 'teardown'])
   })
@@ -126,9 +127,10 @@ describe('cancel SSH bootstrap IPC', () => {
     registerCancelSshBootstrapIpc(ipc.ipcMain, {
       cancelAndWait: (target, whileDrained) => coordinator.cancelAndWait(target, whileDrained),
       readRegistry: () => ({ connections: [{ id: 'imac', kind: 'ssh' }] }),
+      resolveSshScopes: () => [scope, ''],
       scopeKey: backendScopeKey,
       stopPoolBackend: vi.fn(async () => undefined),
-      teardownSshRoute: vi.fn(async () => teardownGate)
+      teardownSshScopes: vi.fn(async () => teardownGate)
     })
 
     await Promise.resolve()
@@ -153,6 +155,70 @@ describe('cancel SSH bootstrap IPC', () => {
     expect(replacementStarted).toBe(true)
   })
 
+  it('holds a published primary scope through alias teardown after its bootstrap entry has settled', async () => {
+    const ipc = createIpcHarness()
+    const coordinator = createBootstrapCoordinator()
+    const scope = backendScopeKey('imac', 'default')
+
+    const published = new Map([
+      [
+        '',
+        {
+          cancelScopes: [scope],
+          primaryRegistryScope: true,
+          registryConnectionId: 'imac'
+        }
+      ]
+    ])
+
+    let finishTeardown!: () => void
+    let markTeardownStarted!: () => void
+    let replacementStarted = false
+
+    const teardownGate = new Promise<void>(resolve => {
+      finishTeardown = resolve
+    })
+
+    const teardownStarted = new Promise<void>(resolve => {
+      markTeardownStarted = resolve
+    })
+
+    registerCancelSshBootstrapIpc(ipc.ipcMain, {
+      cancelAndWait: (target, whileDrained) => coordinator.cancelAndWait(target, whileDrained),
+      readRegistry: () => ({ connections: [{ id: 'imac', kind: 'ssh' }] }),
+      resolveSshScopes: (connectionId, target) =>
+        sshTeardownScopesForRoute(published, connectionId, target),
+      scopeKey: backendScopeKey,
+      stopPoolBackend: vi.fn(async () => undefined),
+      teardownSshScopes: vi.fn(async scopes => {
+        for (const target of scopes) {
+          published.delete(target)
+        }
+
+        markTeardownStarted()
+        await teardownGate
+      })
+    })
+
+    const cancelling = invokeCancelSshBootstrap(ipc.ipcRenderer, { connectionId: 'imac', profile: 'default' })
+
+    await teardownStarted
+
+    const primaryDrain = coordinator.cancelAndWait('')
+
+    const replacement = coordinator.start('', 'new', async () => {
+      replacementStarted = true
+    })
+
+    await Promise.resolve()
+    expect(replacementStarted).toBe(false)
+
+    finishTeardown()
+    await Promise.all([cancelling, primaryDrain])
+    await replacement
+    expect(replacementStarted).toBe(true)
+  })
+
   it('refuses to cancel non-SSH registry sources', async () => {
     const ipc = createIpcHarness()
     const cancelAndWait = vi.fn(async () => undefined)
@@ -160,9 +226,10 @@ describe('cancel SSH bootstrap IPC', () => {
     registerCancelSshBootstrapIpc(ipc.ipcMain, {
       cancelAndWait,
       readRegistry: () => ({ connections: [{ id: 'local', kind: 'local' }] }),
+      resolveSshScopes: (_connectionId, scope) => [scope],
       scopeKey: backendScopeKey,
       stopPoolBackend: vi.fn(),
-      teardownSshRoute: vi.fn()
+      teardownSshScopes: vi.fn()
     })
 
     await expect(
@@ -184,6 +251,23 @@ describe('cancel SSH bootstrap IPC', () => {
     ])
 
     expect(sshTeardownScopesForRoute(states, 'imac', scope)).toEqual([scope, ''])
+  })
+
+  it('maps a direct primary teardown back to its published registry alias', () => {
+    const alias = backendScopeKey('imac', 'default')
+
+    const states = new Map([
+      [
+        '',
+        {
+          cancelScopes: [alias],
+          primaryRegistryScope: true,
+          registryConnectionId: 'imac'
+        }
+      ]
+    ])
+
+    expect(sshTeardownScopesForRoute(states, 'imac', '')).toEqual(['', alias])
   })
 
   it('does not tear down a different primary profile on the same SSH connection', () => {
