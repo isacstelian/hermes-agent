@@ -182,6 +182,7 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
   // v2 multi-connection registry: named agent sources (local / remote / cloud / ssh).
   connections: {
     list: () => ipcRenderer.invoke('hermes:connections:list'),
+    cancelBootstrap: payload => ipcRenderer.invoke('hermes:connections:cancel-bootstrap', payload),
     save: payload => ipcRenderer.invoke('hermes:connections:save', payload),
     remove: id => ipcRenderer.invoke('hermes:connections:remove', id),
     setPrimary: id => ipcRenderer.invoke('hermes:connections:set-primary', id),

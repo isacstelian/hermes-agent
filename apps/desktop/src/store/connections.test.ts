@@ -32,6 +32,7 @@ const ensureGatewayAgent = vi.fn(
 )
 
 const openGatewayAgent = vi.fn(async (_connectionId: string, _profile: string): Promise<void> => undefined)
+const cancelBootstrap = vi.fn(async () => ({ cancelled: true, ok: true }))
 const refreshActiveProfile = vi.fn(async () => undefined)
 const requestFreshSession = vi.fn()
 const beforeConnectionSwitch = vi.fn()
@@ -129,6 +130,7 @@ beforeEach(() => {
   })
   openGatewayAgent.mockReset()
   openGatewayAgent.mockResolvedValue(undefined)
+  cancelBootstrap.mockClear()
   refreshActiveProfile.mockClear()
   requestFreshSession.mockClear()
   beforeConnectionSwitch.mockClear()
@@ -140,7 +142,7 @@ beforeEach(() => {
   $gatewaySwitching.set(false)
   list.mockClear()
   setLastUsed.mockClear()
-  vi.stubGlobal('window', { hermesDesktop: { connections: { list, setLastUsed } }, localStorage })
+  vi.stubGlobal('window', { hermesDesktop: { connections: { cancelBootstrap, list, setLastUsed } }, localStorage })
 })
 
 afterEach(() => vi.unstubAllGlobals())
@@ -589,6 +591,7 @@ describe('selectConnection', () => {
 
       await vi.advanceTimersByTimeAsync(SECONDARY_BACKEND_BOOT_WAIT_TIMEOUT_MS - 20_000)
       expect(await outcome).toMatch(/Timed out connecting to "iMac"/)
+      expect(cancelBootstrap).toHaveBeenCalledWith({ connectionId: 'imac', profile: 'default' })
       expect(beginGatewaySwitch).not.toHaveBeenCalled()
       expect($pendingConnectionId.get()).toBeNull()
     } finally {

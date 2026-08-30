@@ -14217,6 +14217,24 @@ ipcMain.handle('hermes:connection:for', async (_event, payload) => {
 
   return { ...connection, connectionId: id, registryScoped: true }
 })
+ipcMain.handle('hermes:connections:cancel-bootstrap', async (_event, payload) => {
+  const registry = readDesktopConnectionsRegistry()
+  const connectionId = String(payload?.connectionId || '').trim()
+  const profile = String(payload?.profile || '').trim() || 'default'
+  const source = registry.connections.find(connection => connection.id === connectionId)
+
+  if (!source || source.kind !== 'ssh') {
+    return { cancelled: false, ok: true }
+  }
+
+  const scope = backendScopeKey(connectionId, profile)
+
+  await sshBootstrapCoordinator.cancelAndWait(scope)
+  await stopPoolBackend(scope)
+  await teardownSshConnection(scope)
+
+  return { cancelled: true, ok: true }
+})
 
 const windowConnectionRoutes = new WindowConnectionRouteRegistry()
 const windowConnectionRouteOwners = new Set<number>()

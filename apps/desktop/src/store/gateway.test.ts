@@ -436,8 +436,9 @@ describe('secondary connection timeout (#93454)', () => {
       primary: 'imac'
     } as never)
 
+    const cancelBootstrap = vi.fn(async () => ({ cancelled: true, ok: true }))
     const getConnectionFor = vi.fn(() => new Promise(() => undefined))
-    installDesktop({ getConnectionFor })
+    installDesktop({ connections: { cancelBootstrap }, getConnectionFor })
 
     const connection = openGatewayForAgent('imac', 'cmo')
     let settled = false
@@ -462,6 +463,7 @@ describe('secondary connection timeout (#93454)', () => {
 
     await vi.advanceTimersByTimeAsync(1)
     await pending
+    expect(cancelBootstrap).toHaveBeenCalledWith({ connectionId: 'imac', profile: 'cmo' })
   })
 
   it('uses the cold budget while the registry kind is still loading', async () => {

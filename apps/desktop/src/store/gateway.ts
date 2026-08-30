@@ -5,6 +5,7 @@ import type { HermesConnection } from '@/global'
 import { HermesGateway, setApiRequestConnection } from '@/hermes'
 import { reconnectBackoffDelayMs } from '@/lib/reconnect-backoff'
 import {
+  isTimeoutError,
   RECONNECT_ATTEMPT_TIMEOUT_MS,
   SECONDARY_BACKEND_BOOT_WAIT_TIMEOUT_MS,
   withTimeout
@@ -527,18 +528,36 @@ async function openSecondary(entry: Secondary): Promise<void> {
     // this secondary (SSH terminal, messaging DELETE, session send, …) never
     // settles either. Bound the same way use-gateway-boot.ts bounds the
     // primary's equivalent awaits.
-    const conn =
-      entry.connectionId && desktop.getConnectionFor
-        ? await withTimeout(
-            desktop.getConnectionFor({ connectionId: entry.connectionId, profile: entry.profile }),
-            descriptorTimeoutMs,
-            `Timed out connecting to profile "${entry.profile}"`
+    let conn: HermesConnection
+
+    try {
+      conn =
+        entry.connectionId && desktop.getConnectionFor
+          ? await withTimeout(
+              desktop.getConnectionFor({ connectionId: entry.connectionId, profile: entry.profile }),
+              descriptorTimeoutMs,
+              `Timed out connecting to profile "${entry.profile}"`
+            )
+          : await withTimeout(
+              desktop.getConnection(entry.profile),
+              descriptorTimeoutMs,
+              `Timed out connecting to profile "${entry.profile}"`
+            )
+    } catch (error) {
+      if (entry.connectionId && isTimeoutError(error)) {
+        try {
+          await desktop.connections?.cancelBootstrap?.({ connectionId: entry.connectionId, profile: entry.profile })
+        } catch (cleanupError) {
+          // Preserve the descriptor timeout. Main owns cleanup diagnostics.
+          console.warn(
+            `[gateway] SSH bootstrap cleanup failed for "${entry.connectionId}:${entry.profile}"`,
+            cleanupError
           )
-        : await withTimeout(
-            desktop.getConnection(entry.profile),
-            descriptorTimeoutMs,
-            `Timed out connecting to profile "${entry.profile}"`
-          )
+        }
+      }
+
+      throw error
+    }
 
     entry.connection = conn
 
