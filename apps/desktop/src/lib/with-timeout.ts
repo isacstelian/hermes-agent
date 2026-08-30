@@ -24,6 +24,12 @@ export const RECONNECT_ATTEMPT_TIMEOUT_MS = 20_000
 // budget above.
 export const SECONDARY_BACKEND_BOOT_WAIT_TIMEOUT_MS = 330_000
 
+// Full cold secondary activation: descriptor queue + WS URL minting + the
+// gateway client's 15s handshake, with 5s margin. Bot Chat activation and the
+// gateway prune lease share this ceiling so neither expires mid-boot.
+export const SECONDARY_GATEWAY_ACTIVATION_TIMEOUT_MS =
+  SECONDARY_BACKEND_BOOT_WAIT_TIMEOUT_MS + RECONNECT_ATTEMPT_TIMEOUT_MS + 20_000
+
 /** Rejection raised by withTimeout. The bounded work is NOT cancelled — the
  * caller decides what a straggler that settles later means. */
 export class TimeoutError extends Error {

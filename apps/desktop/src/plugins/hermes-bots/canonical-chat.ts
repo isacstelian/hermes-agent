@@ -96,6 +96,10 @@ async function openStoredBotChat(
     typeof sdk !== 'undefined' && Number.isFinite(sdk.BOT_CHAT_SESSION_HYDRATION_TIMEOUT_MS)
       ? sdk.BOT_CHAT_SESSION_HYDRATION_TIMEOUT_MS
       : 60_000
+  const activationTimeoutMs =
+    bot?.connectionKind === 'ssh' && Number.isFinite(sdk.BOT_CHAT_SSH_ACTIVATION_TIMEOUT_MS)
+      ? sdk.BOT_CHAT_SSH_ACTIVATION_TIMEOUT_MS
+      : hydrationTimeoutMs
 
   // A profile backend that just woke up can lose the hydration-timeout race
   // even though the session is fine (hermes-agent#89617) — clicking Retry
@@ -125,6 +129,7 @@ async function openStoredBotChat(
     // the reason this stopped being `main`); it just loads into main instead of
     // minting a second tab when there is nothing to front.
     intent: 'in-place',
+    activationTimeoutMs,
     awaitHydration: true,
     expectHistory,
     forceResume: true,

@@ -8,6 +8,7 @@ import {
   isTimeoutError,
   RECONNECT_ATTEMPT_TIMEOUT_MS,
   SECONDARY_BACKEND_BOOT_WAIT_TIMEOUT_MS,
+  SECONDARY_GATEWAY_ACTIVATION_TIMEOUT_MS,
   withTimeout
 } from '@/lib/with-timeout'
 import { $connectionsRegistry } from '@/store/connection-registry-state'
@@ -122,8 +123,7 @@ interface Secondary {
 // descriptor may spend the full cold-boot budget, WebSocket URL minting has
 // its own reconnect budget, and JsonRpcGatewayClient allows a 15s handshake.
 // Keep 5s of margin while still bounding orphaned leases for the reaper.
-const ACTIVATION_LEASE_MS =
-  SECONDARY_BACKEND_BOOT_WAIT_TIMEOUT_MS + RECONNECT_ATTEMPT_TIMEOUT_MS + 20_000
+const ACTIVATION_LEASE_MS = SECONDARY_GATEWAY_ACTIVATION_TIMEOUT_MS
 
 // ── HMR-stable module state ─────────────────────────────────────────────────
 // All mutable singletons (live sockets, active-profile routing, the event

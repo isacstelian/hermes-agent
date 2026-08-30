@@ -39,6 +39,7 @@ const { hostMock, persistMock, requestForBotMock, saveBotMetaMock } = vi.hoisted
 
 vi.mock('@hermes/plugin-sdk', () => ({
   BOT_CHAT_SESSION_HYDRATION_TIMEOUT_MS: 15_000,
+  BOT_CHAT_SSH_ACTIVATION_TIMEOUT_MS: 370_000,
   host: hostMock
 }))
 
@@ -59,7 +60,7 @@ vi.mock('./data', () => ({
   botOwner: (owner: RosterRow | string) =>
     typeof owner === 'string'
       ? { bot: { name: owner }, key: owner, name: owner, route: null }
-      : { bot: owner, key: owner?.name, name: owner?.name, route: null },
+      : { bot: owner, key: owner?.name, name: owner?.name, route: owner?.route ?? null },
   persistBotMetaSnapshot: persistMock,
   saveBotMeta: saveBotMetaMock
 }))
@@ -153,6 +154,28 @@ describe('the registry row wins, always', () => {
     // The durable registry id names the chat; the tip is what takes focus.
     expect(opened).toEqual({ openedId: 'tip-9', registryId: 'root-1' })
     expect(hostMock.openSession.mock.calls[0][0]).toBe('tip-9')
+  })
+
+  it('gives an SSH bot the full queued-bootstrap activation budget', async () => {
+    respondWith(method =>
+      method === 'session.list' ? { sessions: [{ id: 'forever-chat', title: 'Bot Chat' }] } : {}
+    )
+
+    const { openBotCanonicalChat } = await loadModule()
+    await openBotCanonicalChat({
+      connectionId: 'imac',
+      connectionKind: 'ssh',
+      name: 'cmo',
+      route: { connectionId: 'imac', mode: 'remote', profile: 'cmo', targetProfile: 'cmo' }
+    } as RosterRow)
+
+    expect(hostMock.openSession).toHaveBeenCalledWith(
+      'forever-chat',
+      expect.objectContaining({
+        activationTimeoutMs: 370_000,
+        hydrationTimeoutMs: 15_000
+      })
+    )
   })
 
   it('never reads or writes a stored pointer while opening', async () => {

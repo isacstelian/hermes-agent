@@ -42,6 +42,7 @@ import { onGatewayEvent } from '@/contrib/events'
 import { registry } from '@/contrib/registry'
 import type { WorkspaceMode } from '@/contrib/types'
 import { deleteProfile, getLogs, getStatus, hermesApi, type HermesGateway } from '@/hermes'
+import { SECONDARY_GATEWAY_ACTIVATION_TIMEOUT_MS } from '@/lib/with-timeout'
 import {
   $gateway,
   activeGatewayConnectionId,
@@ -321,9 +322,13 @@ export const DEFAULT_SESSION_HYDRATION_TIMEOUT_MS = 20_000
  *  and paint durable history. Bot Mode opts into one retry, so its effective
  *  ceiling is two bounded attempts rather than an unbounded wait. */
 export const BOT_CHAT_SESSION_HYDRATION_TIMEOUT_MS = 60_000
+/** SSH Bot activation can legitimately wait behind one queued cold bootstrap.
+ * Hydration keeps its own 60s budget after the gateway is open. */
+export const BOT_CHAT_SSH_ACTIVATION_TIMEOUT_MS = SECONDARY_GATEWAY_ACTIVATION_TIMEOUT_MS
 let openSessionGeneration = 0
 
 export interface PluginOpenSessionOptions {
+  activationTimeoutMs?: number
   awaitHydration?: boolean
   expectHistory?: boolean
   /** Always request a sequenced session.resume after the open, even when the
@@ -857,6 +862,7 @@ export const host = {
     const wakeStartedAt = Date.now()
     let profileActiveAt = wakeStartedAt
     const hydrationTimeoutMs = Math.max(1, options.hydrationTimeoutMs ?? DEFAULT_SESSION_HYDRATION_TIMEOUT_MS)
+    const activationTimeoutMs = Math.max(1, options.activationTimeoutMs ?? hydrationTimeoutMs)
     // Which half of the wake a timeout landed in. Only meaningful on the
     // failure path, where the two phases have different remedies: a stuck dial
     // is a gateway problem, a slow transcript is a backend-warmup one.
@@ -906,7 +912,7 @@ export const host = {
         // Retry surface both already exist. A plain open never asked for a
         // deadline and has nowhere to render one, so it keeps today's
         // behaviour rather than gaining a rejection its callers cannot handle.
-        await (options.awaitHydration ? awaitProfileActivation(dial, targetProfile, hydrationTimeoutMs) : dial())
+        await (options.awaitHydration ? awaitProfileActivation(dial, targetProfile, activationTimeoutMs) : dial())
         profileActiveAt = Date.now()
       }
 
