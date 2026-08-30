@@ -36,6 +36,7 @@ const { hostMock } = vi.hoisted(() => ({
     requestProfile: vi.fn(),
     state: {
       connectionId: { get: vi.fn(() => 'local') },
+      connectionKey: { get: vi.fn<() => null | string>(() => 'connection:local') },
       connectionMode: { get: vi.fn<() => null | 'local' | 'remote'>(() => 'local') },
       profile: { get: () => 'default' }
     }
@@ -83,9 +84,15 @@ async function mergedRoster(
   local: { profiles: RowFixture[] },
   union: Union | null,
   liveConnectionId: null | string = 'local',
-  liveConnectionMode: null | 'local' | 'remote' = liveConnectionId === 'local' ? 'local' : 'remote'
+  liveConnectionMode: null | 'local' | 'remote' = liveConnectionId === 'local' ? 'local' : 'remote',
+  liveConnectionKey: null | string = liveConnectionId
+    ? `connection:${liveConnectionId}`
+    : liveConnectionMode === 'local'
+      ? 'local'
+      : 'remote:legacy'
 ): Promise<RowFixture[]> {
   hostMock.state.connectionId.get.mockReturnValue(liveConnectionId as string)
+  hostMock.state.connectionKey.get.mockReturnValue(liveConnectionKey)
   hostMock.state.connectionMode.get.mockReturnValue(liveConnectionMode)
   hostMock.request.mockResolvedValue(local)
 
@@ -128,6 +135,8 @@ describe('no union roster', () => {
 
     expect(rows).toHaveLength(1)
     expect(rows[0].name).toBe('default')
+    expect(rows[0].ambientConnectionKey).toBe('connection:local')
+    expect(rows[0].ambientSource).toBe(true)
     expect(rows[0].last_session?.id).toBe('s1')
   })
 
@@ -515,7 +524,8 @@ describe('a null live id', () => {
         primaryConnectionId: 'noah'
       },
       null,
-      'remote'
+      'remote',
+      'remote:ssh:noah'
     )
 
     expect(rows).toHaveLength(2)
@@ -523,6 +533,7 @@ describe('a null live id', () => {
     const inferred = rows.find(row => row.connectionId === 'noah')!
 
     expect(inferred.ambientSource).toBe(true)
+    expect(inferred.ambientConnectionKey).toBe('remote:ssh:noah')
     expect(inferred.last_session?.id).toBe('noah-chat')
     expect(inferred.remoteSource).toBeUndefined()
     expect(inferred.route?.mode).toBe('remote')
@@ -530,6 +541,83 @@ describe('a null live id', () => {
       name: 'default',
       remoteSource: true,
       route: { mode: 'local' }
+    })
+  })
+
+  it('keeps the rich roster on the ambient legacy remote when Settings changes registry primary', async () => {
+    const connectionKey = 'remote:ssh:active-old'
+
+    const agents = [
+      {
+        connectionId: 'active-old',
+        connectionKind: 'remote',
+        connectionLabel: 'Old',
+        handle: 'default-old',
+        profile: 'default'
+      },
+      {
+        connectionId: 'new-primary',
+        connectionKind: 'remote',
+        connectionLabel: 'New',
+        handle: 'default-new',
+        profile: 'default'
+      }
+    ]
+
+    const first = await mergedRoster(
+      { profiles: [{ last_session: { id: 'rich-from-active-old' }, name: 'default' }] },
+      { agents, primaryConnectionId: 'active-old' },
+      null,
+      'remote',
+      connectionKey
+    )
+
+    $lastRoster.set(first as RosterRow[])
+
+    const afterPrimaryEdit = await mergedRoster(
+      { profiles: [{ last_session: { id: 'rich-from-active-old' }, name: 'default' }] },
+      { agents, primaryConnectionId: 'new-primary' },
+      null,
+      'remote',
+      connectionKey
+    )
+
+    expect(afterPrimaryEdit.find(row => !row.remoteSource)).toMatchObject({
+      ambientConnectionKey: connectionKey,
+      connectionId: 'active-old',
+      last_session: { id: 'rich-from-active-old' }
+    })
+    expect(afterPrimaryEdit.find(row => row.connectionId === 'new-primary')).toMatchObject({ remoteSource: true })
+  })
+
+  it('does not reuse the previous idless remote identity after the descriptor changes', async () => {
+    $lastRoster.set([
+      {
+        ambientConnectionKey: 'remote:ssh:host-a',
+        ambientSource: true,
+        connectionId: 'host-a',
+        name: 'default'
+      }
+    ] as RosterRow[])
+
+    const rows = await mergedRoster(
+      { profiles: [{ last_session: { id: 'rich-from-host-b' }, name: 'default' }] },
+      {
+        agents: [
+          { connectionId: 'host-a', connectionKind: 'remote', handle: 'default-a', profile: 'default' },
+          { connectionId: 'host-b', connectionKind: 'remote', handle: 'default-b', profile: 'default' }
+        ],
+        primaryConnectionId: 'host-b'
+      },
+      null,
+      'remote',
+      'remote:ssh:host-b'
+    )
+
+    expect(rows.find(row => !row.remoteSource)).toMatchObject({
+      ambientConnectionKey: 'remote:ssh:host-b',
+      connectionId: 'host-b',
+      last_session: { id: 'rich-from-host-b' }
     })
   })
 })

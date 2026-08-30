@@ -22,6 +22,7 @@ const { ensureBotMetadataMock, hostMock, storageMock } = vi.hoisted(() => ({
     requestProfile: vi.fn(),
     state: {
       connectionId: { get: vi.fn(() => 'local') },
+      connectionKey: { get: vi.fn<() => null | string>(() => 'connection:local') },
       connectionMode: { get: vi.fn<() => null | 'local' | 'remote'>(() => 'local') },
       focusedSessionOwner: null,
       profile: { get: () => 'default' }
@@ -55,6 +56,7 @@ beforeEach(() => {
   $botMeta.set({})
   storageMock.set.mockResolvedValue(undefined)
   hostMock.state.connectionId.get.mockReturnValue('local')
+  hostMock.state.connectionKey.get.mockReturnValue('connection:local')
   hostMock.state.connectionMode.get.mockReturnValue('local')
   hostMock.request.mockImplementation(async (method: string, params: Record<string, unknown>) => {
     calls.push({ method, params: structuredClone(params ?? {}) })
@@ -257,6 +259,7 @@ describe('roster avatar sync routing', () => {
 
   it('keeps migrated v1 remote avatars on the ambient gateway when its connection id is absent', () => {
     const bot = {
+      ambientConnectionKey: 'remote:ssh:imac',
       ambientSource: true,
       connectionId: 'imac-hermes',
       has_avatar: true,
@@ -271,6 +274,7 @@ describe('roster avatar sync routing', () => {
     } as RosterRow
 
     hostMock.state.connectionId.get.mockReturnValue('')
+    hostMock.state.connectionKey.get.mockReturnValue('remote:ssh:imac')
     hostMock.request.mockResolvedValue({ found: false })
 
     pullServerAvatars([bot])
@@ -284,6 +288,7 @@ describe('roster avatar sync routing', () => {
 
   it('does not read a stale legacy remote avatar after switching to an idless local gateway', () => {
     const bot = {
+      ambientConnectionKey: 'remote:ssh:imac',
       ambientSource: true,
       connectionId: 'imac-hermes',
       has_avatar: true,
@@ -298,6 +303,7 @@ describe('roster avatar sync routing', () => {
     } as RosterRow
 
     hostMock.state.connectionId.get.mockReturnValue('')
+    hostMock.state.connectionKey.get.mockReturnValue('local')
     hostMock.state.connectionMode.get.mockReturnValue('local')
 
     pullServerAvatars([bot])
@@ -305,12 +311,30 @@ describe('roster avatar sync routing', () => {
     expect(hostMock.request).not.toHaveBeenCalled()
 
     hostMock.state.connectionMode.get.mockReturnValue('remote')
+    hostMock.state.connectionKey.get.mockReturnValue('remote:ssh:imac')
     pullServerAvatars([bot])
 
     expect(hostMock.request).toHaveBeenCalledWith('profiles.get_asset', {
       asset: 'avatar',
       name: 'legacy-agent'
     })
+  })
+
+  it('does not read a stale legacy avatar after switching between two idless remotes', () => {
+    const bot = {
+      ambientConnectionKey: 'remote:ssh:host-a',
+      ambientSource: true,
+      has_avatar: true,
+      name: 'legacy-agent'
+    } as RosterRow
+
+    hostMock.state.connectionId.get.mockReturnValue('')
+    hostMock.state.connectionMode.get.mockReturnValue('remote')
+    hostMock.state.connectionKey.get.mockReturnValue('remote:ssh:host-b')
+
+    pullServerAvatars([bot])
+
+    expect(hostMock.request).not.toHaveBeenCalled()
   })
 
   it('does not push a stale local avatar onto the newly active gateway', () => {

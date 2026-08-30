@@ -316,6 +316,44 @@ const $activeConnectionId = computed($connection, connection => {
   return connection.mode === 'local' ? 'local' : null
 })
 
+function connectionKeyBaseUrl(raw: string): string {
+  try {
+    const url = new URL(raw)
+
+    url.username = ''
+    url.password = ''
+    url.search = ''
+    url.hash = ''
+
+    return url.toString().replace(/\/$/, '')
+  } catch {
+    return raw.split(/[?#]/, 1)[0]
+  }
+}
+
+const $activeConnectionKey = computed($connection, connection => {
+  if (!connection) {
+    return null
+  }
+
+  const connectionId = String(connection.connectionId || '').trim()
+
+  if (connectionId) {
+    return `connection:${connectionId}`
+  }
+
+  if (connection.mode !== 'remote') {
+    return 'local'
+  }
+
+  return `remote:${JSON.stringify([
+    String(connection.remoteKind || '').trim(),
+    String(connection.remoteHost || '').trim(),
+    String(connection.remoteIdentity || '').trim(),
+    connectionKeyBaseUrl(String(connection.baseUrl || '').trim())
+  ])}`
+})
+
 /** Ordinary session opens fail fast when their gateway or socket is dead. */
 export const DEFAULT_SESSION_HYDRATION_TIMEOUT_MS = 20_000
 /** Cold Bot profiles get a larger per-attempt budget to start their backend
@@ -591,6 +629,9 @@ export const host = {
     busyBySession: readonlyAtom<Record<string, boolean>>($busyBySession),
     /** Registry source that owns the active gateway, when source-scoped. */
     connectionId: readonlyAtom<null | string>($activeConnectionId),
+    /** Credential-free identity of the active backend. Distinguishes legacy
+     * remotes whose descriptor predates registry connection ids. */
+    connectionKey: readonlyAtom<null | string>($activeConnectionKey),
     /** Transport mode of the active gateway, including legacy remotes whose
      * registry connection id is not available in the descriptor. */
     connectionMode: readonlyAtom<'local' | 'remote' | null>($activeConnectionMode),

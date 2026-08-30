@@ -633,10 +633,11 @@ interface UnionRoster {
 
 export function useRoster() {
   const activeConnectionId = useValue(host.state.connectionId)
+  const activeConnectionKey = useValue(host.state.connectionKey || host.state.connectionId)
   const activeConnectionMode = useValue(host.state.connectionMode)
 
   return useQuery({
-    queryKey: [...ROSTER_KEY, activeConnectionId, activeConnectionMode],
+    queryKey: [...ROSTER_KEY, activeConnectionId, activeConnectionMode, activeConnectionKey],
     queryFn: async () => {
       // Stamp the ISSUE time on the snapshot: mergeServerMeta compares it
       // against each bot's last local meta write, and a fetch issued before
@@ -669,11 +670,25 @@ export function useRoster() {
         name: String(host.state.profile?.get?.() || 'default').trim() || 'default'
       }
 
-      const local = await requestForBot<RosterSnapshot>(activeBot, 'profiles.list', {})
+      const rawLocal = await requestForBot<RosterSnapshot>(activeBot, 'profiles.list', {})
+
+      const local = {
+        ...(rawLocal && typeof rawLocal === 'object' ? rawLocal : {}),
+        profiles: (Array.isArray(rawLocal?.profiles) ? rawLocal.profiles : []).map(profile =>
+          profile?.remoteSource
+            ? profile
+            : {
+                ...profile,
+                ...(activeConnectionKey ? { ambientConnectionKey: activeConnectionKey } : {}),
+                ambientSource: true
+              }
+        )
+      }
+
       // Newer backends inject the teammate-messaging protocol into every
       // session's system prompt (agent.bot_mode_protocol) — SOUL.md must not
       // carry a second copy. Older gateways lack the flag: keep appending.
-      serverInjectsProtocol = Boolean(local?.bot_mode_protocol)
+      serverInjectsProtocol = Boolean(rawLocal?.bot_mode_protocol)
 
       // Multi-source desktops (hermes-agent #86875) also expose the union
       // agent roster across every registered connection. Merge agents from
@@ -684,7 +699,16 @@ export function useRoster() {
         try {
           const union = await host.agents()
           const previous: RosterRow[] = $lastRoster.get().filter(row => !row?.ghost)
-          const merged = mergeMultiSourceRoster(local, union, activeConnectionId, previous, activeConnectionMode)
+
+          const merged = mergeMultiSourceRoster(
+            local,
+            union,
+            activeConnectionId,
+            previous,
+            activeConnectionMode,
+            activeConnectionKey
+          )
+
           const sources = Array.isArray(union?.sources) ? union.sources : []
 
           return {
@@ -712,7 +736,8 @@ export function useRoster() {
 
 /** Synchronous union-roster read for the composer surfaces (autocomplete
  *  provider + mention middleware). useRoster caches under
- *  [...ROSTER_KEY, activeConnectionId, activeConnectionMode], so a bare
+ *  [...ROSTER_KEY, activeConnectionId, activeConnectionMode,
+ *  activeConnectionKey], so a bare
  *  getQueryData(ROSTER_KEY) exact-match lookup returns undefined forever
  *  (issue #89303: remote handles absent from @ autocomplete, mentions
  *  unrouted). Read only the live route's exact entry. A roster cached for a
@@ -725,8 +750,15 @@ export function cachedUnionRoster(): RosterSnapshot | null {
 
   try {
     const connectionId = host.state.connectionId?.get?.() ?? null
+    const connectionKey = host.state.connectionKey?.get?.() ?? connectionId
     const connectionMode = host.state.connectionMode?.get?.() ?? null
-    const exact = queryClient.getQueryData<RosterSnapshot>([...ROSTER_KEY, connectionId, connectionMode])
+
+    const exact = queryClient.getQueryData<RosterSnapshot>([
+      ...ROSTER_KEY,
+      connectionId,
+      connectionMode,
+      connectionKey
+    ])
 
     if (Array.isArray(exact?.profiles)) {
       return exact
@@ -753,7 +785,8 @@ function mergeMultiSourceRoster(
   union: UnionRoster | null | undefined,
   activeConnectionId?: null | string,
   previous: RosterRow[] = [],
-  activeConnectionMode?: 'local' | 'remote' | null
+  activeConnectionMode?: 'local' | 'remote' | null,
+  activeConnectionKey?: null | string
 ): RosterSnapshot {
   const localProfiles = Array.isArray(local?.profiles) ? local.profiles : []
   const agents = Array.isArray(union?.agents) ? union.agents : []
@@ -765,7 +798,20 @@ function mergeMultiSourceRoster(
   // This-device shadow of default.
   const liveProvided = arguments.length >= 3
   const liveId = String(activeConnectionId || '').trim()
-  let activeId = liveId || (liveProvided ? '' : String(union?.primaryConnectionId || '').trim())
+  const ambientKey = String(activeConnectionKey || '').trim()
+
+  const previousAmbientId = ambientKey
+    ? String(
+        previous.find(
+          row =>
+            row?.ambientSource === true &&
+            row.ambientConnectionKey === ambientKey &&
+            String(row.connectionId || '').trim()
+        )?.connectionId || ''
+      ).trim()
+    : ''
+
+  let activeId = liveId || previousAmbientId || (liveProvided ? '' : String(union?.primaryConnectionId || '').trim())
 
   // Migrated remote-primary windows can still expose a legacy remote
   // descriptor without connectionId. That produces a null live id even
@@ -814,6 +860,7 @@ function mergeMultiSourceRoster(
     if (!activeByName.has(name)) {
       activeByName.set(name, {
         ...profile,
+        ...(ambientKey ? { ambientConnectionKey: ambientKey } : {}),
         ambientSource: true,
         name
       })

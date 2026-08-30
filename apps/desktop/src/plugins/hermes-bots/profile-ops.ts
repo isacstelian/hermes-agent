@@ -48,6 +48,8 @@ function usesRemoteAvatarGateway(bot: RosterRow) {
 }
 
 function ambientAvatarGatewayMatches(bot: RosterRow) {
+  const ownerConnectionKey = String(bot.ambientConnectionKey || '').trim()
+  const ambientConnectionKey = String(host.state.connectionKey?.get?.() || '').trim()
   const ownerId = String(bot.connectionId || '').trim()
   const ambientId = String(host.state.connectionId?.get?.() || '').trim()
   const ownerMode = bot.route?.mode
@@ -58,6 +60,10 @@ function ambientAvatarGatewayMatches(bot: RosterRow) {
   // remote roster row is waiting for the new source's roster to arrive.
   if (ownerMode && ambientMode !== ownerMode) {
     return false
+  }
+
+  if (ownerConnectionKey) {
+    return ownerConnectionKey === ambientConnectionKey
   }
 
   if (ownerId && ambientId) {
@@ -127,7 +133,7 @@ function pushLocalAvatars(roster: RosterRow[]) {
     }
 
     avatarPushInflight.add(key)
-    const ambientConnectionId = usesRemoteAvatarGateway(bot) ? null : host.state.connectionId?.get?.()
+    const ambientConnectionKey = usesRemoteAvatarGateway(bot) ? null : host.state.connectionKey?.get?.()
 
     rasterizeSvgToPng(svg, 160)
       .then(png => {
@@ -142,7 +148,7 @@ function pushLocalAvatars(roster: RosterRow[]) {
         // this profile's avatar to the newly active Hermes installation.
         if (
           !remoteGateway &&
-          (!ambientAvatarGatewayMatches(bot) || host.state.connectionId?.get?.() !== ambientConnectionId)
+          (!ambientAvatarGatewayMatches(bot) || host.state.connectionKey?.get?.() !== ambientConnectionKey)
         ) {
           throw new Error('avatar gateway changed')
         }
