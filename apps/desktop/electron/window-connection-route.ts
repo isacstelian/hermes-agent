@@ -10,6 +10,10 @@ interface PublishedSshRouteState {
   registryConnectionId?: string
 }
 
+interface PublishedSshRouteRegistry {
+  get(scope: string): PublishedSshRouteState | null | undefined
+}
+
 interface RegistryConnectionIdentity {
   id: string
 }
@@ -67,6 +71,29 @@ export function activeRosterConnectionId(
   const published = String(sshState?.registryConnectionId || '').trim()
 
   return published && known.has(published) ? published : null
+}
+
+/** Locate the published SSH state serving an idless window route. Profile
+ * overrides publish under their profile key; a global primary publishes at
+ * the empty legacy scope even though the renderer names its active profile. */
+export function activeRosterSshState(
+  route: WindowConnectionRoute | null | undefined,
+  primaryProfile: string,
+  published: PublishedSshRouteRegistry
+): PublishedSshRouteState | null {
+  if (route?.registryScoped) {
+    return null
+  }
+
+  const primary = String(primaryProfile || '').trim() || 'default'
+  const profile = String(route?.profile || '').trim() || primary
+  const profileState = published.get(profile)
+
+  if (profileState) {
+    return profileState
+  }
+
+  return profile === primary ? published.get('') || null : null
 }
 
 export class WindowConnectionRouteRegistry {

@@ -402,6 +402,7 @@ import { createWakeIndicatorWindowController } from './wake-indicator-window'
 import { enumerateWindowsFrontToBack, enumerationFailed, readWindowBelow } from './window-below'
 import {
   activeRosterConnectionId,
+  activeRosterSshState,
   registrySshScopeForWindowRoute,
   WindowConnectionRouteRegistry
 } from './window-connection-route'
@@ -15119,10 +15120,7 @@ ipcMain.handle('hermes:agents:roster', async event => {
   const registry = readDesktopConnectionsRegistry()
   const enumerations = await enumerateRegistryAgentSources(registry)
   const windowRoute = windowConnectionRoutes.get(event.sender.id)
-
-  const activeSshState = windowRoute?.registryScoped
-    ? null
-    : sshConnections.get(sshScopeKey(windowRoute?.profile ?? primaryProfileKey()))
+  const activeSshState = activeRosterSshState(windowRoute, primaryProfileKey(), sshConnections)
 
   const activeConnectionId = activeRosterConnectionId(windowRoute, registry.connections, activeSshState)
 

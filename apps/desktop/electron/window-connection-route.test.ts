@@ -4,6 +4,7 @@ import { test } from 'vitest'
 
 import {
   activeRosterConnectionId,
+  activeRosterSshState,
   normalizeWindowConnectionRoute,
   registrySshScopeForWindowRoute,
   WindowConnectionRouteRegistry
@@ -146,4 +147,31 @@ test('keeps a live legacy SSH owner after Settings changes registry primary', ()
 
 test('does not publish a retired route identity', () => {
   assert.equal(activeRosterConnectionId(null, [{ id: 'new-primary' }], { registryConnectionId: 'active-old' }), null)
+})
+
+test('finds a global primary SSH state published at the empty scope', () => {
+  const state = { registryConnectionId: 'active-old' }
+  const published = new Map([['', state]])
+
+  assert.equal(
+    activeRosterSshState(
+      { connectionId: null, profile: 'default', registryScoped: false },
+      'default',
+      published
+    ),
+    state
+  )
+})
+
+test('does not borrow the global primary state for a different profile', () => {
+  const published = new Map([['', { registryConnectionId: 'primary' }]])
+
+  assert.equal(
+    activeRosterSshState(
+      { connectionId: null, profile: 'research', registryScoped: false },
+      'default',
+      published
+    ),
+    null
+  )
 })
