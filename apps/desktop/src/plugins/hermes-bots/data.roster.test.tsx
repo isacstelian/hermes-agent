@@ -516,6 +516,7 @@ describe('a null live id', () => {
     const inferred = rows.find(row => row.name === 'default')!
 
     expect(inferred.connectionId).toBe('noah')
+    expect(inferred.ambientSource).toBe(true)
     expect(inferred.remoteSource).toBeUndefined()
     expect(rows.find(row => row.name === 'archie')).toMatchObject({ connectionId: 'local', remoteSource: true })
   })

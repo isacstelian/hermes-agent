@@ -73,6 +73,8 @@ export interface BotMeta {
 
 export interface RosterRow {
   name: string
+  /** This row came from the gateway that produced the current profiles.list. */
+  ambientSource?: boolean
   canonical_session?: CanonicalSession | null
   connectionId?: string
   connectionKind?: string

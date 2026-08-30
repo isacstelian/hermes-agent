@@ -49,8 +49,16 @@ function usesRemoteAvatarGateway(bot: RosterRow) {
 
 function ambientAvatarGatewayMatches(bot: RosterRow) {
   const ownerId = String(bot.connectionId || '').trim()
+  const ambientId = String(host.state.connectionId?.get?.() || '').trim()
 
-  return !ownerId || ownerId === String(host.state.connectionId?.get?.() || '').trim()
+  if (ownerId && ambientId) {
+    return ownerId === ambientId
+  }
+
+  // Migrated v1 remote descriptors have no ambient connection id. The roster
+  // merge marks rows that came from this exact gateway's profiles.list, which
+  // is enough to keep avatar sync on host.request without per-profile dials.
+  return !ownerId || bot.ambientSource === true
 }
 
 /** Backfill: local meta has art the server lacks -> profiles.set_asset.

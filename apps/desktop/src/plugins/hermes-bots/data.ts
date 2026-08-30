@@ -824,6 +824,7 @@ function mergeMultiSourceRoster(
     if (!activeByName.has(name)) {
       activeByName.set(name, {
         ...profile,
+        ambientSource: true,
         name
       })
     }

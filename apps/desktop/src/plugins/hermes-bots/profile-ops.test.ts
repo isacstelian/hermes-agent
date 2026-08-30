@@ -249,6 +249,27 @@ describe('roster avatar sync routing', () => {
     expect(hostMock.requestProfile).not.toHaveBeenCalled()
   })
 
+  it('keeps migrated v1 remote avatars on the ambient gateway when its connection id is absent', () => {
+    const bot = {
+      ambientSource: true,
+      connectionId: 'imac-hermes',
+      has_avatar: true,
+      name: 'legacy-agent',
+      sourceScoped: true
+    } as RosterRow
+
+    hostMock.state.connectionId.get.mockReturnValue('')
+    hostMock.request.mockResolvedValue({ found: false })
+
+    pullServerAvatars([bot])
+
+    expect(hostMock.request).toHaveBeenCalledWith('profiles.get_asset', {
+      asset: 'avatar',
+      name: 'legacy-agent'
+    })
+    expect(hostMock.requestProfile).not.toHaveBeenCalled()
+  })
+
   it('does not push a stale local avatar onto the newly active gateway', () => {
     const bot = {
       connectionId: 'imac-hermes',
