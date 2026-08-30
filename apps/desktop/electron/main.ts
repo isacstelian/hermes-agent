@@ -14228,7 +14228,7 @@ ipcMain.handle('hermes:connection:for', async (_event, payload) => {
   return { ...connection, connectionId: id, registryScoped: true }
 })
 registerCancelSshBootstrapIpc(ipcMain, {
-  cancelAndWait: scope => sshBootstrapCoordinator.cancelAndWait(scope),
+  cancelAndWait: (scope, whileDrained) => sshBootstrapCoordinator.cancelAndWait(scope, whileDrained),
   readRegistry: readDesktopConnectionsRegistry,
   scopeKey: backendScopeKey,
   stopPoolBackend,

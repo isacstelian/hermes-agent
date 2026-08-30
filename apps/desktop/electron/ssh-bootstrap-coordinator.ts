@@ -291,7 +291,7 @@ function createBootstrapCoordinator({
     }
   }
 
-  async function cancelAndWait(scope) {
+  async function cancelAndWait(scope, whileDrained = null) {
     const existingDrain = drains.get(scope)
 
     if (existingDrain) {
@@ -330,6 +330,10 @@ function createBootstrapCoordinator({
       // drain barrier still prevents stale resurrection.
       await Promise.allSettled(entries.flatMap(entry => [...entry.forceCleanups]).map(cleanup => cleanup()))
       await Promise.allSettled(entries.map(entry => entry.promise))
+
+      if (typeof whileDrained === 'function') {
+        await whileDrained()
+      }
     } finally {
       for (const drainScope of drainScopes) {
         if (drains.get(drainScope) === barrier) {

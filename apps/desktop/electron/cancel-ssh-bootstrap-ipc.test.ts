@@ -62,9 +62,9 @@ describe('cancel SSH bootstrap IPC', () => {
       { cancelScopes: [scope], managedScope: 'primary' }
     )
 
-    const cancelAndWait = vi.fn(async (targetScope: string) => {
+    const cancelAndWait = vi.fn(async (targetScope: string, whileDrained?: () => Promise<void> | void) => {
       calls.push('cancel')
-      await coordinator.cancelAndWait(targetScope)
+      await coordinator.cancelAndWait(targetScope, whileDrained)
     })
 
     const stopPoolBackend = vi.fn(async () => {
@@ -91,11 +91,66 @@ describe('cancel SSH bootstrap IPC', () => {
     ).resolves.toEqual({ cancelled: true, ok: true })
     await running
 
-    expect(cancelAndWait).toHaveBeenCalledWith(scope)
+    expect(cancelAndWait).toHaveBeenCalledWith(scope, expect.any(Function))
     expect(stopPoolBackend).toHaveBeenCalledWith(scope)
     expect(teardownSshRoute).toHaveBeenCalledWith('imac', scope)
     expect(coordinator.pending.has('')).toBe(false)
     expect(calls).toEqual(['cancel', 'cleanup', 'stop', 'teardown'])
+  })
+
+  it('keeps replacement publication blocked until pool and SSH teardown finish', async () => {
+    const ipc = createIpcHarness()
+    const coordinator = createBootstrapCoordinator()
+    const scope = backendScopeKey('imac', 'default')
+    let finishRunning!: () => void
+    let finishTeardown!: () => void
+    let replacementStarted = false
+
+    const teardownGate = new Promise<void>(resolve => {
+      finishTeardown = resolve
+    })
+
+    const running = coordinator.start(
+      '',
+      'old',
+      async lease => {
+        await new Promise<void>(resolve => {
+          finishRunning = resolve
+          lease.onForceCleanup(resolve)
+        })
+        lease.assertCurrent()
+      },
+      { cancelScopes: [scope], managedScope: 'primary' }
+    )
+
+    registerCancelSshBootstrapIpc(ipc.ipcMain, {
+      cancelAndWait: (target, whileDrained) => coordinator.cancelAndWait(target, whileDrained),
+      readRegistry: () => ({ connections: [{ id: 'imac', kind: 'ssh' }] }),
+      scopeKey: backendScopeKey,
+      stopPoolBackend: vi.fn(async () => undefined),
+      teardownSshRoute: vi.fn(async () => teardownGate)
+    })
+
+    await Promise.resolve()
+    const cancelling = invokeCancelSshBootstrap(ipc.ipcRenderer, { connectionId: 'imac', profile: 'default' })
+
+    const replacement = coordinator.start('', 'new', async () => {
+      replacementStarted = true
+    })
+
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(replacementStarted).toBe(false)
+
+    finishRunning()
+    await Promise.resolve()
+    expect(replacementStarted).toBe(false)
+
+    finishTeardown()
+    await cancelling
+    await expect(running).rejects.toMatchObject({ kind: 'superseded' })
+    await replacement
+    expect(replacementStarted).toBe(true)
   })
 
   it('refuses to cancel non-SSH registry sources', async () => {

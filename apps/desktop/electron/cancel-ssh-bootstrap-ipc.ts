@@ -24,7 +24,7 @@ interface IpcRendererLike {
 }
 
 interface CancelBootstrapDeps {
-  cancelAndWait(scope: string): Promise<void>
+  cancelAndWait(scope: string, whileDrained?: () => MaybePromise<void>): Promise<void>
   readRegistry(): { connections: Array<{ id: string; kind: string }> }
   scopeKey(connectionId: string, profile: string): string
   stopPoolBackend(scope: string): MaybePromise<unknown>
@@ -78,9 +78,10 @@ function registerCancelSshBootstrapIpc(ipcMain: IpcMainLike, deps: CancelBootstr
 
     const scope = deps.scopeKey(connectionId, profile)
 
-    await deps.cancelAndWait(scope)
-    await deps.stopPoolBackend(scope)
-    await deps.teardownSshRoute(connectionId, scope)
+    await deps.cancelAndWait(scope, async () => {
+      await deps.stopPoolBackend(scope)
+      await deps.teardownSshRoute(connectionId, scope)
+    })
 
     return { cancelled: true, ok: true }
   })
