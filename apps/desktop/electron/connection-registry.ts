@@ -226,10 +226,19 @@ export function registryOwnedSshScopes(
   const prefix = backendScopePrefix(id)
   const scopes = new Set<string>()
 
-  const ownsScope = (scope: string, state?: RegistryOwnedSshScopeState): boolean =>
-    scope.startsWith(prefix) ||
-    String(state?.registryConnectionId || '').trim() === id ||
-    Boolean(state?.cancelScopes?.some(cancelScope => cancelScope.startsWith(prefix)))
+  const ownsScope = (scope: string, state?: RegistryOwnedSshScopeState): boolean => {
+    if (scope.startsWith(prefix)) {
+      return true
+    }
+
+    const registryConnectionId = String(state?.registryConnectionId || '').trim()
+
+    if (registryConnectionId) {
+      return registryConnectionId === id
+    }
+
+    return Boolean(state?.cancelScopes?.some(cancelScope => cancelScope.startsWith(prefix)))
+  }
 
   for (const [scope, state] of published) {
     if (ownsScope(scope, state)) {

@@ -707,6 +707,22 @@ test('registryOwnedSshScopes includes an active primary through its registry ali
   assert.deepEqual(registryOwnedSshScopes([], active, 'imac'), [''])
 })
 
+test('registryOwnedSshScopes does not claim a coalesced primary owned by another connection', () => {
+  const imacAlias = backendScopeKey('imac', 'default')
+  const otherAlias = backendScopeKey('other', 'default')
+
+  const coalescedState = {
+    cancelScopes: [otherAlias, imacAlias],
+    registryConnectionId: 'other'
+  }
+
+  const published = new Map([['', coalescedState]])
+  const active = [{ scope: '', metadata: coalescedState }]
+
+  assert.deepEqual(registryOwnedSshScopes(published, active, 'imac'), [])
+  assert.deepEqual(registryOwnedSshScopes(published, active, 'other'), [''])
+})
+
 // --- resolveRegistryLocalRoute (registry 'local' entry vs the v1 route) ---
 
 test('registry local route: delegates to the legacy path when v1 is local (single-source users byte-identical)', () => {
