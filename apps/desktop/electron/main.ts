@@ -347,6 +347,7 @@ import { ensureLoginShellPath } from './shell-path'
 import { createBootstrapCoordinator, sshConfigFingerprint } from './ssh-bootstrap-coordinator'
 import {
   SSH_BOOTSTRAP_MAX_CONCURRENCY,
+  SSH_BOOTSTRAP_RESERVED_PRIMARY_SLOTS,
   sshReadyTimeoutMs
 } from './ssh-bootstrap-policy'
 import { collectSshConfigHosts, parseSshGOutput } from './ssh-config'
@@ -9851,7 +9852,10 @@ function clearManagedSshRecovery(connectionId, correlationId) {
   }
 }
 
-const sshBootstrapCoordinator = createBootstrapCoordinator({ maxConcurrent: SSH_BOOTSTRAP_MAX_CONCURRENCY })
+const sshBootstrapCoordinator = createBootstrapCoordinator({
+  maxConcurrent: SSH_BOOTSTRAP_MAX_CONCURRENCY,
+  reservedPrimarySlots: SSH_BOOTSTRAP_RESERVED_PRIMARY_SLOTS
+})
 
 let sshQuitTeardownDone = false
 let backendQuitTeardownDone = false

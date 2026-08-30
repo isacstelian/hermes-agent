@@ -138,6 +138,66 @@ test('a primary reconnect jumps ahead of queued profile prewarms', async () => {
   await active[1]
 })
 
+test('a reserved primary permit stays available while profile prewarms are queued', async () => {
+  const coordinator = createBootstrapCoordinator({ maxConcurrent: 2, reservedPrimarySlots: 1 })
+
+  const gates = {
+    firstPool: deferred(),
+    primary: deferred(),
+    secondPool: deferred()
+  }
+
+  const started: string[] = []
+  let maxRunning = 0
+  let running = 0
+
+  const run = async (name, gate) => {
+    started.push(name)
+    running += 1
+    maxRunning = Math.max(maxRunning, running)
+
+    try {
+      await gate.promise
+    } finally {
+      running -= 1
+    }
+  }
+
+  const firstPool = coordinator.start('pool-first', 'x', () => run('pool-first', gates.firstPool), {
+    managedScope: 'pool'
+  })
+
+  const secondPool = coordinator.start('pool-second', 'x', () => run('pool-second', gates.secondPool), {
+    managedScope: 'pool'
+  })
+
+  await Promise.resolve()
+  await Promise.resolve()
+  assert.deepEqual(started, ['pool-first'])
+
+  const primary = coordinator.start('primary', 'x', () => run('primary', gates.primary), {
+    managedScope: 'primary'
+  })
+
+  await Promise.resolve()
+  await Promise.resolve()
+  assert.deepEqual(started, ['pool-first', 'primary'])
+
+  gates.primary.resolve()
+  await primary
+  await Promise.resolve()
+  assert.deepEqual(started, ['pool-first', 'primary'])
+
+  gates.firstPool.resolve()
+  await firstPool
+  await Promise.resolve()
+  assert.deepEqual(started, ['pool-first', 'primary', 'pool-second'])
+
+  gates.secondPool.resolve()
+  await secondPool
+  assert.equal(maxRunning, 2)
+})
+
 test('changed fingerprint waits for old rollback before starting', async () => {
   const coordinator = createBootstrapCoordinator()
   const gate = deferred()

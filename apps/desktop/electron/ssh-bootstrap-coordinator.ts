@@ -29,33 +29,69 @@ function bootstrapPriority(metadata) {
   return metadata?.managedScope === 'primary' ? 1 : 0
 }
 
-function createBootstrapCoordinator({ maxConcurrent = Number.POSITIVE_INFINITY } = {}) {
+function createBootstrapCoordinator({
+  maxConcurrent = Number.POSITIVE_INFINITY,
+  reservedPrimarySlots = 0
+} = {}) {
   const active = new Set<any>()
   const pending = new Map<string, any>()
   const generations = new Map<string, number>()
   const drains = new Map<string, Promise<void>>()
   const concurrency = Number.isFinite(maxConcurrent) ? Math.max(1, Math.floor(maxConcurrent)) : Number.POSITIVE_INFINITY
+
+  const requestedPrimaryReservation = Number.isFinite(reservedPrimarySlots)
+    ? Math.max(0, Math.floor(reservedPrimarySlots))
+    : 0
+
+  const primaryReservation = Number.isFinite(concurrency)
+    ? Math.min(concurrency, requestedPrimaryReservation)
+    : 0
+
+  // Reservation gates new non-primary work only. Active bootstraps are never
+  // preempted or cancelled to make room for a later primary.
+  const nonPrimaryConcurrency = concurrency - primaryReservation
   const waiters: any[] = []
   let waiterSequence = 0
   let running = 0
+  let runningNonPrimary = 0
   let shutdownRequested = false
 
-  function releasePermit() {
+  function releasePermit(primary) {
     running = Math.max(0, running - 1)
+
+    if (!primary) {
+      runningNonPrimary = Math.max(0, runningNonPrimary - 1)
+    }
+
     pump()
   }
 
   function pump() {
     while (running < concurrency && waiters.length > 0) {
       waiters.sort((left, right) => right.priority - left.priority || left.sequence - right.sequence)
-      const waiter = waiters.shift()
 
-      if (waiter.cancelled || waiter.signal.aborted) {
-        continue
+      for (let index = waiters.length - 1; index >= 0; index -= 1) {
+        const waiter = waiters[index]
+
+        if (waiter.cancelled || waiter.signal.aborted) {
+          waiters.splice(index, 1)
+        }
       }
 
+      const waiterIndex = waiters.findIndex(waiter => waiter.primary || runningNonPrimary < nonPrimaryConcurrency)
+
+      if (waiterIndex < 0) {
+        return
+      }
+
+      const [waiter] = waiters.splice(waiterIndex, 1)
       waiter.signal.removeEventListener('abort', waiter.onAbort)
       running += 1
+
+      if (!waiter.primary) {
+        runningNonPrimary += 1
+      }
+
       waiter.launch()
     }
   }
@@ -70,6 +106,7 @@ function createBootstrapCoordinator({ maxConcurrent = Number.POSITIVE_INFINITY }
         cancelled: false,
         launch: null,
         onAbort: null,
+        primary: metadata?.managedScope === 'primary',
         priority: bootstrapPriority(metadata),
         sequence: waiterSequence++,
         signal
@@ -81,7 +118,7 @@ function createBootstrapCoordinator({ maxConcurrent = Number.POSITIVE_INFINITY }
         try {
           result = run()
         } catch (error) {
-          releasePermit()
+          releasePermit(waiter.primary)
           reject(error)
 
           return
@@ -89,11 +126,11 @@ function createBootstrapCoordinator({ maxConcurrent = Number.POSITIVE_INFINITY }
 
         Promise.resolve(result).then(
           value => {
-            releasePermit()
+            releasePermit(waiter.primary)
             resolve(value)
           },
           error => {
-            releasePermit()
+            releasePermit(waiter.primary)
             reject(error)
           }
         )
