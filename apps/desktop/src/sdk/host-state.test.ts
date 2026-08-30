@@ -63,10 +63,13 @@ describe('host.state focused-session atoms', () => {
 
     session.setConnection({ connectionId: 'work', mode: 'remote' } as never)
     expect(host.state.connectionId.get()).toBe('work')
+    expect(host.state.connectionMode.get()).toBe('remote')
 
     session.setConnection({ mode: 'local' } as never)
     expect(host.state.connectionId.get()).toBe('local')
+    expect(host.state.connectionMode.get()).toBe('local')
     session.setConnection(null)
+    expect(host.state.connectionMode.get()).toBeNull()
   })
 
   it('follows the interacted tile while the primary-only atom stays put', async () => {

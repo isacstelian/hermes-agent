@@ -633,9 +633,10 @@ interface UnionRoster {
 
 export function useRoster() {
   const activeConnectionId = useValue(host.state.connectionId)
+  const activeConnectionMode = useValue(host.state.connectionMode)
 
   return useQuery({
-    queryKey: [...ROSTER_KEY, activeConnectionId],
+    queryKey: [...ROSTER_KEY, activeConnectionId, activeConnectionMode],
     queryFn: async () => {
       // Stamp the ISSUE time on the snapshot: mergeServerMeta compares it
       // against each bot's last local meta write, and a fetch issued before
@@ -683,7 +684,7 @@ export function useRoster() {
         try {
           const union = await host.agents()
           const previous: RosterRow[] = $lastRoster.get().filter(row => !row?.ghost)
-          const merged = mergeMultiSourceRoster(local, union, activeConnectionId, previous)
+          const merged = mergeMultiSourceRoster(local, union, activeConnectionId, previous, activeConnectionMode)
           const sources = Array.isArray(union?.sources) ? union.sources : []
 
           return {
@@ -766,7 +767,8 @@ function mergeMultiSourceRoster(
   local: RosterSnapshot | null | undefined,
   union: UnionRoster | null | undefined,
   activeConnectionId?: null | string,
-  previous: RosterRow[] = []
+  previous: RosterRow[] = [],
+  activeConnectionMode?: 'local' | 'remote' | null
 ): RosterSnapshot {
   const localProfiles = Array.isArray(local?.profiles) ? local.profiles : []
   const agents = Array.isArray(union?.agents) ? union.agents : []
@@ -799,7 +801,10 @@ function mergeMultiSourceRoster(
         String(agent?.connectionId || '').trim() === primaryId && richNames.has(String(agent?.profile || '').trim())
     )
 
-    if (!localMatches && primaryId && primaryMatches) {
+    const descriptorIdentifiesRemote = activeConnectionMode === 'remote'
+    const descriptorModeUnavailable = activeConnectionMode == null
+
+    if (primaryId && primaryMatches && (descriptorIdentifiesRemote || (descriptorModeUnavailable && !localMatches))) {
       activeId = primaryId
     }
   }

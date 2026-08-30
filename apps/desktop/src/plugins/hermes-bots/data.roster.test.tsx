@@ -34,7 +34,11 @@ const { hostMock } = vi.hoisted(() => ({
     profileRoutes: undefined as unknown,
     request: vi.fn(),
     requestProfile: vi.fn(),
-    state: { connectionId: { get: vi.fn(() => 'local') }, profile: { get: () => 'default' } }
+    state: {
+      connectionId: { get: vi.fn(() => 'local') },
+      connectionMode: { get: vi.fn<() => null | 'local' | 'remote'>(() => 'local') },
+      profile: { get: () => 'default' }
+    }
   }
 }))
 
@@ -78,9 +82,11 @@ interface RowFixture extends Omit<Partial<RosterRow>, 'last_session'> {
 async function mergedRoster(
   local: { profiles: RowFixture[] },
   union: Union | null,
-  liveConnectionId: null | string = 'local'
+  liveConnectionId: null | string = 'local',
+  liveConnectionMode: null | 'local' | 'remote' = liveConnectionId === 'local' ? 'local' : 'remote'
 ): Promise<RowFixture[]> {
   hostMock.state.connectionId.get.mockReturnValue(liveConnectionId as string)
+  hostMock.state.connectionMode.get.mockReturnValue(liveConnectionMode)
   hostMock.request.mockResolvedValue(local)
 
   if (union) {
@@ -483,7 +489,7 @@ describe('a null live id', () => {
     ).toEqual(['bob', 'kai', 'rook'])
   })
 
-  it('infers a matching remote primary when the local inventory does not match', async () => {
+  it('keeps a legacy remote primary rich when local has the same default profile', async () => {
     // Legacy remote descriptors carry mode:'remote' but no connectionId, so
     // the host state reads null even though profiles.list is answering from
     // the registry primary.
@@ -495,8 +501,8 @@ describe('a null live id', () => {
             connectionId: 'local',
             connectionKind: 'local',
             connectionLabel: 'This device',
-            handle: 'archie',
-            profile: 'archie'
+            handle: 'default-this-device',
+            profile: 'default'
           },
           {
             connectionId: 'noah',
@@ -508,17 +514,23 @@ describe('a null live id', () => {
         ],
         primaryConnectionId: 'noah'
       },
-      null
+      null,
+      'remote'
     )
 
     expect(rows).toHaveLength(2)
 
-    const inferred = rows.find(row => row.name === 'default')!
+    const inferred = rows.find(row => row.connectionId === 'noah')!
 
-    expect(inferred.connectionId).toBe('noah')
     expect(inferred.ambientSource).toBe(true)
+    expect(inferred.last_session?.id).toBe('noah-chat')
     expect(inferred.remoteSource).toBeUndefined()
-    expect(rows.find(row => row.name === 'archie')).toMatchObject({ connectionId: 'local', remoteSource: true })
+    expect(inferred.route?.mode).toBe('remote')
+    expect(rows.find(row => row.connectionId === 'local')).toMatchObject({
+      name: 'default',
+      remoteSource: true,
+      route: { mode: 'local' }
+    })
   })
 })
 

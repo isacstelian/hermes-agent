@@ -122,6 +122,7 @@ const focusedTurnFlag = (
   )
 
 const $focusedBusy = focusedTurnFlag(state => state.busy, PRIMARY_SESSION_VIEW.$busy)
+const $activeConnectionMode = computed($connection, connection => connection?.mode ?? null)
 
 const $focusedAwaitingResponse = focusedTurnFlag(
   state => state.awaitingResponse,
@@ -585,6 +586,9 @@ export const host = {
     busyBySession: readonlyAtom<Record<string, boolean>>($busyBySession),
     /** Registry source that owns the active gateway, when source-scoped. */
     connectionId: readonlyAtom<null | string>($activeConnectionId),
+    /** Transport mode of the active gateway, including legacy remotes whose
+     * registry connection id is not available in the descriptor. */
+    connectionMode: readonlyAtom<'local' | 'remote' | null>($activeConnectionMode),
     /** Active workspace cwd ('' when detached). */
     cwd: readonlyAtom<string>($currentCwd),
     /** Runtime id of the FOCUSED chat session — the interacted tile, else the
