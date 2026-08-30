@@ -409,11 +409,12 @@ export const $hydrationSyncProfile = atom<string | null>(null)
 const PREWARM_MIN_INTERVAL_MS = 60_000
 
 const prewarmedAt = new Map<string, number>()
+let prewarmInFlight: Promise<void> | null = null
 
 export function prewarmProfileBackend(name: string): void {
   const key = normalizeProfileKey(name)
 
-  if (key === normalizeProfileKey($activeGatewayProfile.get())) {
+  if (key === normalizeProfileKey($activeGatewayProfile.get()) || prewarmInFlight) {
     return
   }
 
@@ -424,7 +425,15 @@ export function prewarmProfileBackend(name: string): void {
   }
 
   prewarmedAt.set(key, now)
-  openGatewayForProfile(key).catch(() => undefined)
+  const request = openGatewayForProfile(key)
+  prewarmInFlight = request
+  void request
+    .catch(() => undefined)
+    .finally(() => {
+      if (prewarmInFlight === request) {
+        prewarmInFlight = null
+      }
+    })
 }
 
 let gatewaySwitch: Promise<void> | null = null

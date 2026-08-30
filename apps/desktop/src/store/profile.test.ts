@@ -143,14 +143,28 @@ describe('prewarmProfileBackend (hover-intent pool spawn)', () => {
     expect(openGatewayForProfile).not.toHaveBeenCalled()
   })
 
-  it('throttles repeat pre-warms for the same profile within the interval', () => {
+  it('allows only one speculative pre-warm in flight', async () => {
+    let releaseFirst: () => void = () => undefined
+    openGatewayForProfile.mockImplementationOnce(
+      () =>
+        new Promise<undefined>(resolve => {
+          releaseFirst = () => resolve(undefined)
+        })
+    )
+
     prewarmProfileBackend('warm-throttle-a')
     prewarmProfileBackend('warm-throttle-a')
     prewarmProfileBackend('warm-throttle-b')
 
-    const calls = openGatewayForProfile.mock.calls.map(([name]) => name)
-    expect(calls.filter(name => name === 'warm-throttle-a')).toHaveLength(1)
-    expect(calls.filter(name => name === 'warm-throttle-b')).toHaveLength(1)
+    expect(openGatewayForProfile).toHaveBeenCalledTimes(1)
+    expect(openGatewayForProfile).toHaveBeenCalledWith('warm-throttle-a')
+
+    releaseFirst()
+    await vi.waitFor(() => {
+      prewarmProfileBackend('warm-throttle-b')
+      expect(openGatewayForProfile).toHaveBeenCalledTimes(2)
+    })
+    expect(openGatewayForProfile).toHaveBeenLastCalledWith('warm-throttle-b')
   })
 
   it('swallows spawn failures — error UX belongs to the real switch', () => {
