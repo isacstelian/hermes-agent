@@ -47,6 +47,8 @@ import {
   activeGatewayConnectionId,
   openGatewayForAgent,
   openGatewayForProfile,
+  prewarmGatewayForAgent,
+  prewarmGatewayForProfile,
   requestGatewayForAgent,
   requestGatewayForProfile,
   retainGatewayForAgent,
@@ -647,7 +649,7 @@ export const host = {
       return
     }
 
-    void openGatewayForProfile(name).catch(() => undefined)
+    prewarmGatewayForProfile(name)
   },
 
   /** Delete a profile THROUGH the desktop's teardown-routed REST path — the
@@ -787,7 +789,7 @@ export const host = {
    *  `undefined` is accepted alongside `null` because a roster row's
    *  `connectionId` is optional; both mean "no explicit source". */
   warmAgent: (connectionId: null | string | undefined, profile: string): void => {
-    void openGatewayForAgent(connectionId ?? null, (profile ?? '').trim() || 'default').catch(() => undefined)
+    prewarmGatewayForAgent(connectionId ?? null, (profile ?? '').trim() || 'default')
   },
 
   /** Activate an agent's gateway (dialing it if needed) so subsequent

@@ -21,7 +21,7 @@ import {
   ensureGatewayForAgent,
   ensureGatewayForProfile,
   openGatewayForAgent,
-  openGatewayForProfile
+  prewarmGatewayForProfile
 } from '@/store/gateway'
 import { notifyError } from '@/store/notifications'
 import { notifyRemoteOverrideAuthFailure } from '@/store/profile-remote-override'
@@ -400,7 +400,7 @@ export const $hydrationSyncProfile = atom<string | null>(null)
 // plus the socket connect before the sidebar can repopulate. The pointer
 // entering a profile square in the rail signals the switch a few hundred ms
 // before the click lands, so we run the same spawn + connect chain then
-// (openGatewayForProfile — without activating). `ensureBackend` in the
+// (prewarmGatewayForProfile — without activating). `ensureBackend` in the
 // Electron main is idempotent (a pooled profile returns its existing
 // connectionPromise), so the real switch joins the in-flight work instead of
 // duplicating it — and a pre-warm for an already-open profile is a no-op.
@@ -409,12 +409,11 @@ export const $hydrationSyncProfile = atom<string | null>(null)
 const PREWARM_MIN_INTERVAL_MS = 60_000
 
 const prewarmedAt = new Map<string, number>()
-let prewarmInFlight: Promise<void> | null = null
 
 export function prewarmProfileBackend(name: string): void {
   const key = normalizeProfileKey(name)
 
-  if (key === normalizeProfileKey($activeGatewayProfile.get()) || prewarmInFlight) {
+  if (key === normalizeProfileKey($activeGatewayProfile.get())) {
     return
   }
 
@@ -424,16 +423,9 @@ export function prewarmProfileBackend(name: string): void {
     return
   }
 
-  prewarmedAt.set(key, now)
-  const request = openGatewayForProfile(key)
-  prewarmInFlight = request
-  void request
-    .catch(() => undefined)
-    .finally(() => {
-      if (prewarmInFlight === request) {
-        prewarmInFlight = null
-      }
-    })
+  if (prewarmGatewayForProfile(key)) {
+    prewarmedAt.set(key, now)
+  }
 }
 
 let gatewaySwitch: Promise<void> | null = null

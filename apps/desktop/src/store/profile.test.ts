@@ -8,11 +8,16 @@ import type { ProfileInfo } from '@/types/hermes'
 // the REST query client must not run for real in a unit test.
 const ensureGatewayForProfile = vi.fn(async () => undefined)
 const ensureGatewayForAgent = vi.fn(async () => undefined)
-const openGatewayForProfile = vi.fn(async (_profile: string) => undefined)
+const prewarmGatewayForProfile = vi.fn((_profile: string) => true)
 const $gateway = atom<unknown>({ id: 'live-socket' })
 const resetStarmapGraph = vi.fn()
 
-vi.mock('@/store/gateway', () => ({ $gateway, ensureGatewayForAgent, ensureGatewayForProfile, openGatewayForProfile }))
+vi.mock('@/store/gateway', () => ({
+  $gateway,
+  ensureGatewayForAgent,
+  ensureGatewayForProfile,
+  prewarmGatewayForProfile
+}))
 vi.mock('@/hermes', () => ({
   getProfiles: vi.fn(async () => ({ profiles: [] })),
   setApiRequestProfile: vi.fn()
@@ -54,7 +59,8 @@ const getConnection = vi.fn<(profile?: string | null) => Promise<HermesConnectio
 beforeEach(() => {
   getConnection.mockReset()
   ensureGatewayForProfile.mockClear()
-  openGatewayForProfile.mockClear()
+  prewarmGatewayForProfile.mockClear()
+  prewarmGatewayForProfile.mockReturnValue(true)
   $gateway.set({ id: 'live-socket' })
   $activeGatewayProfile.set('default')
   $connection.set(localConn())
@@ -130,7 +136,7 @@ describe('prewarmProfileBackend (hover-intent pool spawn)', () => {
   it('opens the gateway (spawn + connect, no activation) for a non-active profile', () => {
     prewarmProfileBackend('warm-basic')
 
-    expect(openGatewayForProfile).toHaveBeenCalledWith('warm-basic')
+    expect(prewarmGatewayForProfile).toHaveBeenCalledWith('warm-basic')
     // Pre-warm must never activate — that's the click's job.
     expect(ensureGatewayForProfile).not.toHaveBeenCalled()
   })
@@ -140,37 +146,26 @@ describe('prewarmProfileBackend (hover-intent pool spawn)', () => {
 
     prewarmProfileBackend('warm-active')
 
-    expect(openGatewayForProfile).not.toHaveBeenCalled()
+    expect(prewarmGatewayForProfile).not.toHaveBeenCalled()
   })
 
-  it('allows only one speculative pre-warm in flight', async () => {
-    let releaseFirst: () => void = () => undefined
-    openGatewayForProfile.mockImplementationOnce(
-      () =>
-        new Promise<undefined>(resolve => {
-          releaseFirst = () => resolve(undefined)
-        })
-    )
-
+  it('throttles repeat pre-warms for the same profile within the interval', () => {
     prewarmProfileBackend('warm-throttle-a')
     prewarmProfileBackend('warm-throttle-a')
     prewarmProfileBackend('warm-throttle-b')
 
-    expect(openGatewayForProfile).toHaveBeenCalledTimes(1)
-    expect(openGatewayForProfile).toHaveBeenCalledWith('warm-throttle-a')
-
-    releaseFirst()
-    await vi.waitFor(() => {
-      prewarmProfileBackend('warm-throttle-b')
-      expect(openGatewayForProfile).toHaveBeenCalledTimes(2)
-    })
-    expect(openGatewayForProfile).toHaveBeenLastCalledWith('warm-throttle-b')
+    const calls = prewarmGatewayForProfile.mock.calls.map(([name]) => name)
+    expect(calls.filter(name => name === 'warm-throttle-a')).toHaveLength(1)
+    expect(calls.filter(name => name === 'warm-throttle-b')).toHaveLength(1)
   })
 
-  it('swallows spawn failures — error UX belongs to the real switch', () => {
-    openGatewayForProfile.mockRejectedValueOnce(new Error('spawn failed'))
+  it('does not throttle a pre-warm that the shared speculative slot declines', () => {
+    prewarmGatewayForProfile.mockReturnValueOnce(false)
 
-    expect(() => prewarmProfileBackend('warm-failing')).not.toThrow()
+    prewarmProfileBackend('warm-declined')
+    prewarmProfileBackend('warm-declined')
+
+    expect(prewarmGatewayForProfile).toHaveBeenCalledTimes(2)
   })
 })
 

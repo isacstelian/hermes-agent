@@ -1309,6 +1309,45 @@ export async function openGatewayForAgent(
   }
 }
 
+let speculativeGatewayOpenInFlight: Promise<void> | null = null
+
+function beginSpeculativeGatewayOpen(open: () => Promise<void>): boolean {
+  if (speculativeGatewayOpenInFlight) {
+    return false
+  }
+
+  let request: Promise<void>
+
+  try {
+    request = open()
+  } catch {
+    return false
+  }
+
+  speculativeGatewayOpenInFlight = request
+  void request
+    .catch(() => undefined)
+    .finally(() => {
+      if (speculativeGatewayOpenInFlight === request) {
+        speculativeGatewayOpenInFlight = null
+      }
+    })
+
+  return true
+}
+
+// Every hover surface shares one speculative slot. A real click may queue
+// behind that one warm-up, which is exactly the predecessor covered by the
+// renderer's cold-boot timeout; moving across a roster cannot enqueue the
+// other 30 agents behind it.
+export function prewarmGatewayForProfile(profile: string): boolean {
+  return beginSpeculativeGatewayOpen(() => openGatewayForProfile(profile))
+}
+
+export function prewarmGatewayForAgent(connectionId: null | string, profile: string): boolean {
+  return beginSpeculativeGatewayOpen(() => openGatewayForAgent(connectionId, profile))
+}
+
 export async function ensureGatewayForAgent(
   connectionId: null | string,
   profile: string,
