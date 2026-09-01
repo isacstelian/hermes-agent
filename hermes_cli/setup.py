@@ -2428,7 +2428,7 @@ def setup_tools(config: dict, first_install: bool = False):
 
 
 def setup_telemetry(config: dict):
-    """Configure the local, privacy-safe shared-metrics subscriber."""
+    """Configure profile-local metrics and routine feedback collection."""
     print_header("Shared Metrics")
     print_info("Shared metrics contain only bounded counters and histograms.")
     print_info("Packages stay under this Hermes profile and are not uploaded.")
@@ -2451,6 +2451,24 @@ def setup_telemetry(config: dict):
         print_success("Local shared metrics enabled.")
     else:
         print_info("Local shared metrics disabled.")
+
+    cron = config.get("cron")
+    if not isinstance(cron, dict):
+        cron = {}
+        config["cron"] = cron
+    feedback = cron.get("feedback")
+    if not isinstance(feedback, dict):
+        feedback = {}
+        cron["feedback"] = feedback
+
+    feedback["enabled"] = prompt_yes_no(
+        "Add feedback buttons to successful Telegram cron deliveries?",
+        default=feedback.get("enabled") is True,
+    )
+    if feedback["enabled"]:
+        print_success("Local routine feedback enabled.")
+    else:
+        print_info("Local routine feedback disabled.")
 
 
 # =============================================================================

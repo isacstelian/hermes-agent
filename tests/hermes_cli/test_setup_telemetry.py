@@ -23,6 +23,7 @@ def test_setup_telemetry_enables_shared_metrics(monkeypatch):
     setup_telemetry(config)
 
     assert config["telemetry"]["shared_metrics"]["enabled"] is True
+    assert config["cron"]["feedback"]["enabled"] is True
 
 
 def test_setup_parser_accepts_telemetry_section():
