@@ -156,7 +156,9 @@ class TestRecoveryDoesNotLeakMediaFragments:
         monkeypatch.setattr(
             type(adapter),
             "filter_media_delivery_paths_with_drops",
-            staticmethod(lambda m, task_id=None, task_id_factory=None: ([], [])),
+            staticmethod(
+                lambda m, task_id=None, task_id_factory=None, session_key="": ([], [])
+            ),
         )
 
         event = _make_event(Platform.DISCORD)

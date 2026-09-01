@@ -1,6 +1,11 @@
 import { describe, expect, it, vi } from 'vitest'
 
-import { applyConnectionChange, commitConnectionFailure, resolveTerminalConnection } from './connection-apply'
+import {
+  applyConnectionChange,
+  commitConnectionFailure,
+  resolveTerminalConnection,
+  teardownSshState
+} from './connection-apply'
 
 function deferred() {
   let resolve!: () => void
@@ -20,10 +25,12 @@ describe('applyConnectionChange', () => {
       const events: string[] = []
 
       const run = applyConnectionChange({
-        cancelAndWait: async () => {
+        cancelAndWait: async (_scope, whileDrained) => {
           events.push('cancel')
           await gate.promise
           events.push('drained')
+          await whileDrained()
+          events.push('released')
         },
         isPrimary: true,
         scope: '',
@@ -41,15 +48,17 @@ describe('applyConnectionChange', () => {
       expect(events).toEqual(['cancel'])
       gate.resolve()
       await run
-      expect(events).toEqual(['cancel', 'drained', 'ssh', 'primary', 'applied'])
+      expect(events).toEqual(['cancel', 'drained', 'ssh', 'primary', 'applied', 'released'])
     }
   )
 
   it('tears down only a non-primary scope without applying the primary connection', async () => {
     const events: string[] = []
     await applyConnectionChange({
-      cancelAndWait: async scope => {
+      cancelAndWait: async (scope, whileDrained) => {
         events.push(`cancel:${scope}`)
+        await whileDrained()
+        events.push('released')
       },
       isPrimary: false,
       scope: 'worker',
@@ -62,7 +71,7 @@ describe('applyConnectionChange', () => {
         events.push(`ssh:${scope}`)
       }
     })
-    expect(events).toEqual(['cancel:worker', 'ssh:worker', 'pool:worker'])
+    expect(events).toEqual(['cancel:worker', 'ssh:worker', 'pool:worker', 'released'])
   })
 })
 
@@ -83,6 +92,39 @@ describe('resolveTerminalConnection', () => {
         async () => undefined
       )
     ).rejects.toThrow('not ready')
+  })
+})
+
+describe('teardownSshState', () => {
+  it('terminates the owned remote backend before closing its tunnel and SSH transport', async () => {
+    const events: string[] = []
+
+    const ssh = {
+      cancelForward: async () => events.push('forward'),
+      close: async () => events.push('ssh')
+    }
+
+    await teardownSshState(
+      { ssh, ownershipId: 'owner', localPort: 1234, remotePort: 5678 },
+      { cleanupRemote: async () => events.push('remote') }
+    )
+
+    expect(events).toEqual(['remote', 'forward', 'ssh'])
+  })
+
+  it('still closes the SSH transport when remote cleanup fails', async () => {
+    const close = vi.fn(async () => undefined)
+
+    await teardownSshState(
+      { ssh: { cancelForward: vi.fn(async () => undefined), close }, ownershipId: 'owner' },
+      {
+        cleanupRemote: async () => {
+          throw new Error('remote unavailable')
+        }
+      }
+    )
+
+    expect(close).toHaveBeenCalledOnce()
   })
 })
 
