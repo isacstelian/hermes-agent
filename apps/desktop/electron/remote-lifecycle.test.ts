@@ -10,6 +10,7 @@ import { test } from 'vitest'
 import { profileSshOverride } from './connection-config'
 import {
   assertRemoteInstallUpdateClear,
+  buildOwnedDarwinTerminationCommand,
   buildSpawnCommand,
   classifySshReuseProof,
   cleanupStale,
@@ -126,7 +127,11 @@ function fakeSsh(rules: any[] = []) {
         }
       }
 
-      if ((cmd.includes('os.kill(pid') && !cmd.includes('pidfd_open')) || cmd.includes('printf TERMINATED')) {
+      if (
+        cmd.includes('pidfd_open') ||
+        (cmd.includes('os.kill(pid') && !cmd.includes('pidfd_open')) ||
+        cmd.includes('printf TERMINATED')
+      ) {
         return 'TERMINATED'
       }
 
@@ -727,7 +732,7 @@ test('disconnect reaps the backend recorded for this desktop ownership', async (
 
   await disconnect(ssh, OWNERSHIP_ID)
 
-  assert.ok(ssh.calls.some(command => /kill 333\b/.test(command)))
+  assert.ok(ssh.calls.some(command => command.includes('pid=333') && command.includes('pidfd_send_signal')))
   assert.ok(ssh.calls.some(command => /rm -f .*backend\.lock\.json/.test(command)))
 })
 
@@ -764,7 +769,7 @@ test('cleanupStale kills ONLY a provably-ours pid, always drops the lockfile', a
     hermesPath: '/x/hermes',
     logPath: spawnLogPath(OWNERSHIP_ID, SPAWN_NONCE)
   })
-  assert.ok(ours.calls.some(c => /kill 9\b/.test(c)))
+  assert.ok(ours.calls.some(c => c.includes('pid=9') && c.includes('pidfd_send_signal')))
   assert.ok(ours.calls.some(c => /rm -f/.test(c)))
 })
 
@@ -1779,7 +1784,7 @@ test('connect replaces an exact-owned backend only after authenticated stale pro
   // used by the managed-update path (terminateOwnedDashboardForUpdate), not
   // by connect's stale replacement. Assert the CONTRACT: the owned pid was
   // signalled and the record reclaimed.
-  assert.ok(ssh.calls.some(command => /kill 333\b/.test(command)))
+  assert.ok(ssh.calls.some(command => command.includes('pid=333') && command.includes('pidfd_send_signal')))
   assert.ok(ssh.calls.some(command => /rm -f .*backend\.lock\.json/.test(command)))
 })
 
@@ -1813,7 +1818,7 @@ test('cleanupStale escalates to SIGKILL when the backend survives the graceful w
   // graceful-wait failure must escalate to SIGKILL and still drop the lock.
   const ssh = fakeSsh([
     [/print\("OWNED"/, 'OWNED\n'],
-    [(cmd: string) => /kill 9\b/.test(cmd) && !/kill -9 9\b/.test(cmd), 'TIMEOUT\n']
+    [(cmd: string) => cmd.includes('pidfd_open') && cmd.includes('signal.SIGKILL if False'), 'TIMEOUT\n']
   ])
 
   await cleanupStale(ssh, OWNERSHIP_ID, {
@@ -1824,7 +1829,7 @@ test('cleanupStale escalates to SIGKILL when the backend survives the graceful w
   })
 
   assert.ok(
-    ssh.calls.some(c => /kill -9 9\b/.test(c)),
+    ssh.calls.some(c => c.includes('pidfd_open') && c.includes('signal.SIGKILL if True')),
     'must escalate to SIGKILL after the graceful wait fails'
   )
   assert.ok(
@@ -1836,8 +1841,8 @@ test('cleanupStale escalates to SIGKILL when the backend survives the graceful w
 test('cleanupStale keeps the lockfile when even SIGKILL cannot confirm the pid died', async () => {
   const ssh = fakeSsh([
     [/print\("OWNED"/, 'OWNED\n'],
-    [(cmd: string) => /kill 9\b/.test(cmd) && !/kill -9 9\b/.test(cmd), 'TIMEOUT\n'],
-    [(cmd: string) => /kill -9 9\b/.test(cmd), 'REFUSED\n']
+    [(cmd: string) => cmd.includes('pidfd_open') && cmd.includes('signal.SIGKILL if False'), 'TIMEOUT\n'],
+    [(cmd: string) => cmd.includes('pidfd_open') && cmd.includes('signal.SIGKILL if True'), 'REFUSED\n']
   ])
 
   await assert.rejects(
@@ -1854,25 +1859,37 @@ test('cleanupStale keeps the lockfile when even SIGKILL cannot confirm the pid d
   assert.ok(!ssh.calls.some(c => /rm -f .*backend\.lock\.json/.test(c)))
 })
 
-test('cleanupStale refuses a recycled pid at the signal boundary', async () => {
-  const ssh = fakeSsh([
-    [/print\("OWNED"/, 'OWNED\n'],
-    [(cmd: string) => /cmd=\$\(ps .*kill 9\b/.test(cmd), 'REFUSED\n']
-  ])
+test('Darwin cleanup signals by nonce and leaves an unrelated process alive', async () => {
+  const nonce = 'fedcba9876543210'
 
-  await assert.rejects(
-    cleanupStale(ssh, OWNERSHIP_ID, {
-      pid: 9,
-      spawnNonce: SPAWN_NONCE,
-      hermesPath: '/x/hermes',
-      logPath: spawnLogPath(OWNERSHIP_ID, SPAWN_NONCE)
-    }),
-    /identity changed/
-  )
+  const owned = spawn('/bin/bash', ['-c', `exec -a "hermes serve --isolated --ssh-owner-nonce ${nonce}" sleep 30`], {
+    stdio: 'ignore'
+  })
 
-  const signalCommand = ssh.calls.find(c => /cmd=\$\(ps .*kill 9\b/.test(c)) || ''
-  assert.match(signalCommand, /--ssh-owner-nonce/)
-  assert.match(signalCommand, /--ssh-session-token-file/)
-  assert.ok(!ssh.calls.some(c => /^kill 9\b/.test(c.trim())), 'must not signal from a standalone PID-only command')
-  assert.ok(!ssh.calls.some(c => /rm -f .*backend\.lock\.json/.test(c)), 'must keep ownership evidence for retry')
+  const foreign = spawn('sleep', ['30'], { stdio: 'ignore' })
+
+  try {
+    await new Promise(resolve => setTimeout(resolve, 100))
+    const command = buildOwnedDarwinTerminationCommand(ownedLock({ pid: owned.pid, spawnNonce: nonce }))
+    const { stdout } = await exec(command, { shell: '/bin/sh' })
+
+    assert.equal(stdout, 'TERMINATED')
+
+    if (owned.exitCode === null && owned.signalCode === null) {
+      await Promise.race([
+        new Promise(resolve => owned.once('exit', resolve)),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('owned process survived')), 2000))
+      ])
+    }
+
+    assert.ok(owned.exitCode !== null || owned.signalCode !== null)
+    assert.doesNotThrow(() => process.kill(foreign.pid!, 0))
+    assert.doesNotMatch(command, new RegExp(`\\bkill(?:\\s+-[^ ]+)*\\s+${foreign.pid}\\b`))
+  } finally {
+    for (const child of [owned, foreign]) {
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill('SIGKILL')
+      }
+    }
+  }
 })
