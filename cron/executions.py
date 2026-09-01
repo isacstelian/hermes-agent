@@ -117,15 +117,56 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     conn.execute(
         """CREATE TABLE IF NOT EXISTS execution_feedback (
              id TEXT PRIMARY KEY,
+             execution_id TEXT NOT NULL
+               REFERENCES executions(id) ON DELETE CASCADE,
              delivery_id TEXT NOT NULL
                REFERENCES execution_deliveries(id) ON DELETE CASCADE,
              telegram_user_id TEXT NOT NULL,
              vote INTEGER NOT NULL CHECK(vote IN (-1, 1)),
              reason TEXT,
              created_at TEXT NOT NULL,
-             updated_at TEXT NOT NULL,
-             UNIQUE(delivery_id, telegram_user_id)
+             updated_at TEXT NOT NULL
            )"""
+    )
+    feedback_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(execution_feedback)")
+    }
+    if "execution_id" not in feedback_columns:
+        try:
+            conn.execute("ALTER TABLE execution_feedback ADD COLUMN execution_id TEXT")
+        except sqlite3.OperationalError as exc:
+            if "duplicate column" not in str(exc).lower():
+                raise
+    conn.execute(
+        """UPDATE execution_feedback
+           SET execution_id=(
+             SELECT d.execution_id FROM execution_deliveries d
+             WHERE d.id=execution_feedback.delivery_id
+           )
+           WHERE execution_id IS NULL"""
+    )
+    # Older builds keyed votes by delivery. Collapse any duplicate votes from
+    # one execution/user before adding the execution-level invariant, keeping
+    # the most recently updated choice.
+    conn.execute(
+        """DELETE FROM execution_feedback
+           WHERE execution_id IS NOT NULL
+             AND EXISTS (
+               SELECT 1 FROM execution_feedback newer
+               WHERE newer.execution_id=execution_feedback.execution_id
+                 AND newer.telegram_user_id=execution_feedback.telegram_user_id
+                 AND (
+                   newer.updated_at > execution_feedback.updated_at
+                   OR (
+                     newer.updated_at = execution_feedback.updated_at
+                     AND newer.id > execution_feedback.id
+                   )
+                 )
+             )"""
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_execution_feedback_execution_user "
+        "ON execution_feedback(execution_id, telegram_user_id)"
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_execution_feedback_delivery "
@@ -527,6 +568,7 @@ def _validated_feedback(
 
 def _upsert_feedback_unlocked(
     conn: sqlite3.Connection,
+    execution_id: str,
     delivery_id: str,
     *,
     telegram_user_id: str,
@@ -536,17 +578,28 @@ def _upsert_feedback_unlocked(
     now = _hermes_now().isoformat()
     conn.execute(
         """INSERT INTO execution_feedback
-           (id, delivery_id, telegram_user_id, vote, reason, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?)
-           ON CONFLICT(delivery_id, telegram_user_id)
-           DO UPDATE SET vote=excluded.vote, reason=excluded.reason,
+           (id, execution_id, delivery_id, telegram_user_id, vote, reason,
+            created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(execution_id, telegram_user_id)
+           DO UPDATE SET delivery_id=excluded.delivery_id,
+                         vote=excluded.vote, reason=excluded.reason,
                          updated_at=excluded.updated_at""",
-        (uuid.uuid4().hex, delivery_id, telegram_user_id, vote, reason, now, now),
+        (
+            uuid.uuid4().hex,
+            execution_id,
+            delivery_id,
+            telegram_user_id,
+            vote,
+            reason,
+            now,
+            now,
+        ),
     )
     row = conn.execute(
         """SELECT * FROM execution_feedback
-           WHERE delivery_id=? AND telegram_user_id=?""",
-        (delivery_id, telegram_user_id),
+           WHERE execution_id=? AND telegram_user_id=?""",
+        (execution_id, telegram_user_id),
     ).fetchone()
     return dict(row)
 
@@ -566,7 +619,7 @@ def upsert_execution_feedback(
     )
     with _transaction() as conn:
         delivery = conn.execute(
-            """SELECT id FROM execution_deliveries
+            """SELECT id, execution_id FROM execution_deliveries
                WHERE id=? AND platform='telegram' AND status='delivered'
                  AND message_id IS NOT NULL""",
             (delivery_token,),
@@ -575,6 +628,7 @@ def upsert_execution_feedback(
             return None
         return _upsert_feedback_unlocked(
             conn,
+            delivery["execution_id"],
             delivery["id"],
             telegram_user_id=user_key,
             vote=clean_vote,
@@ -607,7 +661,7 @@ def record_execution_feedback(
     thread_key = _optional_text(thread_id)
     with _transaction() as conn:
         delivery = conn.execute(
-            """SELECT id, status, message_id, thread_id
+            """SELECT id, execution_id, status, message_id, thread_id
                FROM execution_deliveries
                WHERE id=? AND platform='telegram' AND chat_id=?""",
             (feedback_token, chat_key),
@@ -653,6 +707,7 @@ def record_execution_feedback(
             return None
         return _upsert_feedback_unlocked(
             conn,
+            delivery["execution_id"],
             delivery["id"],
             telegram_user_id=user_key,
             vote=clean_vote,
@@ -669,6 +724,86 @@ def list_execution_feedback(delivery_token: Any) -> List[Dict[str, Any]]:
             """SELECT * FROM execution_feedback WHERE delivery_id=?
                ORDER BY updated_at DESC, id DESC""",
             (delivery_token,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def routine_feedback_summary(
+    *, job_id: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """Return one local execution/feedback aggregate per routine."""
+    where = "WHERE e.job_id=?" if job_id is not None else ""
+    params: List[Any] = [str(job_id)] if job_id is not None else []
+    with _transaction() as conn:
+        rows = conn.execute(
+            f"""WITH execution_stats AS (
+                   SELECT e.job_id,
+                          (SELECT e2.job_name FROM executions e2
+                           WHERE e2.job_id=e.job_id AND e2.job_name IS NOT NULL
+                           ORDER BY e2.claimed_at DESC, e2.id DESC LIMIT 1)
+                            AS job_name,
+                          COUNT(*) AS runs,
+                          SUM(CASE WHEN e.status='completed' THEN 1 ELSE 0 END)
+                            AS completed_runs,
+                          SUM(CASE WHEN e.status IN ('failed','unknown')
+                                   THEN 1 ELSE 0 END) AS failed_runs,
+                          SUM(CASE WHEN e.delivery_outcome='delivered'
+                                   THEN 1 ELSE 0 END) AS delivered_runs,
+                          COALESCE(SUM(e.duration_ms), 0) AS total_duration_ms,
+                          CAST(ROUND(AVG(e.duration_ms)) AS INTEGER)
+                            AS average_duration_ms,
+                          MAX(e.claimed_at) AS last_run_at
+                   FROM executions e
+                   {where}
+                   GROUP BY e.job_id
+                 ),
+                 feedback_stats AS (
+                   SELECT e.job_id,
+                          COUNT(*) AS votes,
+                          SUM(CASE WHEN f.vote=1 THEN 1 ELSE 0 END)
+                            AS positive_votes,
+                          SUM(CASE WHEN f.vote=-1 THEN 1 ELSE 0 END)
+                            AS negative_votes,
+                          COUNT(DISTINCT f.execution_id) AS rated_runs
+                   FROM execution_feedback f
+                   JOIN executions e ON e.id=f.execution_id
+                   {where}
+                   GROUP BY e.job_id
+                 )
+                 SELECT x.*,
+                        COALESCE(f.votes, 0) AS votes,
+                        COALESCE(f.positive_votes, 0) AS positive_votes,
+                        COALESCE(f.negative_votes, 0) AS negative_votes,
+                        COALESCE(f.rated_runs, 0) AS rated_runs
+                 FROM execution_stats x
+                 LEFT JOIN feedback_stats f ON f.job_id=x.job_id
+                 ORDER BY x.last_run_at DESC, x.job_id""",
+            params + params,
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def list_routine_feedback(
+    *, job_id: Optional[str] = None, limit: int = 50
+) -> List[Dict[str, Any]]:
+    """Return newest local feedback rows with their execution coordinates."""
+    clauses: List[str] = []
+    params: List[Any] = []
+    if job_id is not None:
+        clauses.append("e.job_id=?")
+        params.append(str(job_id))
+    where = " WHERE " + " AND ".join(clauses) if clauses else ""
+    params.append(max(1, min(int(limit), 500)))
+    with _transaction() as conn:
+        rows = conn.execute(
+            """SELECT f.*, e.job_id, e.job_name, e.claimed_at,
+                      e.duration_ms, d.chat_id, d.thread_id, d.message_id
+               FROM execution_feedback f
+               JOIN executions e ON e.id=f.execution_id
+               JOIN execution_deliveries d ON d.id=f.delivery_id"""
+            + where
+            + " ORDER BY f.updated_at DESC, f.id DESC LIMIT ?",
+            params,
         ).fetchall()
     return [dict(row) for row in rows]
 

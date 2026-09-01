@@ -183,6 +183,74 @@ def test_feedback_requires_exact_telegram_callback_coordinates_and_upserts(
         )
 
 
+def test_one_user_has_one_vote_per_execution_across_multiple_deliveries(
+    monkeypatch, tmp_path
+):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    execution = executions.create_execution(
+        "fanout-routine", source="builtin", job_name="Fanout routine"
+    )
+    first_delivery = executions.record_execution_delivery(
+        execution["id"],
+        platform="telegram",
+        chat_id="100",
+        message_id="1",
+        status="delivered",
+    )
+    second_delivery = executions.record_execution_delivery(
+        execution["id"],
+        platform="telegram",
+        chat_id="200",
+        message_id="2",
+        status="delivered",
+    )
+
+    first = executions.record_execution_feedback(
+        first_delivery["id"],
+        vote=-1,
+        telegram_user_id="42",
+        chat_id="100",
+        message_id="1",
+    )
+    changed = executions.record_execution_feedback(
+        second_delivery["id"],
+        vote=1,
+        telegram_user_id="42",
+        chat_id="200",
+        message_id="2",
+    )
+    executions.finish_execution(
+        execution["id"], success=True, delivery_outcome="delivered"
+    )
+
+    assert changed["id"] == first["id"]
+    assert changed["execution_id"] == execution["id"]
+    assert changed["delivery_id"] == second_delivery["id"]
+    assert changed["vote"] == 1
+    assert executions.list_execution_feedback(first_delivery["id"]) == []
+    assert executions.list_execution_feedback(second_delivery["id"]) == [changed]
+
+    summary = executions.routine_feedback_summary(job_id="fanout-routine")
+    assert summary[0]["runs"] == 1
+    assert summary[0]["votes"] == 1
+    assert summary[0]["positive_votes"] == 1
+    assert summary[0]["rated_runs"] == 1
+    assert executions.list_routine_feedback(job_id="fanout-routine") == [
+        {
+            **changed,
+            "job_id": "fanout-routine",
+            "job_name": "Fanout routine",
+            "claimed_at": execution["claimed_at"],
+            "duration_ms": executions.latest_execution("fanout-routine")[
+                "duration_ms"
+            ],
+            "chat_id": "200",
+            "thread_id": None,
+            "message_id": "2",
+        }
+    ]
+
+
 def test_callback_can_confirm_a_pending_telegram_delivery(monkeypatch, tmp_path):
     executions = _point_ledger(monkeypatch, tmp_path)
     execution = executions.create_execution("timed-out-send", source="builtin")
@@ -440,3 +508,66 @@ def test_existing_execution_database_is_migrated_without_losing_rows(
     assert executions.list_executions(job_id="legacy-job")[0]["id"] == (
         "legacy-execution"
     )
+
+
+def test_delivery_keyed_feedback_is_migrated_to_one_vote_per_execution(
+    monkeypatch, tmp_path
+):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    database = executions.EXECUTIONS_FILE
+    database.parent.mkdir(parents=True)
+    with sqlite3.connect(database) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE executions (
+              id TEXT PRIMARY KEY, job_id TEXT NOT NULL, source TEXT NOT NULL,
+              process_id TEXT NOT NULL, pid INTEGER NOT NULL,
+              process_started_at INTEGER, status TEXT NOT NULL,
+              claimed_at TEXT NOT NULL, started_at TEXT, finished_at TEXT,
+              error TEXT, job_name TEXT, definition_hash TEXT,
+              delivery_outcome TEXT, delivery_error TEXT, duration_ms INTEGER
+            );
+            CREATE TABLE execution_deliveries (
+              id TEXT PRIMARY KEY, execution_id TEXT NOT NULL,
+              platform TEXT NOT NULL, chat_id TEXT NOT NULL, thread_id TEXT,
+              message_id TEXT, status TEXT NOT NULL, error TEXT,
+              created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
+            CREATE TABLE execution_feedback (
+              id TEXT PRIMARY KEY, delivery_id TEXT NOT NULL,
+              telegram_user_id TEXT NOT NULL, vote INTEGER NOT NULL,
+              reason TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+              UNIQUE(delivery_id, telegram_user_id)
+            );
+            INSERT INTO executions
+              (id, job_id, source, process_id, pid, status, claimed_at)
+            VALUES
+              ('execution-1', 'job-1', 'builtin', 'owner', 1, 'completed',
+               '2026-09-01T08:00:00+00:00');
+            INSERT INTO execution_deliveries
+              (id, execution_id, platform, chat_id, message_id, status,
+               created_at, updated_at)
+            VALUES
+              ('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'execution-1', 'telegram',
+               '100', '1', 'delivered', '2026-09-01T08:01:00+00:00',
+               '2026-09-01T08:01:00+00:00'),
+              ('bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', 'execution-1', 'telegram',
+               '200', '2', 'delivered', '2026-09-01T08:02:00+00:00',
+               '2026-09-01T08:02:00+00:00');
+            INSERT INTO execution_feedback
+              (id, delivery_id, telegram_user_id, vote, reason,
+               created_at, updated_at)
+            VALUES
+              ('old-vote', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', '42', -1, NULL,
+               '2026-09-01T08:01:00+00:00', '2026-09-01T08:01:00+00:00'),
+              ('new-vote', 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', '42', 1, NULL,
+               '2026-09-01T08:02:00+00:00', '2026-09-01T08:02:00+00:00');
+            """
+        )
+
+    rows = executions.list_routine_feedback(job_id="job-1")
+
+    assert len(rows) == 1
+    assert rows[0]["id"] == "new-vote"
+    assert rows[0]["execution_id"] == "execution-1"
+    assert rows[0]["vote"] == 1

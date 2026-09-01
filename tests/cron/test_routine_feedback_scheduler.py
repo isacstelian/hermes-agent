@@ -209,6 +209,56 @@ def test_successful_run_records_delivery_error_separately(monkeypatch):
     assert finished[-1][1]["delivery_error"] == "Telegram send rejected"
 
 
+def test_interrupted_run_keeps_delivery_outcome_in_execution_ledger(monkeypatch):
+    import cron.scheduler as scheduler
+
+    _contexts, _delivered = _patch_run_pipeline(monkeypatch, scheduler)
+    monkeypatch.setattr(scheduler, "load_config", lambda: {})
+    monkeypatch.setattr(
+        scheduler,
+        "_deliver_result",
+        lambda *_args, **_kwargs: "Telegram send rejected",
+    )
+    monkeypatch.setattr(
+        scheduler, "_consume_interrupted_flag", lambda *_args, **_kwargs: True
+    )
+    monkeypatch.setattr("cron.jobs.update_job", lambda *_args, **_kwargs: None)
+    finished = []
+    monkeypatch.setattr(
+        scheduler,
+        "finish_execution",
+        lambda execution_id, **kwargs: finished.append((execution_id, kwargs)),
+    )
+
+    assert scheduler.run_one_job({
+        "id": "shutdown-run",
+        "deliver": "telegram",
+        "execution_id": "execution-shutdown",
+    }) is True
+
+    assert finished[-1][1]["delivery_outcome"] == "failed"
+    assert finished[-1][1]["delivery_error"] == "Telegram send rejected"
+
+
+def test_mixed_case_telegram_target_creates_feedback_receipt(monkeypatch, tmp_path):
+    from cron import executions
+    import cron.scheduler as scheduler
+
+    monkeypatch.setattr(
+        executions,
+        "EXECUTIONS_FILE",
+        tmp_path / "cron" / "executions.db",
+    )
+    execution = executions.create_execution("mixed-case", source="test")
+
+    token = scheduler._start_routine_feedback_delivery(
+        execution["id"], platform_name="Telegram", chat_id="123"
+    )
+
+    assert token is not None
+    assert executions.lookup_execution_delivery(token)["status"] == "pending"
+
+
 def test_live_telegram_delivery_persists_exact_feedback_receipt(monkeypatch, tmp_path):
     import asyncio
     from concurrent.futures import Future
@@ -373,6 +423,87 @@ def test_live_media_only_feedback_uses_last_attachment_message(monkeypatch, tmp_
     assert receipt["message_id"] == "media-42"
 
 
+def test_live_text_plus_media_failure_does_not_link_feedback_to_plain_text(
+    monkeypatch, tmp_path
+):
+    import asyncio
+    from concurrent.futures import Future
+    from types import SimpleNamespace
+
+    from cron import executions
+    import cron.scheduler as scheduler
+    from gateway.config import Platform, PlatformConfig
+    from gateway.platforms.base import SendResult
+
+    monkeypatch.setattr(
+        executions,
+        "EXECUTIONS_FILE",
+        tmp_path / "cron" / "executions.db",
+    )
+    media_root = tmp_path / "media"
+    media_root.mkdir()
+    document_path = media_root / "details.pdf"
+    document_path.write_bytes(b"document")
+    monkeypatch.setattr(
+        "gateway.platforms.base.MEDIA_DELIVERY_SAFE_ROOTS",
+        (media_root,),
+    )
+
+    execution = executions.create_execution("mixed-media", source="test")
+    pconfig = PlatformConfig(enabled=True, token="test-token", extra={})
+    gateway_config = SimpleNamespace(
+        platforms={Platform.TELEGRAM: pconfig},
+        get_home_channel=lambda _platform: None,
+    )
+    media_metadata = []
+
+    class Adapter:
+        platform = Platform.TELEGRAM
+
+        async def send_document(self, **kwargs):
+            media_metadata.append(kwargs["metadata"])
+            return SendResult(success=False, error="upload rejected")
+
+    async def deliver(_self, _target, _content, _metadata):
+        return SendResult(success=True, message_id="plain-text-41")
+
+    def run_now(coro, _loop):
+        future = Future()
+        try:
+            future.set_result(asyncio.run(coro))
+        except BaseException as exc:  # noqa: BLE001
+            future.set_exception(exc)
+        return future
+
+    monkeypatch.setattr(
+        scheduler,
+        "_resolve_delivery_targets",
+        lambda _job: [{"platform": "telegram", "chat_id": "123"}],
+    )
+    monkeypatch.setattr("gateway.config.load_gateway_config", lambda: gateway_config)
+    monkeypatch.setattr(
+        scheduler, "load_config", lambda: {"cron": {"wrap_response": False}}
+    )
+    monkeypatch.setattr(
+        "gateway.delivery.DeliveryRouter._deliver_to_platform", deliver
+    )
+    monkeypatch.setattr("agent.async_utils.safe_schedule_threadsafe", run_now)
+
+    error = scheduler._deliver_result(
+        {"id": "mixed-media", "deliver": "telegram"},
+        f"Raport\nMEDIA:{document_path}",
+        adapters={Platform.TELEGRAM: Adapter()},
+        loop=Mock(),
+        feedback_execution_id=execution["id"],
+    )
+
+    token = media_metadata[0]["routine_feedback_token"]
+    receipt = executions.lookup_execution_delivery(token)
+    assert "upload rejected" in error
+    assert receipt["status"] == "failed"
+    assert receipt["message_id"] is None
+
+
 def test_failed_telegram_delivery_persists_the_receipt_error(monkeypatch, tmp_path):
     from types import SimpleNamespace
 
@@ -423,3 +554,59 @@ def test_failed_telegram_delivery_persists_the_receipt_error(monkeypatch, tmp_pa
     assert "send rejected" in error
     assert receipt["status"] == "failed"
     assert "send rejected" in receipt["error"]
+
+
+def test_standalone_partial_media_failure_does_not_link_plain_message(
+    monkeypatch, tmp_path
+):
+    from types import SimpleNamespace
+
+    from cron import executions
+    import cron.scheduler as scheduler
+    from gateway.config import Platform, PlatformConfig
+    from tools import send_message_tool
+
+    monkeypatch.setattr(
+        executions,
+        "EXECUTIONS_FILE",
+        tmp_path / "cron" / "executions.db",
+    )
+    execution = executions.create_execution("partial-media", source="test")
+    pconfig = PlatformConfig(enabled=True, token="test-token", extra={})
+    gateway_config = SimpleNamespace(
+        platforms={Platform.TELEGRAM: pconfig},
+        get_home_channel=lambda _platform: None,
+    )
+    captured = {}
+
+    async def partial_send(*_args, **kwargs):
+        captured.update(kwargs)
+        return {
+            "success": True,
+            "message_id": "plain-message-20",
+            "feedback_message_id": None,
+            "warnings": ["last media failed"],
+        }
+
+    monkeypatch.setattr(
+        scheduler,
+        "_resolve_delivery_targets",
+        lambda _job: [{"platform": "telegram", "chat_id": "123"}],
+    )
+    monkeypatch.setattr("gateway.config.load_gateway_config", lambda: gateway_config)
+    monkeypatch.setattr(
+        scheduler, "load_config", lambda: {"cron": {"wrap_response": False}}
+    )
+    monkeypatch.setattr(send_message_tool, "_send_to_platform", partial_send)
+
+    error = scheduler._deliver_result(
+        {"id": "partial-media", "deliver": "telegram"},
+        "Raport",
+        feedback_execution_id=execution["id"],
+    )
+
+    token = captured["args"]["routine_feedback_token"]
+    receipt = executions.lookup_execution_delivery(token)
+    assert "last media failed" in error
+    assert receipt["status"] == "failed"
+    assert receipt["message_id"] is None

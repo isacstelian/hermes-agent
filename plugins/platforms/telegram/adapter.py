@@ -7699,10 +7699,11 @@ class TelegramAdapter(BasePlatformAdapter):
                 re.fullmatch(r"-\d+", normalized_query_chat_id)
                 and int(normalized_query_chat_id) < 0
             )
-            if is_negative_chat_id and normalized_query_chat_type not in {
-                "group",
-                "supergroup",
-            }:
+            if (
+                is_negative_chat_id
+                and direct_messages_topic is None
+                and normalized_query_chat_type not in {"group", "supergroup"}
+            ):
                 await query.answer(text="⛔ This group is not authorized.")
                 return
         if normalized_query_chat_type in {"group", "supergroup"}:

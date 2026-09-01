@@ -737,7 +737,7 @@ def _start_routine_feedback_delivery(
     chat_id: Any,
 ) -> Optional[str]:
     """Create a pending Telegram receipt without risking the actual delivery."""
-    if not execution_id or platform_name != "telegram":
+    if not execution_id or str(platform_name).lower() != "telegram":
         return None
     try:
         receipt = record_execution_delivery(
@@ -3698,6 +3698,8 @@ def _deliver_result(
                 adapter_ok = True
                 timed_out = False
                 delivered_message_id = None
+                feedback_message_id = None
+                _media_errors = []
                 send_raw_response = None
                 if text_to_send:
                     from agent.async_utils import safe_schedule_threadsafe
@@ -3825,6 +3827,8 @@ def _deliver_result(
                                     )
                                 target_errors.append(msg)
                                 adapter_ok = False  # fall through to standalone path
+                            elif feedback_token and not media_files:
+                                feedback_message_id = delivered_message_id
                             elif (
                                 send_raw_response
                                 and thread_id
@@ -3868,7 +3872,7 @@ def _deliver_result(
                         feedback_token=feedback_token,
                     )
                     if media_feedback_message_id is not None:
-                        delivered_message_id = media_feedback_message_id
+                        feedback_message_id = media_feedback_message_id
                     # Surface per-file failures into the run status (parity
                     # with the standalone lane): text delivered but an
                     # attachment didn't is a visible partial failure, not ok.
@@ -3884,7 +3888,7 @@ def _deliver_result(
                     delivery_errors.append(msg)
 
                 if adapter_ok:
-                    if feedback_token and delivered_message_id is not None:
+                    if feedback_token and feedback_message_id is not None:
                         actual_thread_id = (
                             None
                             if isinstance(send_raw_response, dict)
@@ -3896,10 +3900,10 @@ def _deliver_result(
                             feedback_token,
                             chat_id=chat_id,
                             thread_id=actual_thread_id,
-                            message_id=delivered_message_id,
+                            message_id=feedback_message_id,
                             status="delivered",
                         )
-                    elif feedback_token and timed_out:
+                    elif feedback_token and timed_out and not media_files:
                         _finish_routine_feedback_delivery(
                             feedback_execution_id,
                             feedback_token,
@@ -3908,7 +3912,7 @@ def _deliver_result(
                             status="pending",
                             error="Live Telegram send confirmation timed out",
                         )
-                    elif feedback_token and media_files:
+                    elif feedback_token:
                         _finish_routine_feedback_delivery(
                             feedback_execution_id,
                             feedback_token,
@@ -3917,7 +3921,11 @@ def _deliver_result(
                             status="failed",
                             error=(
                                 "; ".join(_media_errors)
-                                or "Telegram media send returned no message_id"
+                                or (
+                                    "Telegram media feedback message was not sent"
+                                    if media_files
+                                    else "Telegram send returned no feedback message_id"
+                                )
                             ),
                         )
                     logger.info("Job '%s': delivered to %s:%s via live adapter", job["id"], platform_name, chat_id)
@@ -4150,15 +4158,29 @@ def _deliver_result(
                 logger.error("Job '%s': %s", job["id"], msg)
                 delivery_errors.append(msg)
 
-            if feedback_token and isinstance(result, dict) and result.get("message_id"):
-                _finish_routine_feedback_delivery(
-                    feedback_execution_id,
-                    feedback_token,
-                    chat_id=chat_id,
-                    thread_id=result.get("thread_id", thread_id),
-                    message_id=result["message_id"],
-                    status="delivered",
-                )
+            if feedback_token and isinstance(result, dict):
+                feedback_message_id = result.get("feedback_message_id")
+                if feedback_message_id:
+                    _finish_routine_feedback_delivery(
+                        feedback_execution_id,
+                        feedback_token,
+                        chat_id=chat_id,
+                        thread_id=result.get("thread_id", thread_id),
+                        message_id=feedback_message_id,
+                        status="delivered",
+                    )
+                else:
+                    _finish_routine_feedback_delivery(
+                        feedback_execution_id,
+                        feedback_token,
+                        chat_id=chat_id,
+                        thread_id=result.get("thread_id", thread_id),
+                        status="failed",
+                        error=(
+                            "; ".join(str(w) for w in _sender_warnings)
+                            or "Telegram send returned no feedback message_id"
+                        ),
+                    )
             logger.info("Job '%s': delivered to %s:%s", job["id"], platform_name, chat_id)
             _maybe_mirror_cron_delivery(
                 job, platform_name, chat_id, mirror_text,
@@ -7721,6 +7743,20 @@ def _run_one_job_body(
             success = False
             error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
+        normalized_deliver = _normalize_deliver_value(job.get("deliver", "local"))
+        if delivery_error:
+            delivery_outcome = "failed"
+        elif should_deliver and unresolved_origin:
+            delivery_outcome = "not_configured"
+        elif should_deliver and normalized_deliver != "local":
+            delivery_outcome = "delivered"
+        elif incident_acked and not success:
+            # The operator acknowledged this exact failure signature, so the
+            # failure ping was intentionally withheld.
+            delivery_outcome = "suppressed_acked"
+        else:
+            delivery_outcome = "suppressed"
+
         interrupted = _consume_interrupted_flag(job["id"], execution_token)
         if interrupted:
             if delivery_error:
@@ -7744,6 +7780,8 @@ def _run_one_job_body(
                 execution_id,
                 success=False,
                 error="Interrupted by gateway shutdown before terminal completion.",
+                delivery_outcome=delivery_outcome,
+                delivery_error=delivery_error,
             )
             return True
 
@@ -7760,20 +7798,6 @@ def _run_one_job_body(
                 error="Fire claim ownership lost before terminal completion.",
             )
             return True
-        normalized_deliver = _normalize_deliver_value(job.get("deliver", "local"))
-        if delivery_error:
-            delivery_outcome = "failed"
-        elif should_deliver and unresolved_origin:
-            delivery_outcome = "not_configured"
-        elif should_deliver and normalized_deliver != "local":
-            delivery_outcome = "delivered"
-        elif incident_acked and not success:
-            # Distinct from plain "suppressed" (silence marker / local jobs):
-            # the failure ping was withheld because the operator acked this
-            # exact signature via `hermes cron incidents ack`.
-            delivery_outcome = "suppressed_acked"
-        else:
-            delivery_outcome = "suppressed"
         if delivery_outcome in ("delivered", "not_configured") and not success:
             # The failure ping left the process (or was composed for a
             # configured target) — record it on the incident so the CLI

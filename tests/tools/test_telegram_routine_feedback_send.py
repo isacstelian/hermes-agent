@@ -93,6 +93,7 @@ def test_standalone_text_send_attaches_keyboard_and_returns_actual_thread(
 
     assert bot.send_message.await_args.kwargs["reply_markup"] is markup
     assert result["message_id"] == "42"
+    assert result["feedback_message_id"] == "42"
     assert result["thread_id"] == "9"
 
 
@@ -131,3 +132,53 @@ def test_standalone_media_only_send_attaches_keyboard_to_the_visible_message(
 
     assert bot.send_photo.await_args.kwargs["reply_markup"] is markup
     assert result["message_id"] == "77"
+    assert result["feedback_message_id"] == "77"
+
+
+def test_standalone_last_media_failure_reports_no_feedback_message(monkeypatch):
+    from plugins.platforms.telegram import adapter as telegram_adapter
+    from tools.send_message_tool import _send_telegram
+
+    _disable_proxy(monkeypatch)
+    markup = object()
+    monkeypatch.setattr(
+        telegram_adapter,
+        "build_routine_feedback_keyboard",
+        lambda _token: markup,
+    )
+    bot = MagicMock()
+    bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=10))
+    bot.send_photo = AsyncMock(
+        side_effect=[
+            SimpleNamespace(message_id=20),
+            RuntimeError("last upload failed"),
+        ]
+    )
+    _install_telegram_mock(monkeypatch, MagicMock(return_value=bot))
+
+    first = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+    second = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+    first.write(b"first")
+    second.write(b"second")
+    first.close()
+    second.close()
+    try:
+        result = asyncio.run(
+            _send_telegram(
+                "token",
+                "123",
+                "Raport",
+                media_files=[(first.name, False), (second.name, False)],
+                routine_feedback_token="delivery-token",
+            )
+        )
+    finally:
+        os.unlink(first.name)
+        os.unlink(second.name)
+
+    first_call, second_call = bot.send_photo.await_args_list
+    assert "reply_markup" not in first_call.kwargs
+    assert second_call.kwargs["reply_markup"] is markup
+    assert result["message_id"] == "20"
+    assert result["feedback_message_id"] is None
+    assert "last upload failed" in result["warnings"][0]

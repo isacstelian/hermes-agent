@@ -1536,6 +1536,7 @@ async def _send_telegram(
             text_kwargs["disable_web_page_preview"] = True
 
         last_msg = None
+        feedback_msg = None
         delivered_thread_id = None
         warnings = []
 
@@ -1625,6 +1626,8 @@ async def _send_telegram(
                         )
                     else:
                         raise
+                if feedback_kwargs:
+                    feedback_msg = last_msg
                 delivered_thread_id = text_kwargs.get("message_thread_id")
 
         for media_index, (media_path, is_voice) in enumerate(media_files):
@@ -1643,6 +1646,8 @@ async def _send_telegram(
                             **text_kwargs,
                             **({"reply_markup": feedback_markup} if feedback_on_text else {}),
                         )
+                        if feedback_on_text:
+                            feedback_msg = last_msg
                         delivered_thread_id = text_kwargs.get("message_thread_id")
                         _tg_caption = None  # delivered — don't re-caption a later file
                     except Exception as _cap_err:
@@ -1656,10 +1661,11 @@ async def _send_telegram(
             try:
                 with open(media_path, "rb") as f:
                     media_kwargs = dict(thread_kwargs)
-                    if (
+                    carries_feedback = (
                         feedback_markup is not None
                         and media_index == last_deliverable_media_index
-                    ):
+                    )
+                    if carries_feedback:
                         media_kwargs["reply_markup"] = feedback_markup
                     # Attach the MEDIA:<path> caption to the bubble itself for
                     # captionable kinds (photo/video/document). _tg_caption is
@@ -1761,6 +1767,8 @@ async def _send_telegram(
                                 )
                         else:
                             raise
+                    if carries_feedback:
+                        feedback_msg = last_msg
                     delivered_thread_id = media_kwargs.get("message_thread_id")
             except Exception as e:
                 warning = _sanitize_error_text(f"Failed to send media {media_path}: {e}")
@@ -1786,6 +1794,10 @@ async def _send_telegram(
         }
         if warnings:
             result["warnings"] = warnings
+        if feedback_markup is not None:
+            result["feedback_message_id"] = (
+                str(feedback_msg.message_id) if feedback_msg is not None else None
+            )
         return result
     except ImportError:
         return {"error": "python-telegram-bot not installed. Run: pip install python-telegram-bot"}

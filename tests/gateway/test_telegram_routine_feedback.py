@@ -307,6 +307,7 @@ async def test_group_feedback_keeps_shared_keyboard_for_other_users():
 @pytest.mark.asyncio
 async def test_channel_direct_message_feedback_uses_native_topic_id():
     adapter = _adapter()
+    adapter.config.extra["auto_allow_groups_from_trusted_adders"] = True
     handler = AsyncMock(return_value={"id": "feedback-row"})
     adapter.set_routine_feedback_handler(handler)
     query = _query(
