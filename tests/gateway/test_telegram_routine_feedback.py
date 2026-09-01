@@ -80,8 +80,8 @@ def _callback_data(markup):
     ]
 
 
-def test_feedback_keyboard_uses_short_native_callbacks():
-    token = "a" * 44
+def test_feedback_keyboard_uses_rollback_safe_clarify_callbacks():
+    token = "a" * 41
 
     markup = build_routine_feedback_keyboard(token)
 
@@ -89,7 +89,10 @@ def test_feedback_keyboard_uses_short_native_callbacks():
         "👍 Util",
         "👎 Nu m-a ajutat",
     ]
-    assert _callback_data(markup) == [f"rf:u:{token}", f"rf:d:{token}"]
+    assert _callback_data(markup) == [
+        f"cl:rf:u:{token}",
+        f"cl:rf:d:{token}",
+    ]
     assert all(len(data.encode("utf-8")) <= 64 for data in _callback_data(markup))
     assert all(
         len(data.encode("utf-8")) <= 64
@@ -99,7 +102,7 @@ def test_feedback_keyboard_uses_short_native_callbacks():
 
 @pytest.mark.parametrize(
     "token",
-    ["", "has:colon", "diacritică", "a" * 45],
+    ["", "has:colon", "diacritică", "a" * 42],
 )
 def test_feedback_keyboard_rejects_tokens_that_cannot_be_safely_encoded(token):
     with pytest.raises(ValueError):
@@ -124,8 +127,8 @@ async def test_send_attaches_feedback_only_to_last_visible_chunk():
     first_call, last_call = adapter._bot.send_message.await_args_list
     assert "reply_markup" not in first_call.kwargs
     assert _callback_data(last_call.kwargs["reply_markup"]) == [
-        "rf:u:delivery123",
-        "rf:d:delivery123",
+        "cl:rf:u:delivery123",
+        "cl:rf:d:delivery123",
     ]
     assert result.success is True
     assert result.message_id == "11"
@@ -150,7 +153,7 @@ async def test_rich_routine_keeps_native_formatting_and_feedback_keyboard():
     assert [
         button["callback_data"]
         for button in payload["reply_markup"]["inline_keyboard"][0]
-    ] == ["rf:u:delivery123", "rf:d:delivery123"]
+    ] == ["cl:rf:u:delivery123", "cl:rf:d:delivery123"]
     assert result.success is True
     assert result.message_id == "12"
 
@@ -192,8 +195,8 @@ async def test_native_media_sends_attach_feedback_keyboard(
 
     call = getattr(adapter._bot, bot_method).await_args
     assert _callback_data(call.kwargs["reply_markup"]) == [
-        "rf:u:delivery123",
-        "rf:d:delivery123",
+        "cl:rf:u:delivery123",
+        "cl:rf:d:delivery123",
     ]
     assert result.success is True
 
@@ -203,7 +206,7 @@ async def test_positive_dm_feedback_is_saved_answered_and_removes_keyboard():
     adapter = _adapter()
     handler = AsyncMock(return_value={"id": "feedback-row"})
     adapter.set_routine_feedback_handler(handler)
-    query = _query("rf:u:delivery123")
+    query = _query("cl:rf:u:delivery123")
 
     await adapter._handle_callback_query(
         SimpleNamespace(callback_query=query), SimpleNamespace()
@@ -223,11 +226,26 @@ async def test_positive_dm_feedback_is_saved_answered_and_removes_keyboard():
 
 
 @pytest.mark.asyncio
+async def test_legacy_rf_feedback_callback_remains_accepted():
+    adapter = _adapter()
+    handler = AsyncMock(return_value={"id": "feedback-row"})
+    adapter.set_routine_feedback_handler(handler)
+    query = _query("rf:u:delivery123")
+
+    await adapter._handle_callback_query(
+        SimpleNamespace(callback_query=query), SimpleNamespace()
+    )
+
+    handler.assert_awaited_once()
+    query.answer.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_negative_dm_feedback_opens_structured_reason_buttons():
     adapter = _adapter()
     handler = AsyncMock(return_value={"id": "feedback-row"})
     adapter.set_routine_feedback_handler(handler)
-    query = _query("rf:d:delivery123")
+    query = _query("cl:rf:d:delivery123")
 
     await adapter._handle_callback_query(
         SimpleNamespace(callback_query=query), SimpleNamespace()
@@ -245,12 +263,12 @@ async def test_negative_dm_feedback_opens_structured_reason_buttons():
     reason_markup = query.edit_message_reply_markup.await_args.kwargs["reply_markup"]
     reason_callbacks = _callback_data(reason_markup)
     assert reason_callbacks == [
-        "rf:r:wrong:delivery123",
-        "rf:r:irrelevant:delivery123",
-        "rf:r:too_long:delivery123",
-        "rf:r:repetitive:delivery123",
-        "rf:r:unclear_action:delivery123",
-        "rf:r:too_frequent:delivery123",
+        "cl:rf:r:wrong:delivery123",
+        "cl:rf:r:irrelevant:delivery123",
+        "cl:rf:r:too_long:delivery123",
+        "cl:rf:r:repetitive:delivery123",
+        "cl:rf:r:unclear_action:delivery123",
+        "cl:rf:r:too_frequent:delivery123",
     ]
     assert all(len(data.encode("utf-8")) <= 64 for data in reason_callbacks)
     query.answer.assert_awaited_once()
@@ -261,7 +279,7 @@ async def test_negative_reason_is_saved_and_removes_dm_keyboard():
     adapter = _adapter()
     handler = Mock(return_value={"id": "feedback-row"})
     adapter.set_routine_feedback_handler(handler)
-    query = _query("rf:r:unclear_action:delivery123")
+    query = _query("cl:rf:r:unclear_action:delivery123")
 
     await adapter._handle_callback_query(
         SimpleNamespace(callback_query=query), SimpleNamespace()
@@ -285,7 +303,9 @@ async def test_group_feedback_keeps_shared_keyboard_for_other_users():
     adapter = _adapter()
     handler = AsyncMock(return_value={"id": "feedback-row"})
     adapter.set_routine_feedback_handler(handler)
-    query = _query("rf:d:delivery123", chat_type="supergroup", thread_id=9)
+    query = _query(
+        "cl:rf:d:delivery123", chat_type="supergroup", thread_id=9
+    )
 
     await adapter._handle_callback_query(
         SimpleNamespace(callback_query=query), SimpleNamespace()
@@ -311,7 +331,7 @@ async def test_channel_direct_message_feedback_uses_native_topic_id():
     handler = AsyncMock(return_value={"id": "feedback-row"})
     adapter.set_routine_feedback_handler(handler)
     query = _query(
-        "rf:d:delivery123",
+        "cl:rf:d:delivery123",
         chat_type="channel",
         thread_id=None,
         direct_messages_topic_id=20189,
@@ -333,7 +353,7 @@ async def test_channel_direct_message_feedback_uses_native_topic_id():
     reason_markup = query.edit_message_reply_markup.await_args.kwargs[
         "reply_markup"
     ]
-    assert _callback_data(reason_markup)[0] == "rf:r:wrong:delivery123"
+    assert _callback_data(reason_markup)[0] == "cl:rf:r:wrong:delivery123"
 
 
 @pytest.mark.asyncio
@@ -342,7 +362,7 @@ async def test_forum_general_feedback_uses_canonical_thread_one():
     handler = AsyncMock(return_value={"id": "feedback-row"})
     adapter.set_routine_feedback_handler(handler)
     query = _query(
-        "rf:u:delivery123",
+        "cl:rf:u:delivery123",
         chat_type="supergroup",
         thread_id=None,
         is_forum=True,
@@ -361,7 +381,7 @@ async def test_unauthorized_feedback_never_reaches_persistence():
     adapter._is_callback_user_authorized.return_value = False
     handler = AsyncMock(return_value={"id": "feedback-row"})
     adapter.set_routine_feedback_handler(handler)
-    query = _query("rf:u:delivery123")
+    query = _query("cl:rf:u:delivery123")
 
     await adapter._handle_callback_query(
         SimpleNamespace(callback_query=query), SimpleNamespace()
@@ -378,7 +398,7 @@ async def test_stale_feedback_is_answered_and_dead_keyboard_is_removed():
     adapter = _adapter()
     handler = AsyncMock(return_value=None)
     adapter.set_routine_feedback_handler(handler)
-    query = _query("rf:u:delivery123", chat_type="group")
+    query = _query("cl:rf:u:delivery123", chat_type="group")
 
     await adapter._handle_callback_query(
         SimpleNamespace(callback_query=query), SimpleNamespace()
@@ -392,7 +412,12 @@ async def test_stale_feedback_is_answered_and_dead_keyboard_is_removed():
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "data",
-    ["rf:", "rf:x:delivery123", "rf:u:", "rf:r:unknown:delivery123"],
+    [
+        "cl:rf:",
+        "cl:rf:x:delivery123",
+        "cl:rf:u:",
+        "cl:rf:r:unknown:delivery123",
+    ],
 )
 async def test_invalid_feedback_callbacks_fail_safely(data):
     adapter = _adapter()
@@ -415,7 +440,7 @@ async def test_persistence_failure_is_answered_and_keyboard_stays_retryable():
     adapter = _adapter()
     handler = AsyncMock(side_effect=RuntimeError("database unavailable"))
     adapter.set_routine_feedback_handler(handler)
-    query = _query("rf:u:delivery123")
+    query = _query("cl:rf:u:delivery123")
 
     await adapter._handle_callback_query(
         SimpleNamespace(callback_query=query), SimpleNamespace()
@@ -442,7 +467,7 @@ async def test_default_handler_persists_in_the_adapters_profile(monkeypatch, tmp
     monkeypatch.setattr(
         executions, "record_execution_feedback", record, raising=False
     )
-    query = _query("rf:u:delivery123")
+    query = _query("cl:rf:u:delivery123")
 
     await adapter._handle_callback_query(
         SimpleNamespace(callback_query=query), SimpleNamespace()

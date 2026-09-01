@@ -237,7 +237,7 @@ _ROUTINE_FEEDBACK_REASON_CODES = frozenset(
     code for code, _label in _ROUTINE_FEEDBACK_REASONS
 )
 _ROUTINE_FEEDBACK_TOKEN_MAX_BYTES = _TELEGRAM_CALLBACK_DATA_MAX_BYTES - max(
-    len(f"rf:r:{code}:".encode("utf-8"))
+    len(f"cl:rf:r:{code}:".encode("utf-8"))
     for code in _ROUTINE_FEEDBACK_REASON_CODES
 )
 
@@ -246,7 +246,7 @@ def _validate_routine_feedback_token(feedback_token: Any) -> str:
     """Return a callback-safe opaque delivery token.
 
     Telegram caps callback_data at 64 bytes. Tokens stay ASCII and cannot
-    contain the colon used by the compact ``rf:`` callback protocol.
+    contain the colon used by the compact ``cl:rf:`` callback protocol.
     """
     if feedback_token is None:
         raise ValueError("routine feedback token is required")
@@ -261,7 +261,10 @@ def _validate_routine_feedback_token(feedback_token: Any) -> str:
 
 
 def _routine_feedback_callback_data(*parts: str) -> str:
-    data = ":".join(("rf", *parts))
+    # Namespace feedback under the long-standing clarify callback prefix.
+    # Older Hermes binaries then answer post-rollback taps as resolved prompts
+    # instead of leaving Telegram's callback spinner unanswered.
+    data = ":".join(("cl", "rf", *parts))
     if len(data.encode("utf-8")) > _TELEGRAM_CALLBACK_DATA_MAX_BYTES:
         raise ValueError("routine feedback callback_data exceeds Telegram's 64-byte limit")
     return data
@@ -301,9 +304,11 @@ def build_routine_feedback_reason_keyboard(feedback_token: Any):
 
 
 def _parse_routine_feedback_callback(data: Any) -> tuple[str, int, Optional[str]]:
-    """Parse ``rf:`` callback_data into delivery token, vote and reason."""
+    """Parse rollback-safe or legacy callback_data into one feedback vote."""
     if not isinstance(data, str) or len(data.encode("utf-8")) > _TELEGRAM_CALLBACK_DATA_MAX_BYTES:
         raise ValueError("invalid routine feedback callback")
+    if data.startswith("cl:rf:"):
+        data = data[3:]
     parts = data.split(":")
     if len(parts) == 3 and parts[0] == "rf" and parts[1] in {"u", "d"}:
         token = _validate_routine_feedback_token(parts[2])
@@ -1389,7 +1394,7 @@ class TelegramAdapter(BasePlatformAdapter):
         query_thread_id: Any,
         query_user_name: Optional[str],
     ) -> None:
-        """Authorize, persist and acknowledge one ``rf:`` callback."""
+        """Authorize, persist and acknowledge one routine feedback callback."""
         try:
             feedback_token, vote, reason = _parse_routine_feedback_callback(data)
         except (TypeError, ValueError):
@@ -7715,7 +7720,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 return
 
         # --- Routine-delivery feedback callbacks ---
-        if data.startswith("rf:"):
+        if data.startswith(("cl:rf:", "rf:")):
             await self._handle_routine_feedback_callback(
                 query,
                 data,
