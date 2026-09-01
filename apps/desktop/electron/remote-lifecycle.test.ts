@@ -11,6 +11,7 @@ import { profileSshOverride } from './connection-config'
 import {
   assertRemoteInstallUpdateClear,
   buildOwnedDarwinTerminationCommand,
+  buildOwnedTerminationCommand,
   buildSpawnCommand,
   classifySshReuseProof,
   cleanupStale,
@@ -1857,6 +1858,49 @@ test('cleanupStale keeps the lockfile when even SIGKILL cannot confirm the pid d
 
   // The record must survive so the next connect's reap pass retries.
   assert.ok(!ssh.calls.some(c => /rm -f .*backend\.lock\.json/.test(c)))
+})
+
+test('cleanupStale falls back to nonce-matched signals when Linux pidfd is unavailable', async () => {
+  const ssh = fakeSsh([
+    [/print\("OWNED"/, 'OWNED\n'],
+    [(cmd: string) => cmd.includes('pidfd_open') && cmd.includes('signal.SIGKILL if False'), 'UNAVAILABLE\n'],
+    [(cmd: string) => cmd.includes('pkill -TERM -f'), 'TIMEOUT\n'],
+    [(cmd: string) => cmd.includes('pidfd_open') && cmd.includes('signal.SIGKILL if True'), 'UNAVAILABLE\n'],
+    [(cmd: string) => cmd.includes('pkill -KILL -f'), 'TERMINATED\n']
+  ])
+
+  await cleanupStale(ssh, OWNERSHIP_ID, ownedLock({ pid: 9 }))
+
+  assert.ok(ssh.calls.some(c => c.includes('pidfd_open') && c.includes('signal.SIGKILL if False')))
+  assert.ok(ssh.calls.some(c => c.includes('pkill -TERM -f')))
+  assert.ok(ssh.calls.some(c => c.includes('pidfd_open') && c.includes('signal.SIGKILL if True')))
+  assert.ok(ssh.calls.some(c => c.includes('pkill -KILL -f')))
+  assert.ok(ssh.calls.some(c => /rm -f .*backend\.lock\.json/.test(c)))
+})
+
+test('Linux termination helper returns REFUSED without turning the marker into an SSH failure', async () => {
+  if (process.platform !== 'linux') {
+    return
+  }
+
+  const foreign = spawn('sleep', ['30'], { stdio: 'ignore' })
+
+  try {
+    const command = buildOwnedTerminationCommand(
+      ownedLock({ pid: foreign.pid }),
+      OWNERSHIP_ID,
+      { requireCreationTime: false }
+    )
+
+    const { stdout } = await exec(command, { shell: '/bin/sh' })
+
+    assert.equal(stdout.trim(), 'REFUSED')
+    assert.doesNotThrow(() => process.kill(foreign.pid!, 0))
+  } finally {
+    if (foreign.exitCode === null && foreign.signalCode === null) {
+      foreign.kill('SIGKILL')
+    }
+  }
 })
 
 test('Darwin cleanup signals by nonce and leaves an unrelated process alive', async () => {

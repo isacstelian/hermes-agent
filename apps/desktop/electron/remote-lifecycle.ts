@@ -676,10 +676,23 @@ async function cleanupStale(ssh, ownershipId, lock, pidAlive = true) {
             requireCreationTime: false
           })
 
+    const runTerminationCommand = async (force = false) => {
+      let result = String(await ssh.exec(terminationCommand(force))).trim()
+
+      // Linux kernels/Python builds without pidfd cannot bind a numeric PID to
+      // the later signal. Fall back to the same random-nonce match used on
+      // Darwin instead of leaking every Desktop-owned backend on those hosts.
+      if (!creationTime.startsWith('darwin:') && result === 'UNAVAILABLE') {
+        result = String(await ssh.exec(buildOwnedDarwinTerminationCommand(terminationLock, force))).trim()
+      }
+
+      return result
+    }
+
     let gracefulResult = ''
 
     try {
-      gracefulResult = String(await ssh.exec(terminationCommand())).trim()
+      gracefulResult = await runTerminationCommand()
     } catch {
       // Preserve the existing best-effort escalation for transport failures.
     }
@@ -698,7 +711,7 @@ async function cleanupStale(ssh, ownershipId, lock, pidAlive = true) {
       // the quit-during-active-turn path. Escalate to SIGKILL and require a
       // confirmed exit before treating the record as reclaimed.
       try {
-        const forcedResult = String(await ssh.exec(terminationCommand(true))).trim()
+        const forcedResult = await runTerminationCommand(true)
 
         if (forcedResult !== 'TERMINATED' && forcedResult !== 'ALREADY_STOPPED') {
           throw new Error(`force termination refused: ${forcedResult || 'empty response'}`)
@@ -761,8 +774,9 @@ function buildOwnedDarwinTerminationCommand(lock, force = false) {
   const signal = force ? '-KILL' : '-TERM'
   const waitIterations = force ? 20 : 50
 
-  // Darwin has no pidfd. Match the random per-spawn nonce inside pkill itself,
-  // so a recycled numeric PID with a different argv is never a signal target.
+  // Darwin has no pidfd. This is also the fallback for Linux hosts whose
+  // kernel/Python lacks pidfd. Match the random per-spawn nonce inside pkill
+  // itself, so a recycled numeric PID with a different argv is not selected.
   // The bracketed first nonce byte keeps pgrep/pkill from matching this shell.
   return (
     `command -v pgrep >/dev/null 2>&1 && command -v pkill >/dev/null 2>&1 || { printf UNAVAILABLE; exit 0; }; ` +
@@ -863,35 +877,35 @@ def owned(args):
 pidfd=None
 if sys.platform.startswith("linux"):
  if not hasattr(os,"pidfd_open") or not hasattr(signal,"pidfd_send_signal"):
-  print("UNAVAILABLE");sys.exit(2)
+  print("UNAVAILABLE");sys.exit(0)
  try:pidfd=os.pidfd_open(pid,0)
  except ProcessLookupError:print("ALREADY_STOPPED");sys.exit(0)
- except (OSError,PermissionError):print("UNAVAILABLE");sys.exit(2)
+ except (OSError,PermissionError):print("UNAVAILABLE");sys.exit(0)
 
 try:
  live_creation,live_args=identity_before_signal()
  if ((${requireCreationTime ? 'True' : 'False'} and live_creation!=expected_creation) or not owned(live_args)):
-  print("REFUSED");sys.exit(3)
+  print("REFUSED");sys.exit(0)
  if (sys.platform=="darwin"):
   # Darwin has no pidfd-style signal binding. Refuse instead of accepting the
   # residual PID-reuse window between ps and os.kill; reconnect will surface
   # the still-running remote owner for an explicit retry.
-  print("DARWIN_UNAVAILABLE");sys.exit(2)
+  print("DARWIN_UNAVAILABLE");sys.exit(0)
  try:
   if pidfd is not None:signal.pidfd_send_signal(pidfd,signal_to_send)
   else:os.kill(pid,signal_to_send)
  except ProcessLookupError:print("ALREADY_STOPPED");sys.exit(0)
  if pidfd is not None:
   poller=select.poll();poller.register(pidfd,select.POLLIN)
-  if not poller.poll(${timeoutMs}):print("TIMEOUT");sys.exit(4)
+  if not poller.poll(${timeoutMs}):print("TIMEOUT");sys.exit(0)
  else:
   deadline=time.monotonic()+${timeoutMs / 1000}
   while time.monotonic()<deadline:
    try:os.kill(pid,0)
    except ProcessLookupError:break
-   except PermissionError:print("UNAVAILABLE");sys.exit(2)
+   except PermissionError:print("UNAVAILABLE");sys.exit(0)
    time.sleep(.1)
-  else:print("TIMEOUT");sys.exit(4)
+  else:print("TIMEOUT");sys.exit(0)
  print("TERMINATED")
 finally:
  if pidfd is not None:os.close(pidfd)
@@ -1660,6 +1674,7 @@ export {
   adoptOwnedServedToken,
   assertRemoteInstallUpdateClear,
   buildOwnedDarwinTerminationCommand,
+  buildOwnedTerminationCommand,
   buildSpawnCommand,
   classifySshReuseProof,
   cleanupStale,
