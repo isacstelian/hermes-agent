@@ -249,13 +249,16 @@ def test_cron_feedback_surfaces_local_aggregates(monkeypatch, capsys):
                 "runs": 4,
                 "completed_runs": 3,
                 "failed_runs": 1,
-                "delivered_runs": 3,
+                "deliveries": 4,
+                "delivered_deliveries": 3,
+                "failed_deliveries": 1,
+                "pending_deliveries": 0,
                 "total_duration_ms": 12000,
                 "average_duration_ms": 3000,
                 "votes": 2,
                 "positive_votes": 1,
                 "negative_votes": 1,
-                "rated_runs": 2,
+                "rated_deliveries": 2,
             }
         ],
     )
@@ -277,7 +280,9 @@ def test_cron_feedback_surfaces_local_aggregates(monkeypatch, capsys):
 
     out = capsys.readouterr().out
     assert "Runs: 4" in out
+    assert "Deliveries: 4" in out
     assert "Runtime: total=12.0s" in out
+    assert "response=67%" in out
     assert "not-useful" in out
     assert "reason=too_long" in out
 

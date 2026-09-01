@@ -299,13 +299,17 @@ def cron_feedback(job_id: Optional[str] = None, limit: int = 20) -> None:
     print()
     for row in summaries:
         name = row.get("job_name") or row["job_id"]
-        delivered = int(row.get("delivered_runs") or 0)
-        rated = int(row.get("rated_runs") or 0)
+        delivered = int(row.get("delivered_deliveries") or 0)
+        rated = int(row.get("rated_deliveries") or 0)
         rate = f"{rated / delivered:.0%}" if delivered else "n/a"
         print(f"  {color(str(name), Colors.BOLD)}  {color(row['job_id'], Colors.DIM)}")
         print(
             f"    Runs: {row['runs']}  completed={row['completed_runs']}  "
-            f"failed={row['failed_runs']}  delivered={delivered}"
+            f"failed={row['failed_runs']}"
+        )
+        print(
+            f"    Deliveries: {row['deliveries']}  delivered={delivered}  "
+            f"failed={row['failed_deliveries']}  pending={row['pending_deliveries']}"
         )
         print(
             f"    Runtime: total={_format_duration(row.get('total_duration_ms'))}  "

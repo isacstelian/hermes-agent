@@ -747,13 +747,25 @@ def routine_feedback_summary(
                             AS completed_runs,
                           SUM(CASE WHEN e.status IN ('failed','unknown')
                                    THEN 1 ELSE 0 END) AS failed_runs,
-                          SUM(CASE WHEN e.delivery_outcome='delivered'
-                                   THEN 1 ELSE 0 END) AS delivered_runs,
                           COALESCE(SUM(e.duration_ms), 0) AS total_duration_ms,
                           CAST(ROUND(AVG(e.duration_ms)) AS INTEGER)
                             AS average_duration_ms,
                           MAX(e.claimed_at) AS last_run_at
                    FROM executions e
+                   {where}
+                   GROUP BY e.job_id
+                 ),
+                 delivery_stats AS (
+                   SELECT e.job_id,
+                          COUNT(*) AS deliveries,
+                          SUM(CASE WHEN d.status='delivered' THEN 1 ELSE 0 END)
+                            AS delivered_deliveries,
+                          SUM(CASE WHEN d.status='failed' THEN 1 ELSE 0 END)
+                            AS failed_deliveries,
+                          SUM(CASE WHEN d.status='pending' THEN 1 ELSE 0 END)
+                            AS pending_deliveries
+                   FROM execution_deliveries d
+                   JOIN executions e ON e.id=d.execution_id
                    {where}
                    GROUP BY e.job_id
                  ),
@@ -764,21 +776,29 @@ def routine_feedback_summary(
                             AS positive_votes,
                           SUM(CASE WHEN f.vote=-1 THEN 1 ELSE 0 END)
                             AS negative_votes,
-                          COUNT(DISTINCT f.execution_id) AS rated_runs
+                          COUNT(DISTINCT f.delivery_id) AS rated_deliveries
                    FROM execution_feedback f
                    JOIN executions e ON e.id=f.execution_id
                    {where}
                    GROUP BY e.job_id
                  )
                  SELECT x.*,
+                        COALESCE(d.deliveries, 0) AS deliveries,
+                        COALESCE(d.delivered_deliveries, 0)
+                          AS delivered_deliveries,
+                        COALESCE(d.failed_deliveries, 0)
+                          AS failed_deliveries,
+                        COALESCE(d.pending_deliveries, 0)
+                          AS pending_deliveries,
                         COALESCE(f.votes, 0) AS votes,
                         COALESCE(f.positive_votes, 0) AS positive_votes,
                         COALESCE(f.negative_votes, 0) AS negative_votes,
-                        COALESCE(f.rated_runs, 0) AS rated_runs
+                        COALESCE(f.rated_deliveries, 0) AS rated_deliveries
                  FROM execution_stats x
+                 LEFT JOIN delivery_stats d ON d.job_id=x.job_id
                  LEFT JOIN feedback_stats f ON f.job_id=x.job_id
                  ORDER BY x.last_run_at DESC, x.job_id""",
-            params + params,
+            params + params + params,
         ).fetchall()
     return [dict(row) for row in rows]
 

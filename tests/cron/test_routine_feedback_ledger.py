@@ -232,9 +232,11 @@ def test_one_user_has_one_vote_per_execution_across_multiple_deliveries(
 
     summary = executions.routine_feedback_summary(job_id="fanout-routine")
     assert summary[0]["runs"] == 1
+    assert summary[0]["deliveries"] == 2
+    assert summary[0]["delivered_deliveries"] == 2
     assert summary[0]["votes"] == 1
     assert summary[0]["positive_votes"] == 1
-    assert summary[0]["rated_runs"] == 1
+    assert summary[0]["rated_deliveries"] == 1
     assert executions.list_routine_feedback(job_id="fanout-routine") == [
         {
             **changed,
