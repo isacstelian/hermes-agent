@@ -5611,12 +5611,21 @@ def tools_command(args=None, first_install: bool = False, config: dict = None):
         )
         feedback_status = "enabled" if feedback_enabled else "disabled"
         print()
-        print(f"  Routine feedback: {feedback_status}")
+        print(
+            f"  Routine feedback: {feedback_status} "
+            "(stores voter Telegram user IDs locally)"
+        )
         print()
         return
     print(color("⚕ Hermes Tool Configuration", Colors.CYAN, Colors.BOLD))
     print(color("  Enable or disable tools per platform.", Colors.DIM))
     print(color("  Tools that need API keys will be configured when enabled.", Colors.DIM))
+    print(
+        color(
+            "  Routine feedback stores voter Telegram user IDs locally in this profile.",
+            Colors.DIM,
+        )
+    )
     print(color("  Guide: https://hermes-agent.nousresearch.com/docs/user-guide/features/tools", Colors.DIM))
     print()
 

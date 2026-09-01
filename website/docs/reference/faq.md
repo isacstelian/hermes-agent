@@ -51,7 +51,7 @@ See:
 
 ### Is my data sent anywhere?
 
-API calls go **only to the LLM provider you configure** (e.g., OpenRouter, your local Ollama instance). Hermes Agent does not upload product telemetry, usage data, or analytics. Your conversations, memory, skills, and opt-in routine feedback are stored locally in `~/.hermes/`.
+API calls go **only to the LLM provider you configure** (e.g., OpenRouter, your local Ollama instance). Hermes Agent does not upload product telemetry, usage data, or analytics. Your conversations, memory, skills, and opt-in routine feedback, including voter Telegram user IDs, are stored locally in `~/.hermes/`.
 
 ### Can I use it offline / with local models?
 

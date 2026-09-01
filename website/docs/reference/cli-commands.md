@@ -612,7 +612,7 @@ hermes cron <list|create|edit|pause|resume|run|remove|status|runs|feedback|tick>
 | `remove` | Delete a scheduled job. |
 | `status` | Check whether the cron scheduler is running. |
 | `runs` / `history` | Show durable execution attempts, optionally filtered by job ID. |
-| `feedback` | Show local run counts, runtime, delivery totals, and Telegram feedback, optionally filtered by job ID. |
+| `feedback` | Show local run counts, runtime, delivery totals, and recent Telegram votes with voter user IDs, optionally filtered by job ID. |
 | `tick` | Run due jobs once and exit. |
 
 The cron **trigger** is pluggable via the `cron.provider` config key. Empty

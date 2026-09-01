@@ -2461,8 +2461,12 @@ def setup_telemetry(config: dict):
         feedback = {}
         cron["feedback"] = feedback
 
+    print_info(
+        "Routine votes store the voter's numeric Telegram user ID locally "
+        "under this profile."
+    )
     feedback["enabled"] = prompt_yes_no(
-        "Add feedback buttons to successful Telegram cron deliveries?",
+        "Add feedback buttons and store voter Telegram user IDs locally?",
         default=feedback.get("enabled") is True,
     )
     if feedback["enabled"]:

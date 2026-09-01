@@ -262,7 +262,7 @@ def test_first_install_nous_auto_configures_video_gen(monkeypatch):
     assert "video_gen" not in configured
 
 
-def test_tools_menu_toggles_local_routine_feedback(monkeypatch):
+def test_tools_menu_toggles_local_routine_feedback(monkeypatch, capsys):
     from hermes_cli.tools_config import tools_command
 
     config = {"platform_toolsets": {"cli": []}}
@@ -284,6 +284,7 @@ def test_tools_menu_toggles_local_routine_feedback(monkeypatch):
 
     assert config["cron"]["feedback"]["enabled"] is True
     assert saved
+    assert "Telegram user IDs" in capsys.readouterr().out
 
 # ── Platform / toolset consistency ────────────────────────────────────────────
 
