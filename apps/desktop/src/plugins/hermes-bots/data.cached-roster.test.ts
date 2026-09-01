@@ -3,19 +3,23 @@
  * must answer per keystroke and the composer middleware runs on submit, so
  * neither can wait on the hook.
  *
- * `useRoster` keys its query on `[...ROSTER_KEY, connectionId]`, one entry per
- * connection the window has been on. Reading it back with the BARE key is an
+ * `useRoster` keys its query on `[...ROSTER_KEY, connectionId, mode, connectionKey]`, one entry
+ * per live route. Reading it back with the BARE key is an
  * exact-key match in TanStack Query and therefore matches NOTHING — the
  * regression where completions offered no handles and remote `@name-device`
- * mentions passed through unresolved. The read has to fall back to a prefix
- * match over the key family, newest snapshot wins.
+ * mentions passed through unresolved. The imperative read must use the same
+ * exact key and must never borrow a roster from another route.
  */
 
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const { cache, connection } = vi.hoisted(() => ({
   cache: new Map<string, { key: unknown[]; value: unknown }>(),
-  connection: { id: 'local' }
+  connection: {
+    id: 'local' as null | string,
+    key: 'connection:local' as null | string,
+    mode: 'local' as null | 'local' | 'remote'
+  }
 }))
 
 vi.mock('@hermes/plugin-sdk', async () => {
@@ -24,7 +28,14 @@ vi.mock('@hermes/plugin-sdk', async () => {
 
   return {
     atom,
-    host: { state: { connectionId: { get: () => connection.id }, profile: { get: () => 'default' } } },
+    host: {
+      state: {
+        connectionId: { get: () => connection.id },
+        connectionKey: { get: () => connection.key },
+        connectionMode: { get: () => connection.mode },
+        profile: { get: () => 'default' }
+      }
+    },
     queryClient: {
       getQueriesData: ({ queryKey }: { queryKey: unknown[] }) =>
         [...cache.values()]
@@ -46,13 +57,15 @@ const seed = (key: unknown[], value: unknown) => cache.set(JSON.stringify(key), 
 beforeEach(() => {
   cache.clear()
   connection.id = 'local'
+  connection.key = 'connection:local'
+  connection.mode = 'local'
 })
 
 describe('cachedUnionRoster', () => {
   it('reads the entry useRoster wrote under the connection-suffixed key', async () => {
     const { cachedUnionRoster } = await import('./data')
 
-    seed(['hermes-bots', 'roster', 'local'], { profiles: [{ name: 'default' }] })
+    seed(['hermes-bots', 'roster', 'local', 'local', 'connection:local'], { profiles: [{ name: 'default' }] })
 
     expect(cachedUnionRoster()?.profiles).toHaveLength(1)
     // The bare key is what the broken read used — it must still miss, or this
@@ -60,27 +73,47 @@ describe('cachedUnionRoster', () => {
     expect(cache.has(JSON.stringify(['hermes-bots', 'roster']))).toBe(false)
   })
 
-  it('falls back to another connection’s entry when the window has moved', async () => {
+  it('does not borrow another connection\'s roster while the live cache is cold', async () => {
     const { cachedUnionRoster } = await import('./data')
 
-    seed(['hermes-bots', 'roster', 'vera'], { profiles: [{ connectionId: 'vera', name: 'default' }] })
+    seed(['hermes-bots', 'roster', 'vera', 'remote', 'connection:vera'], {
+      fetchedAt: 9_000,
+      profiles: [{ connectionId: 'vera', name: 'default' }]
+    })
     connection.id = 'local'
+    connection.mode = 'local'
 
-    expect(cachedUnionRoster()?.profiles?.[0]).toMatchObject({ connectionId: 'vera' })
+    expect(cachedUnionRoster()).toBeNull()
   })
 
-  it('prefers the freshest snapshot among several cached connections', async () => {
+  it('keeps local and remote caches separate even when the connection id is the same', async () => {
     const { cachedUnionRoster } = await import('./data')
 
-    seed(['hermes-bots', 'roster', 'old'], { fetchedAt: 1_000, profiles: [{ name: 'stale' }] })
-    seed(['hermes-bots', 'roster', 'new'], { fetchedAt: 9_000, profiles: [{ name: 'fresh' }] })
-    connection.id = 'neither'
+    seed(['hermes-bots', 'roster', 'local', 'local', 'connection:local'], {
+      profiles: [{ name: 'this-device' }]
+    })
+    seed(['hermes-bots', 'roster', 'local', 'remote', 'remote:ssh:local'], {
+      profiles: [{ name: 'remote-primary' }]
+    })
 
-    expect(cachedUnionRoster()?.profiles?.[0]).toMatchObject({ name: 'fresh' })
+    expect(cachedUnionRoster()?.profiles?.[0]).toMatchObject({ name: 'this-device' })
   })
 
   it('reports nothing rather than throwing on a cold cache', async () => {
     const { cachedUnionRoster } = await import('./data')
+
+    expect(cachedUnionRoster()).toBeNull()
+  })
+
+  it('does not borrow a different idless remote with the same mode and empty id', async () => {
+    const { cachedUnionRoster } = await import('./data')
+
+    connection.id = null
+    connection.mode = 'remote'
+    connection.key = 'remote:ssh:host-b'
+    seed(['hermes-bots', 'roster', null, 'remote', 'remote:ssh:host-a'], {
+      profiles: [{ name: 'host-a' }]
+    })
 
     expect(cachedUnionRoster()).toBeNull()
   })

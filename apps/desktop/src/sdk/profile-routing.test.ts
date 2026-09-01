@@ -200,6 +200,14 @@ afterEach(() => {
 })
 
 describe('connection-aware plugin host APIs', () => {
+  it('does not start backends from profile or agent warm-up hints', () => {
+    Array.from({ length: 31 }, (_, index) => host.warmAgent('imac', `agent-${index}`))
+    host.warmProfile('research')
+
+    expect(openGatewayForAgent).not.toHaveBeenCalled()
+    expect(openGatewayForProfile).not.toHaveBeenCalled()
+  })
+
   it('retires a profile gateway before deleting it', async () => {
     const order: string[] = []
 
@@ -1132,6 +1140,40 @@ describe('profile-aware plugin session opens', () => {
     // retry, not a frozen pane.
     expect(setResumeExhaustedSessionId).toHaveBeenCalledWith('wedged-chat')
     expect($gatewaySwapTarget.get()).toBeNull()
+  })
+
+  it('lets an SSH activation use a longer budget than transcript hydration', async () => {
+    vi.useFakeTimers()
+    vi.mocked(openGatewayForAgent).mockImplementationOnce(() => new Promise<void>(() => undefined))
+
+    try {
+      const opening = host.openSession('ssh-bot-chat', {
+        activationTimeoutMs: 120,
+        awaitHydration: true,
+        expectHistory: true,
+        hydrationTimeoutMs: 40,
+        profile: 'cmo',
+        route: { connectionId: 'imac', mode: 'remote', profile: 'cmo', targetProfile: 'cmo' }
+      })
+
+      let settled = false
+      void opening.then(
+        () => {
+          settled = true
+        },
+        () => {
+          settled = true
+        }
+      )
+
+      await vi.advanceTimersByTimeAsync(40)
+      expect(settled).toBe(false)
+
+      await vi.advanceTimersByTimeAsync(80)
+      await expect(opening).rejects.toThrow("Timed out loading cmo's session history.")
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('names the phase in the wake log so a stuck dial is not read as a slow transcript', async () => {

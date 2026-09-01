@@ -42,6 +42,7 @@ import { onGatewayEvent } from '@/contrib/events'
 import { registry } from '@/contrib/registry'
 import type { WorkspaceMode } from '@/contrib/types'
 import { deleteProfile, getLogs, getStatus, hermesApi, type HermesGateway } from '@/hermes'
+import { SECONDARY_GATEWAY_ACTIVATION_TIMEOUT_MS } from '@/lib/with-timeout'
 import {
   $gateway,
   activeGatewayConnectionId,
@@ -122,6 +123,7 @@ const focusedTurnFlag = (
   )
 
 const $focusedBusy = focusedTurnFlag(state => state.busy, PRIMARY_SESSION_VIEW.$busy)
+const $activeConnectionMode = computed($connection, connection => connection?.mode ?? null)
 
 const $focusedAwaitingResponse = focusedTurnFlag(
   state => state.awaitingResponse,
@@ -314,15 +316,57 @@ const $activeConnectionId = computed($connection, connection => {
   return connection.mode === 'local' ? 'local' : null
 })
 
+function connectionKeyBaseUrl(raw: string): string {
+  try {
+    const url = new URL(raw)
+
+    url.username = ''
+    url.password = ''
+    url.search = ''
+    url.hash = ''
+
+    return url.toString().replace(/\/$/, '')
+  } catch {
+    return raw.split(/[?#]/, 1)[0]
+  }
+}
+
+const $activeConnectionKey = computed($connection, connection => {
+  if (!connection) {
+    return null
+  }
+
+  const connectionId = String(connection.connectionId || '').trim()
+
+  if (connectionId) {
+    return `connection:${connectionId}`
+  }
+
+  if (connection.mode !== 'remote') {
+    return 'local'
+  }
+
+  return `remote:${JSON.stringify([
+    String(connection.remoteKind || '').trim(),
+    String(connection.remoteHost || '').trim(),
+    String(connection.remoteIdentity || '').trim(),
+    connectionKeyBaseUrl(String(connection.baseUrl || '').trim())
+  ])}`
+})
+
 /** Ordinary session opens fail fast when their gateway or socket is dead. */
 export const DEFAULT_SESSION_HYDRATION_TIMEOUT_MS = 20_000
 /** Cold Bot profiles get a larger per-attempt budget to start their backend
  *  and paint durable history. Bot Mode opts into one retry, so its effective
  *  ceiling is two bounded attempts rather than an unbounded wait. */
 export const BOT_CHAT_SESSION_HYDRATION_TIMEOUT_MS = 60_000
+/** SSH Bot activation can legitimately wait behind one queued cold bootstrap.
+ * Hydration keeps its own 60s budget after the gateway is open. */
+export const BOT_CHAT_SSH_ACTIVATION_TIMEOUT_MS = SECONDARY_GATEWAY_ACTIVATION_TIMEOUT_MS
 let openSessionGeneration = 0
 
 export interface PluginOpenSessionOptions {
+  activationTimeoutMs?: number
   awaitHydration?: boolean
   expectHistory?: boolean
   /** Always request a sequenced session.resume after the open, even when the
@@ -585,6 +629,12 @@ export const host = {
     busyBySession: readonlyAtom<Record<string, boolean>>($busyBySession),
     /** Registry source that owns the active gateway, when source-scoped. */
     connectionId: readonlyAtom<null | string>($activeConnectionId),
+    /** Credential-free identity of the active backend. Distinguishes legacy
+     * remotes whose descriptor predates registry connection ids. */
+    connectionKey: readonlyAtom<null | string>($activeConnectionKey),
+    /** Transport mode of the active gateway, including legacy remotes whose
+     * registry connection id is not available in the descriptor. */
+    connectionMode: readonlyAtom<'local' | 'remote' | null>($activeConnectionMode),
     /** Active workspace cwd ('' when detached). */
     cwd: readonlyAtom<string>($currentCwd),
     /** Runtime id of the FOCUSED chat session — the interacted tile, else the
@@ -633,21 +683,12 @@ export const host = {
     window.location.hash = path.startsWith('#') ? path : `#${path}`
   },
 
-  /** Pre-dial a profile's gateway socket in the background — pool-only, no
-   *  activation, no navigation, no scope change (openGatewayForProfile; it
-   *  already no-ops for shared-remote routes and the primary). Roster UIs
-   *  call this after mount so the FIRST click on an agent doesn't pay the
-   *  whole backend spawn + socket dial latency. Fire-and-forget: failures
-   *  are swallowed — the click path re-runs its own ensure and surfaces
-   *  errors properly. */
-  warmProfile: (profile: string): void => {
-    const name = (profile ?? '').trim()
-
-    if (!name || name === $activeGatewayProfile.get()) {
-      return
-    }
-
-    void openGatewayForProfile(name).catch(() => undefined)
+  /** Compatibility door for older plugins. Speculative gateway starts are
+   *  disabled because renderer-local throttles cannot bound work app-wide
+   *  when Desktop has more than one window. */
+  warmProfile: (_profile: string): void => {
+    // Compatibility no-op. Speculative backend starts are unsafe across
+    // multiple renderer windows; the explicit click owns the cold start.
   },
 
   /** Delete a profile THROUGH the desktop's teardown-routed REST path — the
@@ -782,12 +823,9 @@ export const host = {
     return roster()
   },
 
-  /** Pre-dial an agent's socket on ITS source — the (connection, profile)
-   *  analogue of warmProfile. Fire-and-forget, same semantics.
-   *  `undefined` is accepted alongside `null` because a roster row's
-   *  `connectionId` is optional; both mean "no explicit source". */
-  warmAgent: (connectionId: null | string | undefined, profile: string): void => {
-    void openGatewayForAgent(connectionId ?? null, (profile ?? '').trim() || 'default').catch(() => undefined)
+  /** Agent-scoped compatibility twin of warmProfile. */
+  warmAgent: (_connectionId: null | string | undefined, _profile: string): void => {
+    // Same contract as warmProfile: keep the plugin API, start no backend.
   },
 
   /** Activate an agent's gateway (dialing it if needed) so subsequent
@@ -865,6 +903,7 @@ export const host = {
     const wakeStartedAt = Date.now()
     let profileActiveAt = wakeStartedAt
     const hydrationTimeoutMs = Math.max(1, options.hydrationTimeoutMs ?? DEFAULT_SESSION_HYDRATION_TIMEOUT_MS)
+    const activationTimeoutMs = Math.max(1, options.activationTimeoutMs ?? hydrationTimeoutMs)
     // Which half of the wake a timeout landed in. Only meaningful on the
     // failure path, where the two phases have different remedies: a stuck dial
     // is a gateway problem, a slow transcript is a backend-warmup one.
@@ -914,7 +953,7 @@ export const host = {
         // Retry surface both already exist. A plain open never asked for a
         // deadline and has nowhere to render one, so it keeps today's
         // behaviour rather than gaining a rejection its callers cannot handle.
-        await (options.awaitHydration ? awaitProfileActivation(dial, targetProfile, hydrationTimeoutMs) : dial())
+        await (options.awaitHydration ? awaitProfileActivation(dial, targetProfile, activationTimeoutMs) : dial())
         profileActiveAt = Date.now()
       }
 

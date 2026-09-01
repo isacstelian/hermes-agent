@@ -4,8 +4,8 @@
  *
  * Both read the roster IMPERATIVELY (a popover must answer per keystroke, and
  * the middleware runs on submit), so both go through the query cache rather
- * than the hook. `useRoster` keys its query on `[...ROSTER_KEY, connectionId]`
- * — one entry per connection the window has been on — and these readers used
+ * than the hook. `useRoster` keys its query on
+ * `[...ROSTER_KEY, connectionId, connectionMode, connectionKey]`, and these readers used
  * to call `getQueryData(ROSTER_KEY)` with the BARE key. That is an exact-key
  * match in TanStack Query, so it matched NOTHING: completions offered no
  * roster handles, and a remote `@name-device` mention passed through the
@@ -58,7 +58,7 @@ const ROSTER = {
 }
 
 const { cache, hostMock, live } = vi.hoisted(() => {
-  const live = { focused: 'default', profile: 'default' }
+  const live = { connectionKey: 'connection:local', focused: 'default', profile: 'default' }
 
   return {
     cache: new Map<string, { key: unknown[]; value: unknown }>(),
@@ -68,6 +68,8 @@ const { cache, hostMock, live } = vi.hoisted(() => {
       requestProfile: vi.fn(async () => ({})),
       state: {
         connectionId: { get: () => 'local', listen: () => () => undefined },
+        connectionKey: { get: () => live.connectionKey, listen: () => () => undefined },
+        connectionMode: { get: () => 'local', listen: () => () => undefined },
         focusedSessionProfile: { get: () => live.focused, listen: () => () => undefined },
         focusedStoredSessionId: { get: () => null, listen: () => () => undefined },
         gateway: { get: () => null, listen: () => () => undefined },
@@ -119,6 +121,8 @@ interface Fixture {
   /** Which connection id the cache entry is filed under — 'local' is the one
    *  the live window would write. */
   cacheKeyConnection?: string
+  cacheKeyConnectionKey?: string
+  cacheKeyMode?: 'local' | 'remote'
   /** Profile owning the chat on screen; a bot never @s itself. */
   focused?: string
   profiles?: Array<Record<string, unknown>>
@@ -127,15 +131,18 @@ interface Fixture {
 /** Register the plugin and hand back its composer contributions. */
 async function contributions({
   cacheKeyConnection = 'local',
+  cacheKeyConnectionKey = 'connection:local',
+  cacheKeyMode = cacheKeyConnection === 'local' ? 'local' : 'remote',
   focused = 'default',
   profiles = ROSTER.profiles
 }: Fixture = {}) {
   vi.resetModules()
   cache.clear()
+  live.connectionKey = 'connection:local'
   live.focused = focused
-  // Exactly where useRoster writes it: suffixed with the connection id.
-  cache.set(JSON.stringify(['hermes-bots', 'roster', cacheKeyConnection]), {
-    key: ['hermes-bots', 'roster', cacheKeyConnection],
+  // Exactly where useRoster writes it: suffixed with connection id and mode.
+  cache.set(JSON.stringify(['hermes-bots', 'roster', cacheKeyConnection, cacheKeyMode, cacheKeyConnectionKey]), {
+    key: ['hermes-bots', 'roster', cacheKeyConnection, cacheKeyMode, cacheKeyConnectionKey],
     value: { profiles }
   })
 
@@ -172,6 +179,7 @@ beforeAll(async () => {
 beforeEach(() => {
   vi.clearAllMocks()
   live.focused = 'default'
+  live.connectionKey = 'connection:local'
   live.profile = 'default'
 })
 
@@ -182,11 +190,10 @@ describe('@-mention completions', () => {
     expect(provide('').map(item => item.insert)).toContain('@default-vera')
   })
 
-  it('still resolves when the only cached roster is under another connection id', async () => {
-    // The window moved connections; the stale entry is the only one cached.
+  it('does not offer handles from another connection\'s stale cache entry', async () => {
     const { provide } = await contributions({ cacheKeyConnection: 'vera' })
 
-    expect(provide('').map(item => item.insert)).toContain('@default-vera')
+    expect(provide('')).toEqual([])
   })
 
   it('surfaces default as @hermes and prefix-filters on the handle', async () => {

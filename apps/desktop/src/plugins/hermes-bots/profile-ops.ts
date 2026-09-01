@@ -40,6 +40,42 @@ import type { RosterRow } from './types'
 const avatarFetchInflight = new Set<string>()
 const avatarPushInflight = new Set<string>()
 
+// Active-source rows are sourceScoped for identity too. Only remoteSource
+// rows need their exact routed socket; routing every active row would dial one
+// SSH backend per profile whenever the Bots roster syncs avatars.
+function usesRemoteAvatarGateway(bot: RosterRow) {
+  return Boolean(bot.remoteSource)
+}
+
+function ambientAvatarGatewayMatches(bot: RosterRow) {
+  const ownerConnectionKey = String(bot.ambientConnectionKey || '').trim()
+  const ambientConnectionKey = String(host.state.connectionKey?.get?.() || '').trim()
+  const ownerId = String(bot.connectionId || '').trim()
+  const ambientId = String(host.state.connectionId?.get?.() || '').trim()
+  const ownerMode = bot.route?.mode
+  const ambientMode = host.state.connectionMode?.get?.()
+
+  // Legacy remote descriptors omit their connection id. The transport mode
+  // still changes on remote -> local switches, so fail closed while a stale
+  // remote roster row is waiting for the new source's roster to arrive.
+  if (ownerMode && ambientMode !== ownerMode) {
+    return false
+  }
+
+  if (ownerConnectionKey) {
+    return ownerConnectionKey === ambientConnectionKey
+  }
+
+  if (ownerId && ambientId) {
+    return ownerId === ambientId
+  }
+
+  // Migrated v1 remote descriptors have no ambient connection id. The roster
+  // merge marks rows that came from this exact gateway's profiles.list, which
+  // is enough to keep avatar sync on host.request without per-profile dials.
+  return !ownerId || bot.ambientSource === true
+}
+
 /** Backfill: local meta has art the server lacks -> profiles.set_asset.
  *  Server-side avatars power the inter-agent notice pfp (core #85855) and
  *  cross-machine roster art, so local-only images are a bug, not a state. */
@@ -54,9 +90,13 @@ function pushLocalAvatars(roster: RosterRow[]) {
     const image = $botMeta.get()[key]?.image
 
     if (image && typeof image === 'string' && image.startsWith('data:')) {
+      if (!usesRemoteAvatarGateway(bot) && !ambientAvatarGatewayMatches(bot)) {
+        continue
+      }
+
       avatarPushInflight.add(key)
 
-      const request = bot.sourceScoped
+      const request = usesRemoteAvatarGateway(bot)
         ? requestForBot(bot, 'profiles.set_asset', {
             name: bot.name,
             asset: 'avatar',
@@ -88,28 +128,49 @@ function pushLocalAvatars(roster: RosterRow[]) {
       continue
     }
 
+    if (!usesRemoteAvatarGateway(bot) && !ambientAvatarGatewayMatches(bot)) {
+      continue
+    }
+
     avatarPushInflight.add(key)
+    const ambientConnectionKey = usesRemoteAvatarGateway(bot) ? null : host.state.connectionKey?.get?.()
+
     rasterizeSvgToPng(svg, 160)
-      .then(png =>
-        png
-          ? (bot.sourceScoped
-              ? requestForBot(bot, 'profiles.set_asset', {
-                  name: bot.name,
-                  asset: 'avatar',
-                  data: png
-                })
-              : host.request('profiles.set_asset', {
-                  name: bot.name,
-                  asset: 'avatar',
-                  data: png
-                })
-            ).then(() =>
-              queryClient.invalidateQueries({
-                queryKey: ['hermes-bots', 'roster']
-              })
-            )
-          : Promise.reject(new Error('rasterize failed'))
-      )
+      .then(png => {
+        if (!png) {
+          throw new Error('rasterize failed')
+        }
+
+        const remoteGateway = usesRemoteAvatarGateway(bot)
+
+        // host.request follows the ambient gateway. If the user changes
+        // connections while the SVG rasterizes, abort instead of uploading
+        // this profile's avatar to the newly active Hermes installation.
+        if (
+          !remoteGateway &&
+          (!ambientAvatarGatewayMatches(bot) || host.state.connectionKey?.get?.() !== ambientConnectionKey)
+        ) {
+          throw new Error('avatar gateway changed')
+        }
+
+        const request = remoteGateway
+          ? requestForBot(bot, 'profiles.set_asset', {
+              name: bot.name,
+              asset: 'avatar',
+              data: png
+            })
+          : host.request('profiles.set_asset', {
+              name: bot.name,
+              asset: 'avatar',
+              data: png
+            })
+
+        return request.then(() =>
+          queryClient.invalidateQueries({
+            queryKey: ['hermes-bots', 'roster']
+          })
+        )
+      })
       .catch(() => avatarPushInflight.delete(key))
   }
 }
@@ -173,9 +234,13 @@ export function pullServerAvatars(roster: RosterRow[]) {
       continue
     }
 
+    if (!usesRemoteAvatarGateway(bot) && !ambientAvatarGatewayMatches(bot)) {
+      continue
+    }
+
     avatarFetchInflight.add(key)
 
-    const assetRequest = bot.sourceScoped
+    const assetRequest = usesRemoteAvatarGateway(bot)
       ? requestForBot(bot, 'profiles.get_asset', {
           name: bot.name,
           asset: 'avatar'

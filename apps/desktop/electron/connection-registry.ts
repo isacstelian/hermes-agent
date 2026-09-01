@@ -212,6 +212,49 @@ export function backendScopePrefix(connectionId: string): string {
   return `conn:${String(connectionId).trim()}::`
 }
 
+interface RegistryOwnedSshScopeState {
+  cancelScopes?: string[]
+  registryConnectionId?: string
+}
+
+export function registryOwnedSshScopes(
+  published: Iterable<[string, RegistryOwnedSshScopeState]>,
+  active: Iterable<{ scope: string; metadata?: RegistryOwnedSshScopeState }>,
+  connectionId: string
+): string[] {
+  const id = String(connectionId).trim()
+  const prefix = backendScopePrefix(id)
+  const scopes = new Set<string>()
+
+  const ownsScope = (scope: string, state?: RegistryOwnedSshScopeState): boolean => {
+    if (scope.startsWith(prefix)) {
+      return true
+    }
+
+    const registryConnectionId = String(state?.registryConnectionId || '').trim()
+
+    if (registryConnectionId) {
+      return registryConnectionId === id
+    }
+
+    return Boolean(state?.cancelScopes?.some(cancelScope => cancelScope.startsWith(prefix)))
+  }
+
+  for (const [scope, state] of published) {
+    if (ownsScope(scope, state)) {
+      scopes.add(scope)
+    }
+  }
+
+  for (const entry of active) {
+    if (ownsScope(entry.scope, entry.metadata)) {
+      scopes.add(entry.scope)
+    }
+  }
+
+  return [...scopes]
+}
+
 export interface RegistryLocalRoute {
   /** Reuse the legacy v1 ensureBackend path — it already resolves to the
    * app's own local runtime, so single-source behavior stays byte-identical. */

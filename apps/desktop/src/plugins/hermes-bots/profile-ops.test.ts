@@ -9,10 +9,10 @@
  * the base forever and the search runs out at -99.
  */
 
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { $botMeta } from './data'
-import { duplicateBot } from './profile-ops'
+import { duplicateBot, pullServerAvatars } from './profile-ops'
 import type { RosterRow } from './types'
 
 const { ensureBotMetadataMock, hostMock, storageMock } = vi.hoisted(() => ({
@@ -20,7 +20,13 @@ const { ensureBotMetadataMock, hostMock, storageMock } = vi.hoisted(() => ({
   hostMock: {
     request: vi.fn(),
     requestProfile: vi.fn(),
-    state: { connectionId: { get: () => 'local' }, focusedSessionOwner: null, profile: { get: () => 'default' } }
+    state: {
+      connectionId: { get: vi.fn(() => 'local') },
+      connectionKey: { get: vi.fn<() => null | string>(() => 'connection:local') },
+      connectionMode: { get: vi.fn<() => null | 'local' | 'remote'>(() => 'local') },
+      focusedSessionOwner: null,
+      profile: { get: () => 'default' }
+    }
   },
   storageMock: { get: vi.fn(), set: vi.fn() }
 }))
@@ -49,11 +55,20 @@ beforeEach(() => {
   calls.length = 0
   $botMeta.set({})
   storageMock.set.mockResolvedValue(undefined)
+  hostMock.state.connectionId.get.mockReturnValue('local')
+  hostMock.state.connectionKey.get.mockReturnValue('connection:local')
+  hostMock.state.connectionMode.get.mockReturnValue('local')
   hostMock.request.mockImplementation(async (method: string, params: Record<string, unknown>) => {
     calls.push({ method, params: structuredClone(params ?? {}) })
 
     return { ok: true }
   })
+})
+
+afterEach(() => {
+  document.body.replaceChildren()
+  vi.unstubAllGlobals()
+  vi.restoreAllMocks()
 })
 
 describe('duplicating a bot', () => {
@@ -151,5 +166,286 @@ describe('duplicating a bot', () => {
     hostMock.requestProfile.mockResolvedValue({ ok: true })
 
     expect(await duplicateBot(bot, [bot, elsewhere])).toBe('ops-2')
+  })
+})
+
+describe('roster avatar sync routing', () => {
+  beforeEach(() => {
+    hostMock.state.connectionMode.get.mockReturnValue('remote')
+  })
+
+  it('keeps active-source avatar reads on the ambient gateway for a 31-profile roster', () => {
+    const roster = Array.from({ length: 31 }, (_, index) => {
+      const name = `agent-${index}`
+
+      return {
+        connectionId: 'imac-hermes',
+        has_avatar: true,
+        name,
+        route: {
+          connectionId: 'imac-hermes',
+          mode: 'remote' as const,
+          profile: name,
+          targetProfile: name
+        },
+        sourceScoped: true
+      } as RosterRow
+    })
+
+    hostMock.request.mockResolvedValue({ found: false })
+    hostMock.requestProfile.mockResolvedValue({ found: false })
+    hostMock.state.connectionId.get.mockReturnValue('imac-hermes')
+
+    pullServerAvatars(roster)
+
+    expect(hostMock.request).toHaveBeenCalledTimes(31)
+    expect(hostMock.request.mock.calls.every(([method]) => method === 'profiles.get_asset')).toBe(true)
+    expect(hostMock.requestProfile).not.toHaveBeenCalled()
+  })
+
+  it('keeps a different connection on its exact routed gateway without requiring sourceScoped', () => {
+    const remote = {
+      connectionId: 'other-host',
+      has_avatar: true,
+      name: 'remote-agent',
+      remoteSource: true,
+      route: {
+        connectionId: 'other-host',
+        mode: 'remote' as const,
+        profile: 'remote-agent',
+        targetProfile: 'remote-agent'
+      },
+    } as RosterRow
+
+    hostMock.requestProfile.mockResolvedValue({ found: false })
+
+    pullServerAvatars([remote])
+
+    expect(hostMock.requestProfile).toHaveBeenCalledWith(
+      remote.route,
+      'profiles.get_asset',
+      expect.objectContaining({ asset: 'avatar', name: 'remote-agent' })
+    )
+    expect(hostMock.request).not.toHaveBeenCalled()
+  })
+
+  it('keeps active-source avatar backfills on the ambient gateway too', () => {
+    const bot = {
+      connectionId: 'imac-hermes',
+      has_avatar: false,
+      name: 'active-agent',
+      route: {
+        connectionId: 'imac-hermes',
+        mode: 'remote' as const,
+        profile: 'active-agent',
+        targetProfile: 'active-agent'
+      },
+      sourceScoped: true
+    } as RosterRow
+
+    $botMeta.set({ 'imac-hermes::active-agent': { image: 'data:image/png;base64,active' } })
+    hostMock.request.mockResolvedValue({ ok: true })
+    hostMock.state.connectionId.get.mockReturnValue('imac-hermes')
+
+    pullServerAvatars([bot])
+
+    expect(hostMock.request).toHaveBeenCalledWith('profiles.set_asset', {
+      asset: 'avatar',
+      data: 'data:image/png;base64,active',
+      name: 'active-agent'
+    })
+    expect(hostMock.requestProfile).not.toHaveBeenCalled()
+  })
+
+  it('keeps migrated v1 remote avatars on the ambient gateway when its connection id is absent', () => {
+    const bot = {
+      ambientConnectionKey: 'remote:ssh:imac',
+      ambientSource: true,
+      connectionId: 'imac-hermes',
+      has_avatar: true,
+      name: 'legacy-agent',
+      route: {
+        connectionId: 'imac-hermes',
+        mode: 'remote' as const,
+        profile: 'legacy-agent',
+        targetProfile: 'legacy-agent'
+      },
+      sourceScoped: true
+    } as RosterRow
+
+    hostMock.state.connectionId.get.mockReturnValue('')
+    hostMock.state.connectionKey.get.mockReturnValue('remote:ssh:imac')
+    hostMock.request.mockResolvedValue({ found: false })
+
+    pullServerAvatars([bot])
+
+    expect(hostMock.request).toHaveBeenCalledWith('profiles.get_asset', {
+      asset: 'avatar',
+      name: 'legacy-agent'
+    })
+    expect(hostMock.requestProfile).not.toHaveBeenCalled()
+  })
+
+  it('does not read a stale legacy remote avatar after switching to an idless local gateway', () => {
+    const bot = {
+      ambientConnectionKey: 'remote:ssh:imac',
+      ambientSource: true,
+      connectionId: 'imac-hermes',
+      has_avatar: true,
+      name: 'legacy-agent',
+      route: {
+        connectionId: 'imac-hermes',
+        mode: 'remote' as const,
+        profile: 'legacy-agent',
+        targetProfile: 'legacy-agent'
+      },
+      sourceScoped: true
+    } as RosterRow
+
+    hostMock.state.connectionId.get.mockReturnValue('')
+    hostMock.state.connectionKey.get.mockReturnValue('local')
+    hostMock.state.connectionMode.get.mockReturnValue('local')
+
+    pullServerAvatars([bot])
+
+    expect(hostMock.request).not.toHaveBeenCalled()
+
+    hostMock.state.connectionMode.get.mockReturnValue('remote')
+    hostMock.state.connectionKey.get.mockReturnValue('remote:ssh:imac')
+    pullServerAvatars([bot])
+
+    expect(hostMock.request).toHaveBeenCalledWith('profiles.get_asset', {
+      asset: 'avatar',
+      name: 'legacy-agent'
+    })
+  })
+
+  it('does not read a stale legacy avatar after switching between two idless remotes', () => {
+    const bot = {
+      ambientConnectionKey: 'remote:ssh:host-a',
+      ambientSource: true,
+      has_avatar: true,
+      name: 'legacy-agent'
+    } as RosterRow
+
+    hostMock.state.connectionId.get.mockReturnValue('')
+    hostMock.state.connectionMode.get.mockReturnValue('remote')
+    hostMock.state.connectionKey.get.mockReturnValue('remote:ssh:host-b')
+
+    pullServerAvatars([bot])
+
+    expect(hostMock.request).not.toHaveBeenCalled()
+  })
+
+  it('does not push a stale local avatar onto the newly active gateway', () => {
+    const bot = {
+      connectionId: 'imac-hermes',
+      has_avatar: false,
+      name: 'stale-data-agent',
+      sourceScoped: true
+    } as RosterRow
+
+    $botMeta.set({ 'imac-hermes::stale-data-agent': { image: 'data:image/png;base64,stale' } })
+    hostMock.state.connectionId.get.mockReturnValue('other-host')
+
+    pullServerAvatars([bot])
+
+    expect(hostMock.request).not.toHaveBeenCalled()
+
+    hostMock.state.connectionId.get.mockReturnValue('imac-hermes')
+    pullServerAvatars([bot])
+
+    expect(hostMock.request).toHaveBeenCalledWith('profiles.set_asset', {
+      asset: 'avatar',
+      data: 'data:image/png;base64,stale',
+      name: 'stale-data-agent'
+    })
+    expect(hostMock.requestProfile).not.toHaveBeenCalled()
+  })
+
+  it('does not read a stale roster row from the newly active gateway', () => {
+    const bot = {
+      connectionId: 'imac-hermes',
+      has_avatar: true,
+      name: 'stale-roster-agent',
+      sourceScoped: true
+    } as RosterRow
+
+    hostMock.state.connectionId.get.mockReturnValue('other-host')
+    pullServerAvatars([bot])
+
+    expect(hostMock.request).not.toHaveBeenCalled()
+
+    hostMock.state.connectionId.get.mockReturnValue('imac-hermes')
+    pullServerAvatars([bot])
+
+    expect(hostMock.request).toHaveBeenCalledWith('profiles.get_asset', {
+      asset: 'avatar',
+      name: 'stale-roster-agent'
+    })
+    expect(hostMock.requestProfile).not.toHaveBeenCalled()
+  })
+
+  it('aborts an SVG backfill after a connection switch and permits a retry on the original gateway', async () => {
+    const imageLoads: Array<() => void> = []
+
+    class DeferredImage {
+      onerror: null | (() => void) = null
+      onload: null | (() => void) = null
+
+      set src(_value: string) {
+        imageLoads.push(() => this.onload?.())
+      }
+    }
+
+    vi.stubGlobal('Image', DeferredImage)
+    vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue({
+      drawImage: vi.fn()
+    } as unknown as CanvasRenderingContext2D)
+    vi.spyOn(HTMLCanvasElement.prototype, 'toDataURL').mockReturnValue('data:image/png;base64,raster')
+
+    const face = document.createElementNS('http://www.w3.org/2000/svg', 'svg')
+    face.dataset.botFace = 'raster-agent'
+    document.body.append(face)
+
+    const bot = {
+      connectionId: 'imac-hermes',
+      has_avatar: false,
+      name: 'raster-agent',
+      route: {
+        connectionId: 'imac-hermes',
+        mode: 'remote' as const,
+        profile: 'raster-agent',
+        targetProfile: 'raster-agent'
+      },
+      sourceScoped: true
+    } as RosterRow
+
+    hostMock.state.connectionId.get.mockReturnValue('imac-hermes')
+    pullServerAvatars([bot])
+
+    expect(imageLoads).toHaveLength(1)
+
+    hostMock.state.connectionId.get.mockReturnValue('other-host')
+    imageLoads[0]()
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    expect(hostMock.request).not.toHaveBeenCalled()
+    expect(hostMock.requestProfile).not.toHaveBeenCalled()
+
+    hostMock.state.connectionId.get.mockReturnValue('imac-hermes')
+    pullServerAvatars([bot])
+
+    expect(imageLoads).toHaveLength(2)
+    imageLoads[1]()
+
+    await vi.waitFor(() =>
+      expect(hostMock.request).toHaveBeenCalledWith('profiles.set_asset', {
+        asset: 'avatar',
+        data: 'data:image/png;base64,raster',
+        name: 'raster-agent'
+      })
+    )
+    expect(hostMock.requestProfile).not.toHaveBeenCalled()
   })
 })

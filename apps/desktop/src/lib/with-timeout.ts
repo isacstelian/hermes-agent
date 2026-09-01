@@ -15,6 +15,21 @@ export const BACKEND_BOOT_WAIT_TIMEOUT_MS = 45_000
 // caller forever. Every caller of these bounds them with this shared budget.
 export const RECONNECT_ATTEMPT_TIMEOUT_MS = 20_000
 
+// A registry SSH secondary's FIRST descriptor request can wait behind one
+// queued pool bootstrap. Each boot owns a 75s remote-port window, then a 45s
+// health window, plus bounded SSH/platform setup and cleanup. The main-process
+// queue is capped at one waiter, so 330s covers the complete two-boot chain
+// without letting arbitrary fan-out turn this into an unbounded renderer wait.
+// Non-SSH cold descriptors and every later re-dial keep the short reconnect
+// budget above.
+export const SECONDARY_BACKEND_BOOT_WAIT_TIMEOUT_MS = 330_000
+
+// Full cold secondary activation: descriptor queue + WS URL minting + the
+// gateway client's 15s handshake, with 5s margin. Bot Chat activation and the
+// gateway prune lease share this ceiling so neither expires mid-boot.
+export const SECONDARY_GATEWAY_ACTIVATION_TIMEOUT_MS =
+  SECONDARY_BACKEND_BOOT_WAIT_TIMEOUT_MS + RECONNECT_ATTEMPT_TIMEOUT_MS + 20_000
+
 /** Rejection raised by withTimeout. The bounded work is NOT cancelled — the
  * caller decides what a straggler that settles later means. */
 export class TimeoutError extends Error {

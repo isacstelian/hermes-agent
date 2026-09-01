@@ -664,17 +664,46 @@ async function cleanupStale(ssh, ownershipId, lock, pidAlive = true) {
       lock.profile
     ))
   ) {
-    try {
-      const result = (
-        await ssh.exec(
-          `kill ${Number(lock.pid)} && ` +
-            `i=0; while kill -0 ${Number(lock.pid)} 2>/dev/null; do ` +
-            `i=$((i+1)); [ "$i" -ge 50 ] && exit 1; sleep 0.1; done`
-        )
-      ).trim()
+    const creationTime = lock.creationTime || (await remoteProcessCreationTime(ssh, lock.pid))
+    const terminationLock = { ...lock, creationTime }
 
-      void result
+    const terminationCommand = (force = false) =>
+      creationTime.startsWith('darwin:')
+        ? buildOwnedDarwinTerminationCommand(terminationLock, force)
+        : buildOwnedTerminationCommand(terminationLock, ownershipId, {
+            force,
+            timeoutMs: force ? 2000 : 5000,
+            requireCreationTime: false
+          })
+
+    const runTerminationCommand = async (force = false) => {
+      let result = String(await ssh.exec(terminationCommand(force))).trim()
+
+      // Linux kernels/Python builds without pidfd cannot bind a numeric PID to
+      // the later signal. Fall back to the same random-nonce match used on
+      // Darwin instead of leaking every Desktop-owned backend on those hosts.
+      if (!creationTime.startsWith('darwin:') && result === 'UNAVAILABLE') {
+        result = String(await ssh.exec(buildOwnedDarwinTerminationCommand(terminationLock, force))).trim()
+      }
+
+      return result
+    }
+
+    let gracefulResult = ''
+
+    try {
+      gracefulResult = await runTerminationCommand()
     } catch {
+      // Preserve the existing best-effort escalation for transport failures.
+    }
+
+    if (['REFUSED', 'UNAVAILABLE', 'DARWIN_UNAVAILABLE'].includes(gracefulResult)) {
+      const error: any = new Error('The stale SSH backend process identity changed before termination.')
+      error.kind = 'ownership-changed'
+      throw error
+    }
+
+    if (gracefulResult !== 'TERMINATED' && gracefulResult !== 'ALREADY_STOPPED') {
       // A backend mid-turn (in-flight LLM call, live MCP children) can ride
       // out SIGTERM past the 5s graceful wait — and before-quit races this
       // whole teardown against 6s before closing SSH, so giving up here
@@ -682,11 +711,11 @@ async function cleanupStale(ssh, ownershipId, lock, pidAlive = true) {
       // the quit-during-active-turn path. Escalate to SIGKILL and require a
       // confirmed exit before treating the record as reclaimed.
       try {
-        await ssh.exec(
-          `kill -9 ${Number(lock.pid)} 2>/dev/null; ` +
-            `i=0; while kill -0 ${Number(lock.pid)} 2>/dev/null; do ` +
-            `i=$((i+1)); [ "$i" -ge 20 ] && exit 1; sleep 0.1; done`
-        )
+        const forcedResult = await runTerminationCommand(true)
+
+        if (forcedResult !== 'TERMINATED' && forcedResult !== 'ALREADY_STOPPED') {
+          throw new Error(`force termination refused: ${forcedResult || 'empty response'}`)
+        }
       } catch (cause) {
         // Even SIGKILL could not confirm death (D-state, permissions). Keep
         // the lockfile so the next connect's reap pass retries.
@@ -733,38 +762,29 @@ async function disconnect(ssh, ownershipId) {
   await cleanupStale(ssh, ownershipId, lock, pidAlive)
 }
 
-function buildOwnedStaleTerminationCommand(lock, ownershipId) {
-  const pid = Number(lock.pid)
-  // expandRemotePath() output is already a shell-quoted fragment; embed it
-  // raw so $HOME expands at assignment. Double-quoting stores the quote
-  // characters in the variable and every identity match below REFUSEs.
-  const expectedPath = expandRemotePath(lock.hermesPath)
-  const expectedHome = lock.hermesHome ? expandRemotePath(lock.hermesHome) : "''"
-  const expectedToken = expandRemotePath(spawnTokenPath(ownershipId, lock.spawnNonce))
-  const nonce = shq(lock.spawnNonce)
-  const profile = shq(lock.profile || '')
-  const command = `$(ps -ww -o command= -p ${pid} 2>/dev/null || true)`
+function regexPatternWithoutLiteral(value) {
+  const escaped = String(value || '').replace(/[\\^$.*+?()[\]{}|]/g, '\\$&')
 
-  const executableMatch = lock.hermesHome
-    ? `case "$cmd" in *"$path"*|*"$home"*) ;; *) printf REFUSED; exit 0;; esac; `
-    : `case "$cmd" in *"$path"*) ;; *) printf REFUSED; exit 0;; esac; `
+  return escaped ? `[${escaped[0]}]${escaped.slice(1)}` : ''
+}
 
-  const identity =
-    `cmd=${command}; ` +
-    `path=${expectedPath}; home=${expectedHome}; token=${expectedToken}; nonce=${nonce}; profile=${profile}; ` +
-    executableMatch +
-    `case "$cmd" in *" serve"*|*" serve "*) ;; *) printf REFUSED; exit 0;; esac; ` +
-    `case "$cmd" in *"--ssh-owner-nonce $nonce"*) ;; *) printf REFUSED; exit 0;; esac; ` +
-    `case "$cmd" in *"--ssh-session-token-file $token"*) ;; *) printf REFUSED; exit 0;; esac; ` +
-    `[ -n "$profile" ] && case "$cmd" in *"--profile $profile"*) ;; *) printf REFUSED; exit 0;; esac; `
+function buildOwnedDarwinTerminationCommand(lock, force = false) {
+  const noncePattern = regexPatternWithoutLiteral(lock.spawnNonce)
+  const pattern = `serve .*--isolated.*--ssh-owner-nonce ${noncePattern}`
+  const signal = force ? '-KILL' : '-TERM'
+  const waitIterations = force ? 20 : 50
 
-  // Legacy records do not have creationTime. Re-read argv immediately before
-  // signaling in this same shell command; never use the earlier probe's PID
-  // verdict as authority for the kill.
+  // Darwin has no pidfd. This is also the fallback for Linux hosts whose
+  // kernel/Python lacks pidfd. Match the random per-spawn nonce inside pkill
+  // itself, so a recycled numeric PID with a different argv is not selected.
+  // The bracketed first nonce byte keeps pgrep/pkill from matching this shell.
   return (
-    `${identity} kill ${pid} && ` +
-    `i=0; while kill -0 ${pid} 2>/dev/null; do ` +
-    `i=$((i+1)); [ "$i" -ge 50 ] && printf TIMEOUT && exit 0; sleep 0.1; done; printf TERMINATED`
+    `command -v pgrep >/dev/null 2>&1 && command -v pkill >/dev/null 2>&1 || { printf UNAVAILABLE; exit 0; }; ` +
+    `pattern=${shq(pattern)}; ` +
+    `pgrep -f "$pattern" >/dev/null 2>&1 || { printf ALREADY_STOPPED; exit 0; }; ` +
+    `pkill ${signal} -f "$pattern" >/dev/null 2>&1 || { printf REFUSED; exit 0; }; ` +
+    `i=0; while pgrep -f "$pattern" >/dev/null 2>&1; do ` +
+    `i=$((i+1)); [ "$i" -ge ${waitIterations} ] && printf TIMEOUT && exit 0; sleep 0.1; done; printf TERMINATED`
   )
 }
 
@@ -783,10 +803,13 @@ function lockMatchesManagedUpdateScope(lock, expected) {
   )
 }
 
-function buildOwnedTerminationCommand(lock, ownershipId) {
+function buildOwnedTerminationCommand(lock, ownershipId, options: any = {}) {
   const pid = Number(lock.pid)
   const py = value => JSON.stringify(String(value || ''))
   const expectedToken = spawnTokenPath(ownershipId, lock.spawnNonce)
+  const force = options.force === true
+  const timeoutMs = Number.isInteger(options.timeoutMs) ? options.timeoutMs : 10000
+  const requireCreationTime = options.requireCreationTime !== false
 
   const script = `
 import os,select,shlex,signal,subprocess,sys,time
@@ -798,6 +821,7 @@ expected_entries={expected_path,os.path.join(hermes_home,"hermes-agent","venv","
 expected_token=os.path.expanduser(${py(expectedToken)})
 expected_profile=${py(lock.profile)}
 nonce=${py(lock.spawnNonce)}
+signal_to_send=signal.SIGKILL if ${force ? 'True' : 'False'} else signal.SIGTERM
 
 def creation():
  if sys.platform.startswith("linux"):
@@ -853,35 +877,35 @@ def owned(args):
 pidfd=None
 if sys.platform.startswith("linux"):
  if not hasattr(os,"pidfd_open") or not hasattr(signal,"pidfd_send_signal"):
-  print("UNAVAILABLE");sys.exit(2)
+  print("UNAVAILABLE");sys.exit(0)
  try:pidfd=os.pidfd_open(pid,0)
  except ProcessLookupError:print("ALREADY_STOPPED");sys.exit(0)
- except (OSError,PermissionError):print("UNAVAILABLE");sys.exit(2)
+ except (OSError,PermissionError):print("UNAVAILABLE");sys.exit(0)
 
 try:
  live_creation,live_args=identity_before_signal()
- if live_creation!=expected_creation or not owned(live_args):
-  print("REFUSED");sys.exit(3)
+ if ((${requireCreationTime ? 'True' : 'False'} and live_creation!=expected_creation) or not owned(live_args)):
+  print("REFUSED");sys.exit(0)
  if (sys.platform=="darwin"):
   # Darwin has no pidfd-style signal binding. Refuse instead of accepting the
   # residual PID-reuse window between ps and os.kill; reconnect will surface
   # the still-running remote owner for an explicit retry.
-  print("DARWIN_UNAVAILABLE");sys.exit(2)
+  print("DARWIN_UNAVAILABLE");sys.exit(0)
  try:
-  if pidfd is not None:signal.pidfd_send_signal(pidfd,signal.SIGTERM)
-  else:os.kill(pid,signal.SIGTERM)
+  if pidfd is not None:signal.pidfd_send_signal(pidfd,signal_to_send)
+  else:os.kill(pid,signal_to_send)
  except ProcessLookupError:print("ALREADY_STOPPED");sys.exit(0)
  if pidfd is not None:
   poller=select.poll();poller.register(pidfd,select.POLLIN)
-  if not poller.poll(10000):print("TIMEOUT");sys.exit(4)
+  if not poller.poll(${timeoutMs}):print("TIMEOUT");sys.exit(0)
  else:
-  deadline=time.monotonic()+10
+  deadline=time.monotonic()+${timeoutMs / 1000}
   while time.monotonic()<deadline:
    try:os.kill(pid,0)
    except ProcessLookupError:break
-   except PermissionError:print("UNAVAILABLE");sys.exit(2)
+   except PermissionError:print("UNAVAILABLE");sys.exit(0)
    time.sleep(.1)
-  else:print("TIMEOUT");sys.exit(4)
+  else:print("TIMEOUT");sys.exit(0)
  print("TERMINATED")
 finally:
  if pidfd is not None:os.close(pidfd)
@@ -1649,6 +1673,8 @@ async function connect(deps) {
 export {
   adoptOwnedServedToken,
   assertRemoteInstallUpdateClear,
+  buildOwnedDarwinTerminationCommand,
+  buildOwnedTerminationCommand,
   buildSpawnCommand,
   classifySshReuseProof,
   cleanupStale,

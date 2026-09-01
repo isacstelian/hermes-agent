@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { RECONNECT_ATTEMPT_TIMEOUT_MS, SECONDARY_BACKEND_BOOT_WAIT_TIMEOUT_MS } from '@/lib/with-timeout'
+
 // Regression suite for #89622: clicking a profile in the rail did nothing.
 // The live-work pruner (pruneSecondaryGateways) disposed the switch target's
 // secondary entry while its socket was still dialing — the target is not yet
@@ -157,8 +159,13 @@ describe('activation lease vs. the live-work pruner (#89622)', () => {
     expect(secondaryGateways[0].close).toHaveBeenCalled()
   })
 
-  it('an orphaned lease expires — the pruner is not permanently locked out', async () => {
+  it('the lease covers a full remote cold boot, then expires', async () => {
     vi.useFakeTimers()
+
+    const activationLeaseMs =
+      SECONDARY_BACKEND_BOOT_WAIT_TIMEOUT_MS + RECONNECT_ATTEMPT_TIMEOUT_MS + 20_000
+    const validRemoteColdBootChainMs = activationLeaseMs - 5_000
+    const leaseStartedAt = Date.now()
 
     let releaseConnect: () => void = () => undefined
     connectGate = new Promise<void>(resolve => {
@@ -174,9 +181,16 @@ describe('activation lease vs. the live-work pruner (#89622)', () => {
     pruneSecondaryGateways(new Set())
     expect(secondaryGateways[0].close).not.toHaveBeenCalled()
 
-    // Past the lease window: reclaimed. (Lease is wall-clock bounded so a
-    // leaked lease cannot pin a dead entry forever.)
-    vi.setSystemTime(Date.now() + 31_000)
+    // The complete valid chain can consume the descriptor budget, URL minting,
+    // and a 15s WebSocket handshake. It must remain protected through that
+    // chain, leaving the lease's final 5s margin intact.
+    vi.setSystemTime(leaseStartedAt + validRemoteColdBootChainMs)
+    pruneSecondaryGateways(new Set())
+    expect(secondaryGateways[0].close).not.toHaveBeenCalled()
+
+    // Past the complete lease window: reclaimed. The lease remains bounded so
+    // a leaked activation cannot pin a dead entry forever.
+    vi.setSystemTime(leaseStartedAt + activationLeaseMs + 1)
     pruneSecondaryGateways(new Set())
     expect(secondaryGateways[0].close).toHaveBeenCalled()
 

@@ -28,6 +28,7 @@ import {
   reconcileAppliedGlobalConnection,
   reconcileRegistryDrift,
   REGISTRY_VERSION,
+  registryOwnedSshScopes,
   registrySourceOwnsPrimaryBackend,
   rememberSshEnumeration,
   removeConnection,
@@ -671,6 +672,55 @@ test('backendScopeKey: non-local connections get an unambiguous composite', () =
   assert.ok(backendScopeKey('homelab', 'research').startsWith(backendScopePrefix('homelab')))
   assert.ok(!backendScopeKey('homelab-2', 'research').startsWith(backendScopePrefix('homelab')))
   assert.ok(!'research'.startsWith(backendScopePrefix('homelab')))
+})
+
+test('registryOwnedSshScopes includes a settled primary published under the global scope', () => {
+  const alias = backendScopeKey('imac', 'default')
+
+  const published = new Map([
+    [
+      '',
+      {
+        cancelScopes: [alias],
+        registryConnectionId: 'imac'
+      }
+    ],
+    ['other', { registryConnectionId: 'other' }]
+  ])
+
+  assert.deepEqual(registryOwnedSshScopes(published, [], 'imac'), [''])
+})
+
+test('registryOwnedSshScopes includes an active primary through its registry alias metadata', () => {
+  const alias = backendScopeKey('imac', 'default')
+
+  const active = [
+    {
+      scope: '',
+      metadata: {
+        cancelScopes: [alias],
+        registryConnectionId: 'imac'
+      }
+    }
+  ]
+
+  assert.deepEqual(registryOwnedSshScopes([], active, 'imac'), [''])
+})
+
+test('registryOwnedSshScopes does not claim a coalesced primary owned by another connection', () => {
+  const imacAlias = backendScopeKey('imac', 'default')
+  const otherAlias = backendScopeKey('other', 'default')
+
+  const coalescedState = {
+    cancelScopes: [otherAlias, imacAlias],
+    registryConnectionId: 'other'
+  }
+
+  const published = new Map([['', coalescedState]])
+  const active = [{ scope: '', metadata: coalescedState }]
+
+  assert.deepEqual(registryOwnedSshScopes(published, active, 'imac'), [])
+  assert.deepEqual(registryOwnedSshScopes(published, active, 'other'), [''])
 })
 
 // --- resolveRegistryLocalRoute (registry 'local' entry vs the v1 route) ---

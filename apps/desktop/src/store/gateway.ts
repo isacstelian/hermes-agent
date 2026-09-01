@@ -4,7 +4,14 @@ import { atom } from 'nanostores'
 import type { HermesConnection } from '@/global'
 import { HermesGateway, setApiRequestConnection } from '@/hermes'
 import { reconnectBackoffDelayMs } from '@/lib/reconnect-backoff'
-import { RECONNECT_ATTEMPT_TIMEOUT_MS, withTimeout } from '@/lib/with-timeout'
+import {
+  isTimeoutError,
+  RECONNECT_ATTEMPT_TIMEOUT_MS,
+  SECONDARY_BACKEND_BOOT_WAIT_TIMEOUT_MS,
+  SECONDARY_GATEWAY_ACTIVATION_TIMEOUT_MS,
+  withTimeout
+} from '@/lib/with-timeout'
+import { $connectionsRegistry } from '@/store/connection-registry-state'
 import { markNativeNotifyBaseline } from '@/store/notify-baseline'
 import { setConnection, setGatewayState } from '@/store/session'
 
@@ -112,10 +119,11 @@ interface Secondary {
   activationLeaseUntil: number
 }
 
-// How long a mid-dial activation holds its prune lease: covers a cold pool
-// backend spawn + socket connect with margin, while still letting a leaked
-// lease expire quickly enough for the reaper to reclaim the entry.
-const ACTIVATION_LEASE_MS = 30_000
+// How long a mid-dial activation holds its prune lease. A first remote
+// descriptor may spend the full cold-boot budget, WebSocket URL minting has
+// its own reconnect budget, and JsonRpcGatewayClient allows a 15s handshake.
+// Keep 5s of margin while still bounding orphaned leases for the reaper.
+const ACTIVATION_LEASE_MS = SECONDARY_GATEWAY_ACTIVATION_TIMEOUT_MS
 
 // ── HMR-stable module state ─────────────────────────────────────────────────
 // All mutable singletons (live sockets, active-profile routing, the event
@@ -431,6 +439,34 @@ function clearTimer(entry: Secondary): void {
   }
 }
 
+async function coldDescriptorTimeoutMs(entry: Secondary): Promise<number> {
+  const connectionId = entry.connectionId?.trim()
+  let registry = $connectionsRegistry.get()
+
+  if (connectionId && !registry) {
+    const list = window.hermesDesktop?.connections?.list
+
+    if (list) {
+      try {
+        registry = await withTimeout(
+          list(),
+          RECONNECT_ATTEMPT_TIMEOUT_MS,
+          `Timed out resolving connection kind for "${connectionId}"`
+        )
+        $connectionsRegistry.set(registry)
+      } catch {
+        return RECONNECT_ATTEMPT_TIMEOUT_MS
+      }
+    }
+  }
+
+  const connection = connectionId
+    ? registry?.connections.find(candidate => candidate.id === connectionId)
+    : null
+
+  return connection?.kind === 'ssh' ? SECONDARY_BACKEND_BOOT_WAIT_TIMEOUT_MS : RECONNECT_ATTEMPT_TIMEOUT_MS
+}
+
 async function openSecondary(entry: Secondary): Promise<void> {
   const desktop = window.hermesDesktop
 
@@ -456,10 +492,12 @@ async function openSecondary(entry: Secondary): Promise<void> {
     // open. Awaiting it is intentional: correctness at the generation boundary
     // outranks the single local-module microtask this adds to a reconnect.
     const openedScopes = openedSecondaryScopes()
-    const reopening = entry.openedOnce || entry.connection !== null || openedScopes.has(entry.scope)
+    const reconnectingSocket = entry.openedOnce || entry.connection !== null || openedScopes.has(entry.scope)
+    const resettingRuntimeBindings = reconnectingSocket || openedScopes.has(entry.scope)
+
     let reconcileBusyAfterOpen: null | (() => void) = null
 
-    if (reopening) {
+    if (resettingRuntimeBindings) {
       try {
         const { reconcileBusyStatesOnReconnect, resetTileRuntimeBindings } = await import('@/store/session-states')
 
@@ -495,18 +533,46 @@ async function openSecondary(entry: Secondary): Promise<void> {
     // this secondary (SSH terminal, messaging DELETE, session send, …) never
     // settles either. Bound the same way use-gateway-boot.ts bounds the
     // primary's equivalent awaits.
-    const conn =
+    const descriptorStartedAt = Date.now()
+
+    const descriptorPromise =
       entry.connectionId && desktop.getConnectionFor
-        ? await withTimeout(
-            desktop.getConnectionFor({ connectionId: entry.connectionId, profile: entry.profile }),
-            RECONNECT_ATTEMPT_TIMEOUT_MS,
-            `Timed out connecting to profile "${entry.profile}"`
+        ? desktop.getConnectionFor({ connectionId: entry.connectionId, profile: entry.profile })
+        : desktop.getConnection(entry.profile)
+
+    // The registry lookup below may take a full IPC round-trip before
+    // withTimeout attaches its rejection handler. Observe an eager descriptor
+    // failure now; the later await still receives and rethrows the same error.
+    void descriptorPromise.catch(() => {})
+
+    const descriptorBudgetMs = reconnectingSocket
+      ? RECONNECT_ATTEMPT_TIMEOUT_MS
+      : await coldDescriptorTimeoutMs(entry)
+
+    const descriptorTimeoutMs = Math.max(0, descriptorBudgetMs - (Date.now() - descriptorStartedAt))
+    let conn: HermesConnection
+
+    try {
+      conn = await withTimeout(
+        descriptorPromise,
+        descriptorTimeoutMs,
+        `Timed out connecting to profile "${entry.profile}"`
+      )
+    } catch (error) {
+      if (!reconnectingSocket && entry.connectionId && isTimeoutError(error)) {
+        try {
+          await desktop.connections?.cancelBootstrap?.({ connectionId: entry.connectionId, profile: entry.profile })
+        } catch (cleanupError) {
+          // Preserve the descriptor timeout. Main owns cleanup diagnostics.
+          console.warn(
+            `[gateway] SSH bootstrap cleanup failed for "${entry.connectionId}:${entry.profile}"`,
+            cleanupError
           )
-        : await withTimeout(
-            desktop.getConnection(entry.profile),
-            RECONNECT_ATTEMPT_TIMEOUT_MS,
-            `Timed out connecting to profile "${entry.profile}"`
-          )
+        }
+      }
+
+      throw error
+    }
 
     entry.connection = conn
 

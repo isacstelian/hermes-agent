@@ -162,6 +162,10 @@ declare global {
       // together (local + any number of remote/cloud/ssh instances).
       connections: {
         list: () => Promise<DesktopConnectionsRegistry>
+        cancelBootstrap?: (payload: {
+          connectionId: string
+          profile: string
+        }) => Promise<{ cancelled: boolean; ok: boolean }>
         save: (
           payload: DesktopRegistryConnectionInput
         ) => Promise<{ ok: boolean; connection: DesktopRegistryConnection; registry: DesktopConnectionsRegistry }>
@@ -931,6 +935,8 @@ export interface DesktopRosterAgent {
 }
 
 export interface DesktopAgentRoster {
+  // Exact registry owner serving this window's ambient gateway, when known.
+  activeConnectionId?: string
   agents: DesktopRosterAgent[]
   sources: {
     connectionId: string

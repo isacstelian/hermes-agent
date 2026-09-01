@@ -2,7 +2,12 @@ import { atom, computed } from 'nanostores'
 
 import type { DesktopConnectionsRegistry } from '@/global'
 import { persistStringRecord, storedStringRecord } from '@/lib/storage'
-import { BACKEND_BOOT_WAIT_TIMEOUT_MS, isTimeoutError, withTimeout } from '@/lib/with-timeout'
+import {
+  BACKEND_BOOT_WAIT_TIMEOUT_MS,
+  isTimeoutError,
+  SECONDARY_BACKEND_BOOT_WAIT_TIMEOUT_MS,
+  withTimeout
+} from '@/lib/with-timeout'
 import { $connectionsRegistry } from '@/store/connection-registry-state'
 import {
   beginGatewaySwitch,
@@ -137,6 +142,16 @@ async function rememberConnection(connectionId: string): Promise<void> {
     // The source is already usable. A read-only/full userData directory (or
     // a stalled IPC) must not turn a successful backend switch into a false
     // connection failure.
+  }
+}
+
+async function cancelSshBootstrap(connectionId: string, profile: string): Promise<void> {
+  try {
+    await window.hermesDesktop?.connections?.cancelBootstrap?.({ connectionId, profile })
+  } catch (error) {
+    // The original timeout remains the actionable failure. Main logs cleanup
+    // failures, and an older Desktop without this bridge keeps compatibility.
+    console.warn(`[connections] SSH bootstrap cleanup failed for "${connectionId}:${profile}"`, error)
   }
 }
 
@@ -337,11 +352,19 @@ export async function selectConnection(connectionId: string, options: SelectConn
     // Phase 1 — open the target's socket; the active route is untouched.
     // Always use the explicit registry route. `local` must mean This device,
     // and a registry primary can differ from a legacy per-profile override.
-    await withTimeout(
-      openGatewayAgent(connectionId, targetProfile),
-      SWITCH_DIAL_TIMEOUT_MS,
-      `Timed out connecting to "${targetConnection.label}".`
-    )
+    try {
+      await withTimeout(
+        openGatewayAgent(connectionId, targetProfile),
+        targetConnection.kind === 'ssh' ? SECONDARY_BACKEND_BOOT_WAIT_TIMEOUT_MS : SWITCH_DIAL_TIMEOUT_MS,
+        `Timed out connecting to "${targetConnection.label}".`
+      )
+    } catch (error) {
+      if (targetConnection.kind === 'ssh' && isTimeoutError(error)) {
+        await cancelSshBootstrap(connectionId, targetProfile)
+      }
+
+      throw error
+    }
 
     // A newer click owns the switch from here on. The superseded dial never
     // activates, so the user doesn't flip through it on the way to the source

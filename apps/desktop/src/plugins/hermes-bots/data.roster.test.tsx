@@ -34,7 +34,12 @@ const { hostMock } = vi.hoisted(() => ({
     profileRoutes: undefined as unknown,
     request: vi.fn(),
     requestProfile: vi.fn(),
-    state: { connectionId: { get: vi.fn(() => 'local') }, profile: { get: () => 'default' } }
+    state: {
+      connectionId: { get: vi.fn(() => 'local') },
+      connectionKey: { get: vi.fn<() => null | string>(() => 'connection:local') },
+      connectionMode: { get: vi.fn<() => null | 'local' | 'remote'>(() => 'local') },
+      profile: { get: () => 'default' }
+    }
   }
 }))
 
@@ -62,6 +67,7 @@ interface UnionAgent {
 }
 
 interface Union {
+  activeConnectionId?: string
   agents: UnionAgent[]
   primaryConnectionId?: string
   sources?: Array<{ connectionId: string; error?: string; kind: string; reachable?: boolean }>
@@ -78,9 +84,17 @@ interface RowFixture extends Omit<Partial<RosterRow>, 'last_session'> {
 async function mergedRoster(
   local: { profiles: RowFixture[] },
   union: Union | null,
-  liveConnectionId: null | string = 'local'
+  liveConnectionId: null | string = 'local',
+  liveConnectionMode: null | 'local' | 'remote' = liveConnectionId === 'local' ? 'local' : 'remote',
+  liveConnectionKey: null | string = liveConnectionId
+    ? `connection:${liveConnectionId}`
+    : liveConnectionMode === 'local'
+      ? 'local'
+      : 'remote:legacy'
 ): Promise<RowFixture[]> {
   hostMock.state.connectionId.get.mockReturnValue(liveConnectionId as string)
+  hostMock.state.connectionKey.get.mockReturnValue(liveConnectionKey)
+  hostMock.state.connectionMode.get.mockReturnValue(liveConnectionMode)
   hostMock.request.mockResolvedValue(local)
 
   if (union) {
@@ -122,6 +136,8 @@ describe('no union roster', () => {
 
     expect(rows).toHaveLength(1)
     expect(rows[0].name).toBe('default')
+    expect(rows[0].ambientConnectionKey).toBe('connection:local')
+    expect(rows[0].ambientSource).toBe(true)
     expect(rows[0].last_session?.id).toBe('s1')
   })
 
@@ -132,6 +148,69 @@ describe('no union roster', () => {
     )
 
     expect(identities(rows)).toEqual(['undefined:default'])
+  })
+
+  it('preserves the proven ambient owner and other sources through host.agents failure', async () => {
+    $lastRoster.set([
+      {
+        ambientConnectionKey: 'remote:ssh:active-old',
+        ambientSource: true,
+        connectionId: 'active-old',
+        connectionKind: 'ssh',
+        name: 'default',
+        route: {
+          connectionId: 'active-old',
+          mode: 'remote',
+          profile: 'default',
+          targetProfile: 'default'
+        },
+        sourceScoped: true
+      },
+      {
+        connectionId: 'other',
+        connectionKind: 'ssh',
+        name: 'research',
+        remoteSource: true,
+        sourceScoped: true
+      }
+    ])
+
+    const rows = await mergedRoster(
+      { profiles: [{ last_session: { id: 'rich-active' }, name: 'default' }] },
+      null,
+      null,
+      'remote',
+      'remote:ssh:active-old'
+    )
+
+    expect(rows.find(row => row.name === 'default')).toMatchObject({
+      connectionId: 'active-old',
+      last_session: { id: 'rich-active' },
+      sourceScoped: true
+    })
+    expect(rows.find(row => row.name === 'research')).toMatchObject({ connectionId: 'other', remoteSource: true })
+  })
+
+  it('does not carry an ambient owner across a descriptor-key change during host.agents failure', async () => {
+    $lastRoster.set([
+      {
+        ambientConnectionKey: 'remote:ssh:host-a',
+        ambientSource: true,
+        connectionId: 'host-a',
+        name: 'default',
+        sourceScoped: true
+      }
+    ])
+
+    const rows = await mergedRoster(
+      { profiles: [{ last_session: { id: 'rich-host-b' }, name: 'default' }] },
+      null,
+      null,
+      'remote',
+      'remote:ssh:host-b'
+    )
+
+    expect(rows.find(row => row.name === 'default')?.connectionId).toBeUndefined()
   })
 })
 
@@ -483,7 +562,7 @@ describe('a null live id', () => {
     ).toEqual(['bob', 'kai', 'rook'])
   })
 
-  it('infers a matching remote primary when the local inventory does not match', async () => {
+  it('keeps a legacy remote primary rich when local has the same default profile', async () => {
     // Legacy remote descriptors carry mode:'remote' but no connectionId, so
     // the host state reads null even though profiles.list is answering from
     // the registry primary.
@@ -495,8 +574,8 @@ describe('a null live id', () => {
             connectionId: 'local',
             connectionKind: 'local',
             connectionLabel: 'This device',
-            handle: 'archie',
-            profile: 'archie'
+            handle: 'default-this-device',
+            profile: 'default'
           },
           {
             connectionId: 'noah',
@@ -508,16 +587,162 @@ describe('a null live id', () => {
         ],
         primaryConnectionId: 'noah'
       },
-      null
+      null,
+      'remote',
+      'remote:ssh:noah'
     )
 
     expect(rows).toHaveLength(2)
 
-    const inferred = rows.find(row => row.name === 'default')!
+    const inferred = rows.find(row => row.connectionId === 'noah')!
 
-    expect(inferred.connectionId).toBe('noah')
+    expect(inferred.ambientSource).toBe(true)
+    expect(inferred.ambientConnectionKey).toBe('remote:ssh:noah')
+    expect(inferred.last_session?.id).toBe('noah-chat')
     expect(inferred.remoteSource).toBeUndefined()
-    expect(rows.find(row => row.name === 'archie')).toMatchObject({ connectionId: 'local', remoteSource: true })
+    expect(inferred.route?.mode).toBe('remote')
+    expect(rows.find(row => row.connectionId === 'local')).toMatchObject({
+      name: 'default',
+      remoteSource: true,
+      route: { mode: 'local' }
+    })
+  })
+
+  it('keeps the rich roster on the ambient legacy remote when Settings changes registry primary', async () => {
+    const connectionKey = 'remote:ssh:active-old'
+
+    const agents = [
+      {
+        connectionId: 'active-old',
+        connectionKind: 'remote',
+        connectionLabel: 'Old',
+        handle: 'default-old',
+        profile: 'default'
+      },
+      {
+        connectionId: 'new-primary',
+        connectionKind: 'remote',
+        connectionLabel: 'New',
+        handle: 'default-new',
+        profile: 'default'
+      }
+    ]
+
+    const first = await mergedRoster(
+      { profiles: [{ last_session: { id: 'rich-from-active-old' }, name: 'default' }] },
+      { activeConnectionId: 'active-old', agents, primaryConnectionId: 'active-old' },
+      null,
+      'remote',
+      connectionKey
+    )
+
+    $lastRoster.set(first as RosterRow[])
+
+    const afterPrimaryEdit = await mergedRoster(
+      { profiles: [{ last_session: { id: 'rich-from-active-old' }, name: 'default' }] },
+      { activeConnectionId: 'active-old', agents, primaryConnectionId: 'new-primary' },
+      null,
+      'remote',
+      connectionKey
+    )
+
+    expect(afterPrimaryEdit.find(row => !row.remoteSource)).toMatchObject({
+      ambientConnectionKey: connectionKey,
+      connectionId: 'active-old',
+      last_session: { id: 'rich-from-active-old' }
+    })
+    expect(afterPrimaryEdit.find(row => row.connectionId === 'new-primary')).toMatchObject({ remoteSource: true })
+  })
+
+  it('uses Electron live ownership on the first idless roster after Settings changes primary', async () => {
+    const rows = await mergedRoster(
+      { profiles: [{ last_session: { id: 'rich-from-active-old' }, name: 'default' }] },
+      {
+        activeConnectionId: 'active-old',
+        agents: [
+          {
+            connectionId: 'active-old',
+            connectionKind: 'remote',
+            connectionLabel: 'Old',
+            handle: 'default-old',
+            profile: 'default'
+          },
+          {
+            connectionId: 'new-primary',
+            connectionKind: 'remote',
+            connectionLabel: 'New',
+            handle: 'default-new',
+            profile: 'default'
+          }
+        ],
+        primaryConnectionId: 'new-primary'
+      },
+      null,
+      'remote',
+      'remote:ssh:active-old'
+    )
+
+    expect(rows.find(row => !row.remoteSource)).toMatchObject({
+      connectionId: 'active-old',
+      last_session: { id: 'rich-from-active-old' }
+    })
+    expect(rows.find(row => row.connectionId === 'new-primary')).toMatchObject({ remoteSource: true })
+  })
+
+  it('does not guess the new primary when an older shell cannot prove idless ownership', async () => {
+    const rows = await mergedRoster(
+      { profiles: [{ last_session: { id: 'rich-from-active-old' }, name: 'default' }] },
+      {
+        agents: [
+          { connectionId: 'active-old', connectionKind: 'remote', handle: 'default-old', profile: 'default' },
+          { connectionId: 'new-primary', connectionKind: 'remote', handle: 'default-new', profile: 'default' }
+        ],
+        primaryConnectionId: 'new-primary'
+      },
+      null,
+      'remote',
+      'remote:ssh:active-old'
+    )
+
+    const ambient = rows.find(row => !row.remoteSource)
+
+    expect(ambient).toMatchObject({
+      ambientSource: true,
+      last_session: { id: 'rich-from-active-old' }
+    })
+    expect(ambient?.connectionId).toBeUndefined()
+  })
+
+  it('does not reuse the previous idless remote identity after the descriptor changes', async () => {
+    $lastRoster.set([
+      {
+        ambientConnectionKey: 'remote:ssh:host-a',
+        ambientSource: true,
+        connectionId: 'host-a',
+        name: 'default'
+      }
+    ] as RosterRow[])
+
+    const rows = await mergedRoster(
+      { profiles: [{ last_session: { id: 'rich-from-host-b' }, name: 'default' }] },
+      {
+        activeConnectionId: 'host-b',
+        agents: [
+          { connectionId: 'host-a', connectionKind: 'remote', handle: 'default-a', profile: 'default' },
+          { connectionId: 'host-b', connectionKind: 'remote', handle: 'default-b', profile: 'default' }
+        ],
+        primaryConnectionId: 'host-b'
+      },
+      null,
+      'remote',
+      'remote:ssh:host-b'
+    )
+
+    expect(rows.find(row => !row.remoteSource)).toMatchObject({
+      ambientConnectionKey: 'remote:ssh:host-b',
+      connectionId: 'host-b',
+      last_session: { id: 'rich-from-host-b' }
+    })
   })
 })
 

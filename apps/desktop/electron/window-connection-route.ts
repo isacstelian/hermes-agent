@@ -6,6 +6,18 @@ export interface WindowConnectionRoute {
   registryScoped: boolean
 }
 
+interface PublishedSshRouteState {
+  registryConnectionId?: string
+}
+
+interface PublishedSshRouteRegistry {
+  get(scope: string): PublishedSshRouteState | null | undefined
+}
+
+interface RegistryConnectionIdentity {
+  id: string
+}
+
 export function normalizeWindowConnectionRoute(value: unknown): WindowConnectionRoute | null {
   if (!value || typeof value !== 'object') {
     return null
@@ -38,6 +50,50 @@ export function registrySshScopeForWindowRoute(
   }
 
   return backendScopeKey(route.connectionId, route.profile)
+}
+
+/** Exact registry owner of the backend serving a window's ambient requests.
+ * Registry-scoped routes name themselves. Legacy SSH routes use the identity
+ * captured when that live tunnel was published. The mutable registry primary
+ * is never evidence about an already-running idless descriptor. */
+export function activeRosterConnectionId(
+  route: WindowConnectionRoute | null | undefined,
+  connections: RegistryConnectionIdentity[],
+  sshState: PublishedSshRouteState | null | undefined
+): null | string {
+  const known = new Set(connections.map(connection => String(connection?.id || '').trim()).filter(Boolean))
+  const routed = route?.registryScoped ? String(route.connectionId || '').trim() : ''
+
+  if (routed) {
+    return known.has(routed) ? routed : null
+  }
+
+  const published = String(sshState?.registryConnectionId || '').trim()
+
+  return published && known.has(published) ? published : null
+}
+
+/** Locate the published SSH state serving an idless window route. Profile
+ * overrides publish under their profile key; a global primary publishes at
+ * the empty legacy scope even though the renderer names its active profile. */
+export function activeRosterSshState(
+  route: WindowConnectionRoute | null | undefined,
+  primaryProfile: string,
+  published: PublishedSshRouteRegistry
+): PublishedSshRouteState | null {
+  if (route?.registryScoped) {
+    return null
+  }
+
+  const primary = String(primaryProfile || '').trim() || 'default'
+  const profile = String(route?.profile || '').trim() || primary
+  const profileState = published.get(profile)
+
+  if (profileState) {
+    return profileState
+  }
+
+  return profile === primary ? published.get('') || null : null
 }
 
 export class WindowConnectionRouteRegistry {

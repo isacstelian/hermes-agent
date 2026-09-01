@@ -87,6 +87,7 @@ import {
   buildBrowserWindowUrl
 } from './browser-windows'
 import { detectBundleSkew } from './bundle-skew'
+import { registerCancelSshBootstrapIpc, sshTeardownScopesForRoute } from './cancel-ssh-bootstrap-ipc'
 import { applyConnectionChange, teardownSshState } from './connection-apply'
 import {
   apiRequestRegistryConnectionId,
@@ -136,6 +137,7 @@ import {
   parseBackendScopeKey,
   reconcileAppliedGlobalConnection,
   reconcileRegistryDrift,
+  registryOwnedSshScopes,
   registrySourceOwnsPrimaryBackend,
   rememberSshEnumeration,
   removeConnection,
@@ -345,6 +347,12 @@ import {
 } from './session-windows'
 import { ensureLoginShellPath } from './shell-path'
 import { createBootstrapCoordinator, sshConfigFingerprint } from './ssh-bootstrap-coordinator'
+import {
+  SSH_BOOTSTRAP_MAX_CONCURRENCY,
+  SSH_BOOTSTRAP_MAX_QUEUED_NON_PRIMARY,
+  SSH_BOOTSTRAP_RESERVED_PRIMARY_SLOTS,
+  sshReadyTimeoutMs
+} from './ssh-bootstrap-policy'
 import { collectSshConfigHosts, parseSshGOutput } from './ssh-config'
 import { createSshProbeConnection, pickLocalPort, redactSecrets, SshConnection } from './ssh-connection'
 import { createStreamThrottle } from './stream-throttle'
@@ -393,7 +401,12 @@ import {
 import { fetchMarketplaceThemes, searchMarketplaceThemes } from './vscode-marketplace'
 import { createWakeIndicatorWindowController } from './wake-indicator-window'
 import { enumerateWindowsFrontToBack, enumerationFailed, readWindowBelow } from './window-below'
-import { registrySshScopeForWindowRoute, WindowConnectionRouteRegistry } from './window-connection-route'
+import {
+  activeRosterConnectionId,
+  activeRosterSshState,
+  registrySshScopeForWindowRoute,
+  WindowConnectionRouteRegistry
+} from './window-connection-route'
 import { installWindowRendererLifecycle } from './window-renderer-lifecycle'
 import { createWindowRevealController } from './window-reveal'
 import {
@@ -9847,7 +9860,11 @@ function clearManagedSshRecovery(connectionId, correlationId) {
   }
 }
 
-const sshBootstrapCoordinator = createBootstrapCoordinator()
+const sshBootstrapCoordinator = createBootstrapCoordinator({
+  maxConcurrent: SSH_BOOTSTRAP_MAX_CONCURRENCY,
+  maxQueuedNonPrimary: SSH_BOOTSTRAP_MAX_QUEUED_NON_PRIMARY,
+  reservedPrimarySlots: SSH_BOOTSTRAP_RESERVED_PRIMARY_SLOTS
+})
 
 let sshQuitTeardownDone = false
 let backendQuitTeardownDone = false
@@ -9912,6 +9929,20 @@ async function teardownSshConnection(profile) {
           : remoteLifecycle.disconnect
     }
   )
+}
+
+function resolvePublishedSshTeardownScopes(scope, connectionId = '') {
+  return sshTeardownScopesForRoute(sshConnections, connectionId, sshScopeKey(scope))
+}
+
+async function teardownSshScopes(scopes) {
+  await Promise.all(scopes.map(scope => teardownSshConnection(scope)))
+}
+
+async function cancelSshScopesAndWait(scope, connectionId = '', whileDrained = teardownSshScopes) {
+  const scopes = resolvePublishedSshTeardownScopes(scope, connectionId)
+
+  await sshBootstrapCoordinator.cancelAndWait(scopes, () => whileDrained(scopes))
 }
 
 // CRITICAL: this must mirror resolveRemoteBackend's precedence, not just return
@@ -10206,6 +10237,7 @@ async function bootstrapSshConnectionInner(profile, sshConfig, reuseToken, sourc
 
     const platform = await detectRemotePlatform(ssh, sshConfig.remoteHermesPath || '')
     const lifecycle = platform.os === 'Windows' ? connectWindowsRemote : remoteLifecycle.connect
+    const readyTimeoutMs = sshReadyTimeoutMs(metadata)
     result = await lifecycle({
       ssh,
       profile: resolveRemoteSshDashboardProfile(sshConfig.remoteProfile, profile),
@@ -10219,7 +10251,8 @@ async function bootstrapSshConnectionInner(profile, sshConfig, reuseToken, sourc
       probeReuseProof: sshProbeReuseProof,
       adoptServedToken: adoptServedDashboardToken,
       rememberLog: sshRememberLog,
-      signal: lease.signal
+      signal: lease.signal,
+      ...(readyTimeoutMs ? { readyTimeoutMs } : {})
     })
   } catch (error: any) {
     if (created) {
@@ -10292,6 +10325,7 @@ async function bootstrapSshConnectionInner(profile, sshConfig, reuseToken, sourc
         registryConnectionId:
           metadata.registryConnectionId ||
           (typeof source === 'string' && source.startsWith('registry:') ? source.slice('registry:'.length) : ''),
+        cancelScopes: Array.isArray(metadata.cancelScopes) ? [...metadata.cancelScopes] : [],
         // Never infer primary ownership from a non-composite scope key: legacy
         // per-profile pools also use bare keys. Only startHermes' explicit call
         // site may label a registry-qualified SSH scope as the primary backend.
@@ -10419,6 +10453,7 @@ async function resolveRemoteBackend(profile, options: { poolKey?: string; primar
       persistenceSource,
       undefined,
       {
+        cancelScopes: [backendScopeKey(source.id, profileKey)],
         managedScope: 'primary',
         managedUpdateCorrelation: managedPrimary.correlationId,
         primaryRegistryScope: true,
@@ -10459,6 +10494,8 @@ async function resolveRemoteBackend(profile, options: { poolKey?: string; primar
       route.source,
       undefined,
       {
+        cancelScopes:
+          options.primary && route.connectionId ? [backendScopeKey(route.connectionId, profileKey)] : [],
         managedScope: options.primary ? 'primary' : options.poolKey ? 'pool' : 'transient',
         poolKey: options.poolKey || '',
         primaryRegistryScope: options.primary === true && Boolean(route.connectionId),
@@ -11255,8 +11292,7 @@ async function ensureRegistryBackend(connectionId, profile, managedUpdateCorrela
           await stopPoolBackend(key)
 
           if (source.kind === 'ssh') {
-            await sshBootstrapCoordinator.cancelAndWait(key)
-            await teardownSshConnection(key)
+            await cancelSshScopesAndWait(key, id)
           }
         }
       })
@@ -11870,23 +11906,13 @@ async function resumeManagedSshRecoveries() {
 async function stopRegistryConnectionBackends(connectionId) {
   const prefix = backendScopePrefix(connectionId)
 
-  for (const key of [...backendPool.keys()]) {
-    if (String(key).startsWith(prefix)) {
-      stopPoolBackend(key)
-    }
-  }
+  const poolStops = [...backendPool.keys()]
+    .filter(key => String(key).startsWith(prefix))
+    .map(key => stopPoolBackend(key))
 
-  const sshScopes = new Set([
-    ...[...sshConnections.keys()].filter(scope => String(scope).startsWith(prefix)),
-    ...[...sshBootstrapCoordinator.active].map(entry => entry.scope).filter(scope => String(scope).startsWith(prefix))
-  ])
+  const sshScopes = registryOwnedSshScopes(sshConnections, sshBootstrapCoordinator.active, connectionId)
 
-  await Promise.all(
-    [...sshScopes].map(async scope => {
-      await sshBootstrapCoordinator.cancelAndWait(scope)
-      await teardownSshConnection(scope)
-    })
-  )
+  await Promise.all([...poolStops, ...sshScopes.map(scope => cancelSshScopesAndWait(scope, connectionId))])
 }
 
 // Mark a pool profile as recently used so the idle reaper spares it. The
@@ -14205,6 +14231,14 @@ ipcMain.handle('hermes:connection:for', async (_event, payload) => {
 
   return { ...connection, connectionId: id, registryScoped: true }
 })
+registerCancelSshBootstrapIpc(ipcMain, {
+  cancelAndWait: (scope, whileDrained) => sshBootstrapCoordinator.cancelAndWait(scope, whileDrained),
+  readRegistry: readDesktopConnectionsRegistry,
+  resolveSshScopes: (connectionId, scope) => resolvePublishedSshTeardownScopes(scope, connectionId),
+  scopeKey: backendScopeKey,
+  stopPoolBackend,
+  teardownSshScopes
+})
 
 const windowConnectionRoutes = new WindowConnectionRouteRegistry()
 const windowConnectionRouteOwners = new Set<number>()
@@ -14272,8 +14306,7 @@ ipcMain.handle('hermes:connection:revalidate', async () => {
 
       if (conn?.remoteKind === 'ssh') {
         const profile = primaryProfileKey()
-        await sshBootstrapCoordinator.cancelAndWait(sshScopeKey(profile))
-        await teardownSshConnection(profile)
+        await cancelSshScopesAndWait(sshScopeKey(profile), conn.connectionId || '')
       }
     }
 
@@ -14330,8 +14363,7 @@ function revalidateSuspectPoolAfterResume() {
         // The pool key doubles as the SSH scope for registry SSH backends and
         // resolves through sshScopeKey() for bare-profile remotes; both
         // teardown calls no-op when the scope holds no SSH state.
-        await sshBootstrapCoordinator.cancelAndWait(poolKey)
-        await teardownSshConnection(poolKey)
+        await cancelSshScopesAndWait(poolKey, parseBackendScopeKey(poolKey).connectionId || '')
       },
       tracker: remoteLiveness
     })
@@ -15083,17 +15115,22 @@ async function enumerateRegistryAgentSources(registry = readDesktopConnectionsRe
   )
 }
 
-ipcMain.handle('hermes:agents:roster', async () => {
+ipcMain.handle('hermes:agents:roster', async event => {
   const registry = readDesktopConnectionsRegistry()
   const enumerations = await enumerateRegistryAgentSources(registry)
+  const windowRoute = windowConnectionRoutes.get(event.sender.id)
+  const activeSshState = activeRosterSshState(windowRoute, primaryProfileKey(), sshConnections)
+
+  const activeConnectionId = activeRosterConnectionId(windowRoute, registry.connections, activeSshState)
 
   return {
     agents: buildAgentRoster(enumerations, { primaryConnectionId: registry.primary }),
-    // The active gateway owns the renderer's profiles.list — union agents
-    // that report THIS connection are the same identities, not extra rows.
-    // Expose the primary id so the plugin merger can annotate them in place
-    // instead of appending duplicates (remote-only desktops doubled every
-    // bot otherwise; see #88344).
+    // Exact owner of this window's already-running ambient gateway. A legacy
+    // idless SSH descriptor keeps the source captured when its tunnel was
+    // published, even if Settings changes the mutable registry primary.
+    ...(activeConnectionId ? { activeConnectionId } : {}),
+    // Compatibility hint for older renderer mergers that predate exact
+    // per-window ownership.
     primaryConnectionId: registry.primary,
     sources: enumerations.map(({ connection, error, installId, profiles }) => ({
       connectionId: connection.id,
@@ -15445,7 +15482,8 @@ ipcMain.handle('hermes:connection-config:apply', async (_event, payload) => {
     writeRegistry: writeDesktopConnectionsRegistry,
     apply: () =>
       applyConnectionChange({
-        cancelAndWait: value => sshBootstrapCoordinator.cancelAndWait(value),
+        cancelAndWait: (value, whileDrained) =>
+          cancelSshScopesAndWait(value, '', () => whileDrained()),
         isPrimary: !key || key === primaryProfileKey(),
         rehomePrimary: () =>
           rehomePrimaryConnection({
@@ -15899,7 +15937,7 @@ async function teardownConnectionScopedProfileBackend(connectionId, profile) {
   const key = backendScopeKey(connectionId, profile)
   await Promise.all([
     poolStopper.stop(key),
-    sshBootstrapCoordinator.cancelAndWait(key).then(() => teardownSshConnection(key))
+    cancelSshScopesAndWait(key, connectionId)
   ])
 }
 

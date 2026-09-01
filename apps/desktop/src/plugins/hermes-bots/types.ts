@@ -73,6 +73,10 @@ export interface BotMeta {
 
 export interface RosterRow {
   name: string
+  /** Credential-free key of the gateway that produced this rich row. */
+  ambientConnectionKey?: string
+  /** This row came from the gateway that produced the current profiles.list. */
+  ambientSource?: boolean
   canonical_session?: CanonicalSession | null
   connectionId?: string
   connectionKind?: string

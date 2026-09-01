@@ -63,10 +63,40 @@ describe('host.state focused-session atoms', () => {
 
     session.setConnection({ connectionId: 'work', mode: 'remote' } as never)
     expect(host.state.connectionId.get()).toBe('work')
+    expect(host.state.connectionKey.get()).toBe('connection:work')
+    expect(host.state.connectionMode.get()).toBe('remote')
 
     session.setConnection({ mode: 'local' } as never)
     expect(host.state.connectionId.get()).toBe('local')
+    expect(host.state.connectionKey.get()).toBe('local')
+    expect(host.state.connectionMode.get()).toBe('local')
     session.setConnection(null)
+    expect(host.state.connectionKey.get()).toBeNull()
+    expect(host.state.connectionMode.get()).toBeNull()
+  })
+
+  it('identifies idless remotes without including their token', async () => {
+    const { host, session } = await setup()
+
+    const descriptor = {
+      baseUrl: 'http://127.0.0.1:51423?token=query-secret',
+      mode: 'remote',
+      remoteHost: 'magic@imac',
+      remoteIdentity: 'owned-dashboard',
+      remoteKind: 'ssh',
+      token: 'secret-a'
+    }
+
+    session.setConnection(descriptor as never)
+    const first = host.state.connectionKey.get()
+
+    session.setConnection({ ...descriptor, token: 'secret-b' } as never)
+
+    expect(first).toBe(
+      'remote:["ssh","magic@imac","owned-dashboard","http://127.0.0.1:51423"]'
+    )
+    expect(host.state.connectionKey.get()).toBe(first)
+    expect(first).not.toContain('secret')
   })
 
   it('follows the interacted tile while the primary-only atom stays put', async () => {

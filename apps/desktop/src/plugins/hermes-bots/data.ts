@@ -623,9 +623,10 @@ interface UnionAgentRow {
   targetProfile?: string
 }
 
-/** The union roster payload. `primaryConnectionId` is served by Electron but
- *  absent from the SDK's `DesktopAgentRoster`, so the merge reads it here. */
+/** Shell-only union fields may lead the plugin SDK type during a Desktop
+ * compatibility rollout, so the merger declares its additive envelope here. */
 interface UnionRoster {
+  activeConnectionId?: string
   agents?: UnionAgentRow[]
   primaryConnectionId?: string
   sources?: GatewaySource[]
@@ -633,9 +634,11 @@ interface UnionRoster {
 
 export function useRoster() {
   const activeConnectionId = useValue(host.state.connectionId)
+  const activeConnectionKey = useValue(host.state.connectionKey || host.state.connectionId)
+  const activeConnectionMode = useValue(host.state.connectionMode)
 
   return useQuery({
-    queryKey: [...ROSTER_KEY, activeConnectionId],
+    queryKey: [...ROSTER_KEY, activeConnectionId, activeConnectionMode, activeConnectionKey],
     queryFn: async () => {
       // Stamp the ISSUE time on the snapshot: mergeServerMeta compares it
       // against each bot's last local meta write, and a fetch issued before
@@ -668,22 +671,47 @@ export function useRoster() {
         name: String(host.state.profile?.get?.() || 'default').trim() || 'default'
       }
 
-      const local = await requestForBot<RosterSnapshot>(activeBot, 'profiles.list', {})
+      const rawLocal = await requestForBot<RosterSnapshot>(activeBot, 'profiles.list', {})
+
+      const local = {
+        ...(rawLocal && typeof rawLocal === 'object' ? rawLocal : {}),
+        profiles: (Array.isArray(rawLocal?.profiles) ? rawLocal.profiles : []).map(profile =>
+          profile?.remoteSource
+            ? profile
+            : {
+                ...profile,
+                ...(activeConnectionKey ? { ambientConnectionKey: activeConnectionKey } : {}),
+                ambientSource: true
+              }
+        )
+      }
+
       // Newer backends inject the teammate-messaging protocol into every
       // session's system prompt (agent.bot_mode_protocol) — SOUL.md must not
       // carry a second copy. Older gateways lack the flag: keep appending.
-      serverInjectsProtocol = Boolean(local?.bot_mode_protocol)
+      serverInjectsProtocol = Boolean(rawLocal?.bot_mode_protocol)
 
       // Multi-source desktops (hermes-agent #86875) also expose the union
       // agent roster across every registered connection. Merge agents from
       // OTHER sources in as additional rows. Feature-detected + best-effort:
-      // an older Desktop build (no host.agents) or a roster hiccup leaves
-      // the local list exactly as it was.
+      // an older Desktop build has no host.agents; a transient roster failure
+      // retains only identities already proven on this exact ambient route.
       if (typeof host.agents === 'function') {
+        const previous: RosterRow[] = $lastRoster.get().filter(row => !row?.ghost)
+
         try {
           const union = await host.agents()
-          const previous: RosterRow[] = $lastRoster.get().filter(row => !row?.ghost)
-          const merged = mergeMultiSourceRoster(local, union, activeConnectionId, previous)
+          const exactActiveConnectionId = String(union?.activeConnectionId || '').trim()
+
+          const merged = mergeMultiSourceRoster(
+            local,
+            union,
+            exactActiveConnectionId || activeConnectionId,
+            previous,
+            activeConnectionMode,
+            activeConnectionKey
+          )
+
           const sources = Array.isArray(union?.sources) ? union.sources : []
 
           return {
@@ -693,7 +721,22 @@ export function useRoster() {
             fetchedAt: issuedAt
           }
         } catch {
-          /* older build or roster failure — single-source list stands */
+          // Preserve exact identities and previously-painted other sources
+          // through a transient roster failure. The ambient connection key
+          // prevents an idless descriptor for B from inheriting A.
+          const merged = mergeMultiSourceRoster(
+            local,
+            null,
+            activeConnectionId,
+            previous,
+            activeConnectionMode,
+            activeConnectionKey
+          )
+
+          return {
+            ...merged,
+            fetchedAt: issuedAt
+          }
         }
       }
 
@@ -711,39 +754,32 @@ export function useRoster() {
 
 /** Synchronous union-roster read for the composer surfaces (autocomplete
  *  provider + mention middleware). useRoster caches under
- *  [...ROSTER_KEY, activeConnectionId] — a 3-element key — so a bare
+ *  [...ROSTER_KEY, activeConnectionId, activeConnectionMode,
+ *  activeConnectionKey], so a bare
  *  getQueryData(ROSTER_KEY) exact-match lookup returns undefined forever
  *  (issue #89303: remote handles absent from @ autocomplete, mentions
- *  unrouted). Read the live connection's entry first, then fall back to a
- *  prefix scan keeping the freshest snapshot. Never throws: cold cache or
- *  legacy queryClient returns null and callers fall back to their own path. */
+ *  unrouted). Read only the live route's exact entry. A roster cached for a
+ *  different source must not leak into mention completion or submit routing.
+ *  Never throws: a cold cache returns null and callers use their own fallback. */
 export function cachedUnionRoster(): RosterSnapshot | null {
   if (typeof queryClient === 'undefined' || !queryClient || typeof queryClient.getQueryData !== 'function') {
     return null
   }
 
   try {
-    const connectionId = String(host.state.connectionId?.get?.() || host.activeConnectionId?.() || 'local')
-    const exact = queryClient.getQueryData<RosterSnapshot>([...ROSTER_KEY, connectionId])
+    const connectionId = host.state.connectionId?.get?.() ?? null
+    const connectionKey = host.state.connectionKey?.get?.() ?? connectionId
+    const connectionMode = host.state.connectionMode?.get?.() ?? null
+
+    const exact = queryClient.getQueryData<RosterSnapshot>([
+      ...ROSTER_KEY,
+      connectionId,
+      connectionMode,
+      connectionKey
+    ])
 
     if (Array.isArray(exact?.profiles)) {
       return exact
-    }
-
-    if (typeof queryClient.getQueriesData === 'function') {
-      let best: RosterSnapshot | null = null
-
-      // v5 takes a filters object; a legacy v3 queryClient treats the same
-      // object as the key itself and simply matches nothing — harmless.
-      for (const [, data] of queryClient.getQueriesData<RosterSnapshot>({
-        queryKey: ROSTER_KEY
-      })) {
-        if (Array.isArray(data?.profiles) && (!best || Number(data.fetchedAt || 0) > Number(best.fetchedAt || 0))) {
-          best = data
-        }
-      }
-
-      return best
     }
   } catch {
     /* cache hiccup — caller falls back (middleware refetches) */
@@ -754,8 +790,8 @@ export function cachedUnionRoster(): RosterSnapshot | null {
 
 /** Merge the union agent roster (host.agents) over the active gateway's
  *  profiles.list. Active-source rows — matched by the LIVE connection id,
- *  falling back to the roster's primaryConnectionId, then the legacy
- *  kind==='local' rule on older desktops — are the agents profiles.list
+ *  then a uniquely provable legacy source, then the kind==='local' rule on
+ *  older desktops — are the agents profiles.list
  *  already returned: they only ANNOTATE the rich rows (handle, connection
  *  fields); rich fields stay authoritative and they are NOT duplicated.
  *  Rows from other sources become new roster entries tagged with their
@@ -766,7 +802,9 @@ function mergeMultiSourceRoster(
   local: RosterSnapshot | null | undefined,
   union: UnionRoster | null | undefined,
   activeConnectionId?: null | string,
-  previous: RosterRow[] = []
+  previous: RosterRow[] = [],
+  activeConnectionMode?: 'local' | 'remote' | null,
+  activeConnectionKey?: null | string
 ): RosterSnapshot {
   const localProfiles = Array.isArray(local?.profiles) ? local.profiles : []
   const agents = Array.isArray(union?.agents) ? union.agents : []
@@ -778,14 +816,26 @@ function mergeMultiSourceRoster(
   // This-device shadow of default.
   const liveProvided = arguments.length >= 3
   const liveId = String(activeConnectionId || '').trim()
-  let activeId = liveId || (liveProvided ? '' : String(union?.primaryConnectionId || '').trim())
+  const ambientKey = String(activeConnectionKey || '').trim()
 
-  // Migrated remote-primary windows can still expose a legacy remote
-  // descriptor without connectionId. That produces a null live id even
-  // though profiles.list is answering from the registry primary. Infer the
-  // primary only when its inventory matches the rich rows and the local
-  // inventory does not. A genuinely local window has a matching local row,
-  // so it keeps the null-is-local behavior used after clicking This device.
+  const previousAmbientId = ambientKey
+    ? String(
+        previous.find(
+          row =>
+            row?.ambientSource === true &&
+            row.ambientConnectionKey === ambientKey &&
+            String(row.connectionId || '').trim()
+        )?.connectionId || ''
+      ).trim()
+    : ''
+
+  let activeId = liveId || previousAmbientId || (liveProvided ? '' : String(union?.primaryConnectionId || '').trim())
+
+  // Older Desktop builds cannot publish the exact source serving an idless
+  // remote descriptor. Infer their primary only when it is the sole remote
+  // source whose inventory matches the rich rows. Settings can change the
+  // registry primary while the old gateway remains active, so a matching but
+  // non-unique primary is not proof of ownership.
   if (!activeId && liveProvided) {
     const primaryId = String(union?.primaryConnectionId || '').trim()
     const richNames = new Set(localProfiles.map(profile => String(profile?.name || '').trim()).filter(Boolean))
@@ -799,7 +849,23 @@ function mergeMultiSourceRoster(
         String(agent?.connectionId || '').trim() === primaryId && richNames.has(String(agent?.profile || '').trim())
     )
 
-    if (!localMatches && primaryId && primaryMatches) {
+    const matchingRemoteIds = new Set(
+      agents
+        .filter(agent => agent?.connectionKind !== 'local' && richNames.has(String(agent?.profile || '').trim()))
+        .map(agent => String(agent?.connectionId || '').trim())
+        .filter(Boolean)
+    )
+
+    const descriptorIdentifiesRemote = activeConnectionMode === 'remote'
+    const descriptorModeUnavailable = activeConnectionMode == null
+    const primaryIsOnlyMatchingRemote = matchingRemoteIds.size === 1 && matchingRemoteIds.has(primaryId)
+
+    if (
+      primaryId &&
+      primaryMatches &&
+      primaryIsOnlyMatchingRemote &&
+      (descriptorIdentifiesRemote || (descriptorModeUnavailable && !localMatches))
+    ) {
       activeId = primaryId
     }
   }
@@ -822,8 +888,32 @@ function mergeMultiSourceRoster(
     }
 
     if (!activeByName.has(name)) {
+      const previousIdentity =
+        activeId && ambientKey
+          ? previous.find(
+              row =>
+                row?.ambientSource === true &&
+                row.ambientConnectionKey === ambientKey &&
+                row.name === name &&
+                String(row.connectionId || '').trim() === activeId
+            )
+          : null
+
       activeByName.set(name, {
         ...profile,
+        ...(previousIdentity
+          ? {
+              connectionId: previousIdentity.connectionId,
+              connectionKind: previousIdentity.connectionKind,
+              connectionLabel: previousIdentity.connectionLabel,
+              handle: previousIdentity.handle,
+              route: previousIdentity.route,
+              sourceScoped: previousIdentity.sourceScoped,
+              targetProfile: previousIdentity.targetProfile
+            }
+          : {}),
+        ...(ambientKey ? { ambientConnectionKey: ambientKey } : {}),
+        ambientSource: true,
         name
       })
     }

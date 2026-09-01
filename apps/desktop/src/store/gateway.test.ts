@@ -1,5 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { RECONNECT_ATTEMPT_TIMEOUT_MS, SECONDARY_BACKEND_BOOT_WAIT_TIMEOUT_MS } from '@/lib/with-timeout'
+import { $connectionsRegistry } from '@/store/connection-registry-state'
+
 // Connection lifecycle for registry-scoped secondary gateways:
 //
 //  1. Removing a connection must dispose its secondaries — remote/cloud
@@ -66,6 +69,7 @@ beforeEach(() => {
 
 afterEach(() => {
   closeSecondaryGateways()
+  $connectionsRegistry.set(null)
   gatewayMocks.instances.length = 0
   vi.clearAllMocks()
   vi.useRealTimers()
@@ -126,6 +130,145 @@ describe('ensureGatewayForProfile — secondary connect failure surfaces (#81094
     pruneSecondaryGateways(new Set())
 
     expect(gatewayMocks.instances[0].close).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps the short descriptor budget for a recreated non-SSH secondary', async () => {
+    vi.useFakeTimers()
+
+    let redial = false
+    let redialCalls = 0
+
+    const getConnection = vi.fn((profile: string) => {
+      if (redial) {
+        redialCalls += 1
+
+        if (redialCalls === 1) {
+          return Promise.resolve({ sharedPrimary: false })
+        }
+
+        return new Promise(() => undefined)
+      }
+
+      return Promise.resolve({
+        authMode: 'token',
+        baseUrl: `https://${profile}.invalid`,
+        mode: 'local',
+        profile,
+        token: 'fake-test-token',
+        wsUrl: `wss://${profile}.invalid/ws`
+      })
+    })
+
+    installDesktop({ getConnection })
+    gatewayMocks.connect.mockImplementation(async () => undefined)
+    await ensureGatewayForProfile('work')
+    await ensureGatewayForProfile('default')
+    pruneSecondaryGateways(new Set())
+
+    redial = true
+    let settled = false
+    let failure: unknown = null
+
+    const pending = ensureGatewayForProfile('work').catch(error => {
+      failure = error
+      settled = true
+    })
+
+    await vi.advanceTimersByTimeAsync(RECONNECT_ATTEMPT_TIMEOUT_MS - 1)
+    expect(settled).toBe(false)
+
+    await vi.advanceTimersByTimeAsync(1)
+    await pending
+    expect(failure).toMatchObject({ message: 'Timed out connecting to profile "work"' })
+  })
+
+  it('keeps the short timeout for a reconnect on the same secondary', async () => {
+    vi.useFakeTimers()
+
+    let reconnect = false
+    let reconnectCalls = 0
+
+    const getConnection = vi.fn((profile: string) => {
+      if (reconnect) {
+        reconnectCalls += 1
+
+        if (reconnectCalls === 1) {
+          return Promise.resolve({ sharedPrimary: false })
+        }
+
+        return new Promise(() => undefined)
+      }
+
+      return Promise.resolve({
+        authMode: 'token',
+        baseUrl: `https://${profile}.invalid`,
+        mode: 'local',
+        profile,
+        token: 'fake-test-token',
+        wsUrl: `wss://${profile}.invalid/ws`
+      })
+    })
+
+    installDesktop({ getConnection })
+    gatewayMocks.connect.mockImplementation(async () => undefined)
+    await ensureGatewayForProfile('work')
+    ;(activeGateway() as unknown as { connectionState: string }).connectionState = 'closed'
+
+    reconnect = true
+    let settled = false
+    let failure: unknown = null
+
+    const pending = ensureGatewayForProfile('work').catch(error => {
+      failure = error
+      settled = true
+    })
+
+    await vi.advanceTimersByTimeAsync(19_999)
+    expect(settled).toBe(false)
+
+    await vi.advanceTimersByTimeAsync(1)
+    await pending
+    expect(failure).toMatchObject({ message: 'Timed out connecting to profile "work"' })
+  })
+
+  it('does not globally cancel a shared SSH bootstrap when one renderer reconnect times out', async () => {
+    vi.useFakeTimers()
+    $connectionsRegistry.set({
+      connections: [{ id: 'imac', kind: 'ssh', label: 'iMac' }],
+      lastUsed: 'imac',
+      primary: 'imac'
+    } as never)
+
+    let reconnect = false
+    const cancelBootstrap = vi.fn(async () => ({ cancelled: true, ok: true }))
+
+    const getConnectionFor = vi.fn(() =>
+      reconnect
+        ? new Promise(() => undefined)
+        : Promise.resolve({
+            authMode: 'token',
+            baseUrl: 'https://imac.invalid',
+            connectionId: 'imac',
+            mode: 'remote',
+            profile: 'cmo',
+            token: 'fake-test-token',
+            wsUrl: 'wss://imac.invalid/ws'
+          })
+    )
+
+    installDesktop({ connections: { cancelBootstrap }, getConnectionFor })
+    await openGatewayForAgent('imac', 'cmo')
+    ;(gatewayMocks.instances[0] as { connectionState: string }).connectionState = 'closed'
+    reconnect = true
+
+    const pending = expect(openGatewayForAgent('imac', 'cmo')).rejects.toThrow(
+      'Timed out connecting to profile "cmo"'
+    )
+
+    await vi.advanceTimersByTimeAsync(RECONNECT_ATTEMPT_TIMEOUT_MS)
+    await pending
+
+    expect(cancelBootstrap).not.toHaveBeenCalled()
   })
 
   it('keeps the reconnect schedule armed so transient failures still self-heal', async () => {
@@ -303,11 +446,196 @@ describe('secondary connection timeout (#93454)', () => {
 
     installDesktop({ getConnection })
 
-    const pending = expect(ensureGatewayForProfile('work')).rejects.toThrow('Timed out connecting to profile "work"')
+    const connection = ensureGatewayForProfile('work')
+    let settled = false
+    const pending = expect(connection).rejects.toThrow('Timed out connecting to profile "work"')
 
-    // Advance past the internal reconnect-attempt timeout (20s) — the stalled
-    // await must reject instead of hanging forever.
-    await vi.advanceTimersByTimeAsync(20_000)
+    void connection.then(
+      () => {
+        settled = true
+      },
+      () => {
+        settled = true
+      }
+    )
+
+    // Local, URL, and cloud routes retain the original short IPC bound. Only a
+    // registry SSH cold boot gets the longer queue-aware budget.
+    await vi.advanceTimersByTimeAsync(RECONNECT_ATTEMPT_TIMEOUT_MS - 1)
+    expect(settled).toBe(false)
+
+    await vi.advanceTimersByTimeAsync(1)
+    await pending
+  })
+
+  it('keeps the longer cold descriptor budget only for registry SSH routes', async () => {
+    vi.useFakeTimers()
+    $connectionsRegistry.set({
+      connections: [{ id: 'imac', kind: 'ssh', label: 'iMac' }],
+      lastUsed: 'imac',
+      primary: 'imac'
+    } as never)
+
+    const cancelBootstrap = vi.fn(async () => ({ cancelled: true, ok: true }))
+    const getConnectionFor = vi.fn(() => new Promise(() => undefined))
+    installDesktop({ connections: { cancelBootstrap }, getConnectionFor })
+
+    const connection = openGatewayForAgent('imac', 'cmo')
+    let settled = false
+    const pending = expect(connection).rejects.toThrow('Timed out connecting to profile "cmo"')
+
+    void connection.then(
+      () => {
+        settled = true
+      },
+      () => {
+        settled = true
+      }
+    )
+
+    await vi.advanceTimersByTimeAsync(RECONNECT_ATTEMPT_TIMEOUT_MS)
+    expect(settled).toBe(false)
+
+    await vi.advanceTimersByTimeAsync(
+      SECONDARY_BACKEND_BOOT_WAIT_TIMEOUT_MS - RECONNECT_ATTEMPT_TIMEOUT_MS - 1
+    )
+    expect(settled).toBe(false)
+
+    await vi.advanceTimersByTimeAsync(1)
+    await pending
+    expect(cancelBootstrap).toHaveBeenCalledWith({ connectionId: 'imac', profile: 'cmo' })
+  })
+
+  it('loads the registry kind before choosing the cold SSH budget', async () => {
+    vi.useFakeTimers()
+    $connectionsRegistry.set(null)
+
+    const getConnectionFor = vi.fn(() => new Promise(() => undefined))
+
+    const list = vi.fn(async () => ({
+      connections: [{ id: 'imac', kind: 'ssh', label: 'iMac' }],
+      primary: 'imac'
+    }))
+
+    installDesktop({ connections: { list }, getConnectionFor })
+
+    const connection = openGatewayForAgent('imac', 'cmo')
+    let settled = false
+    const pending = expect(connection).rejects.toThrow('Timed out connecting to profile "cmo"')
+
+    void connection.then(
+      () => {
+        settled = true
+      },
+      () => {
+        settled = true
+      }
+    )
+
+    await vi.advanceTimersByTimeAsync(RECONNECT_ATTEMPT_TIMEOUT_MS)
+    expect(settled).toBe(false)
+
+    await vi.advanceTimersByTimeAsync(SECONDARY_BACKEND_BOOT_WAIT_TIMEOUT_MS - RECONNECT_ATTEMPT_TIMEOUT_MS)
+    await pending
+    expect(list).toHaveBeenCalledTimes(1)
+  })
+
+  it('observes a fast descriptor rejection while the registry kind is loading', async () => {
+    $connectionsRegistry.set(null)
+
+    let resolveRegistry!: (registry: unknown) => void
+    const descriptorFailure = new Error('SSH bootstrap failed')
+    const getConnectionFor = vi.fn(() => Promise.reject(descriptorFailure))
+
+    const list = vi.fn(
+      () =>
+        new Promise(resolve => {
+          resolveRegistry = resolve
+        })
+    )
+
+    const unhandled: unknown[] = []
+
+    const onUnhandled = (reason: unknown): void => {
+      unhandled.push(reason)
+    }
+
+    process.on('unhandledRejection', onUnhandled)
+    installDesktop({ connections: { list }, getConnectionFor })
+
+    try {
+      const connection = openGatewayForAgent('imac', 'cmo')
+
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(unhandled).toEqual([])
+
+      resolveRegistry({
+        connections: [{ id: 'imac', kind: 'ssh', label: 'iMac' }],
+        primary: 'imac'
+      })
+
+      await expect(connection).rejects.toBe(descriptorFailure)
+    } finally {
+      process.off('unhandledRejection', onUnhandled)
+    }
+  })
+
+  it.each(['cloud', 'local', 'remote'] as const)(
+    'keeps the short cold budget for a %s route while the registry cache is loading',
+    async kind => {
+      vi.useFakeTimers()
+      $connectionsRegistry.set(null)
+
+      const getConnectionFor = vi.fn(() => new Promise(() => undefined))
+
+      const list = vi.fn(async () => ({
+        connections: [{ id: 'target', kind, label: 'Target' }],
+        primary: 'target'
+      }))
+
+      installDesktop({ connections: { list }, getConnectionFor })
+
+      const pending = expect(openGatewayForAgent('target', 'cmo')).rejects.toThrow(
+        'Timed out connecting to profile "cmo"'
+      )
+
+      await vi.advanceTimersByTimeAsync(RECONNECT_ATTEMPT_TIMEOUT_MS - 1)
+      expect(getConnectionFor).toHaveBeenCalledTimes(1)
+
+      await vi.advanceTimersByTimeAsync(1)
+      await pending
+    }
+  )
+
+  it('uses the short reconnect budget after an SSH secondary was pruned and recreated', async () => {
+    gatewayMocks.connect.mockImplementation(async () => undefined)
+    $connectionsRegistry.set({
+      connections: [
+        { id: 'local', kind: 'local', label: 'This device' },
+        { id: 'imac', kind: 'ssh', label: 'iMac' }
+      ],
+      primary: 'local'
+    } as never)
+
+    const getConnectionFor = vi.fn().mockResolvedValueOnce({
+      connectionId: 'imac',
+      profile: 'cmo',
+      wsUrl: 'wss://imac.invalid/ws'
+    })
+
+    installDesktop({ getConnectionFor })
+    await openGatewayForAgent('imac', 'cmo')
+
+    pruneSecondaryGateways(new Set())
+    expect(gatewayMocks.instances[0].close).toHaveBeenCalled()
+
+    vi.useFakeTimers()
+    getConnectionFor.mockImplementationOnce(() => new Promise(() => undefined))
+
+    const connection = openGatewayForAgent('imac', 'cmo')
+    const pending = expect(connection).rejects.toThrow('Timed out connecting to profile "cmo"')
+
+    await vi.advanceTimersByTimeAsync(RECONNECT_ATTEMPT_TIMEOUT_MS)
     await pending
   })
 
