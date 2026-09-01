@@ -8,6 +8,7 @@ proved gone. Terminal states are immutable.
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
 import threading
 import uuid
@@ -23,6 +24,8 @@ from hermes_time import now as _hermes_now
 EXECUTIONS_FILE: Optional[Path] = None
 MAX_TERMINAL_EXECUTIONS = 1000
 _TERMINAL_STATES = ("completed", "failed", "unknown")
+_DELIVERY_STATES = ("pending", "delivered", "failed")
+_DELIVERY_TOKEN_RE = re.compile(r"[0-9a-f]{32}")
 _lock = threading.RLock()
 _PROCESS_ID = uuid.uuid4().hex
 
@@ -40,6 +43,7 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
 
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute("PRAGMA foreign_keys=ON")
     apply_wal_with_fallback(conn, db_label="cron/executions.db")
     conn.execute("PRAGMA synchronous=FULL")
     conn.execute(
@@ -55,9 +59,28 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
              claimed_at TEXT NOT NULL,
              started_at TEXT,
              finished_at TEXT,
-             error TEXT
+             error TEXT,
+             job_name TEXT,
+             definition_hash TEXT,
+             delivery_outcome TEXT,
+             duration_ms INTEGER
            )"""
     )
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(executions)")}
+    for name, declaration in (
+        ("job_name", "TEXT"),
+        ("definition_hash", "TEXT"),
+        ("delivery_outcome", "TEXT"),
+        ("duration_ms", "INTEGER"),
+    ):
+        if name in columns:
+            continue
+        try:
+            conn.execute(f"ALTER TABLE executions ADD COLUMN {name} {declaration}")
+        except sqlite3.OperationalError as exc:
+            # Concurrent first-use connections may both observe the old schema.
+            if "duplicate column" not in str(exc).lower():
+                raise
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_executions_job_claimed "
         "ON executions(job_id, claimed_at DESC, id DESC)"
@@ -65,6 +88,46 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_executions_status_claimed "
         "ON executions(status, claimed_at DESC, id DESC)"
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS execution_deliveries (
+             id TEXT PRIMARY KEY,
+             execution_id TEXT NOT NULL REFERENCES executions(id) ON DELETE CASCADE,
+             platform TEXT NOT NULL,
+             chat_id TEXT NOT NULL,
+             thread_id TEXT,
+             message_id TEXT,
+             status TEXT NOT NULL CHECK(status IN ('pending','delivered','failed')),
+             error TEXT,
+             created_at TEXT NOT NULL,
+             updated_at TEXT NOT NULL
+           )"""
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_execution_deliveries_execution "
+        "ON execution_deliveries(execution_id, created_at DESC, id DESC)"
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_execution_deliveries_message "
+        "ON execution_deliveries(platform, chat_id, message_id) "
+        "WHERE message_id IS NOT NULL"
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS execution_feedback (
+             id TEXT PRIMARY KEY,
+             delivery_id TEXT NOT NULL
+               REFERENCES execution_deliveries(id) ON DELETE CASCADE,
+             telegram_user_id TEXT NOT NULL,
+             vote INTEGER NOT NULL CHECK(vote IN (-1, 1)),
+             reason TEXT,
+             created_at TEXT NOT NULL,
+             updated_at TEXT NOT NULL,
+             UNIQUE(delivery_id, telegram_user_id)
+           )"""
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_execution_feedback_delivery "
+        "ON execution_feedback(delivery_id, updated_at DESC, id DESC)"
     )
 
 
@@ -130,15 +193,26 @@ def _prune_unlocked(conn: sqlite3.Connection) -> None:
     limit = max(0, int(MAX_TERMINAL_EXECUTIONS))
     conn.execute(
         """DELETE FROM executions WHERE id IN (
-             SELECT id FROM executions
-             WHERE status IN ('completed','failed','unknown')
-             ORDER BY claimed_at DESC, id DESC LIMIT -1 OFFSET ?
+             SELECT e.id FROM executions e
+             WHERE e.status IN ('completed','failed','unknown')
+               AND NOT EXISTS (
+                 SELECT 1 FROM execution_deliveries d
+                 JOIN execution_feedback f ON f.delivery_id=d.id
+                 WHERE d.execution_id=e.id
+               )
+             ORDER BY e.claimed_at DESC, e.id DESC LIMIT -1 OFFSET ?
            )""",
         (limit,),
     )
 
 
-def create_execution(job_id: str, *, source: str) -> Dict[str, Any]:
+def create_execution(
+    job_id: str,
+    *,
+    source: str,
+    job_name: Optional[str] = None,
+    definition_hash: Optional[str] = None,
+) -> Dict[str, Any]:
     """Persist a claimed attempt before executor/provider dispatch."""
     now = _hermes_now().isoformat()
     execution_id = uuid.uuid4().hex
@@ -147,10 +221,12 @@ def create_execution(job_id: str, *, source: str) -> Dict[str, Any]:
         conn.execute(
             """INSERT INTO executions
                (id, job_id, source, process_id, pid, process_started_at,
-                status, claimed_at)
-               VALUES (?, ?, ?, ?, ?, ?, 'claimed', ?)""",
+                status, claimed_at, job_name, definition_hash)
+               VALUES (?, ?, ?, ?, ?, ?, 'claimed', ?, ?, ?)""",
             (execution_id, str(job_id), str(source), _PROCESS_ID, pid,
-             _process_start_time(pid), now),
+             _process_start_time(pid), now,
+             None if job_name is None else str(job_name),
+             None if definition_hash is None else str(definition_hash)),
         )
         row = conn.execute(
             "SELECT * FROM executions WHERE id=?", (execution_id,)
@@ -158,6 +234,42 @@ def create_execution(job_id: str, *, source: str) -> Dict[str, Any]:
     record = _record(row)
     _emit_execution_state(record)
     return record  # type: ignore[return-value]
+
+
+def update_execution_context(
+    execution_id: str,
+    *,
+    job_name: Optional[str] = None,
+    definition_hash: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Fill job metadata after a provider resolves the claimed definition.
+
+    ``None`` leaves that field unchanged. The update is allowed only while the
+    execution is claimed or running, matching the ledger's immutable-terminal
+    contract.
+    """
+    assignments: List[str] = []
+    params: List[Any] = []
+    if job_name is not None:
+        assignments.append("job_name=?")
+        params.append(str(job_name))
+    if definition_hash is not None:
+        assignments.append("definition_hash=?")
+        params.append(str(definition_hash))
+    with _transaction() as conn:
+        if assignments:
+            params.append(str(execution_id))
+            cur = conn.execute(
+                "UPDATE executions SET " + ", ".join(assignments)
+                + " WHERE id=? AND status IN ('claimed','running')",
+                params,
+            )
+            if cur.rowcount != 1:
+                return None
+        row = conn.execute(
+            "SELECT * FROM executions WHERE id=?", (str(execution_id),)
+        ).fetchone()
+    return _record(row)
 
 
 def mark_execution_running(execution_id: str) -> Optional[Dict[str, Any]]:
@@ -183,14 +295,22 @@ def finish_execution(
     delivery_outcome: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Write a terminal result once; terminal attempts cannot be rewritten."""
-    now = _hermes_now().isoformat()
+    finished = _hermes_now()
+    now = finished.isoformat()
     status = "completed" if success else "failed"
     detail = None if success else (str(error) if error else "unknown failure")
     with _transaction() as conn:
         cur = conn.execute(
-            """UPDATE executions SET status=?, finished_at=?, error=?
+            """UPDATE executions SET status=?, finished_at=?, error=?,
+               delivery_outcome=?,
+               duration_ms=MAX(0, CAST(ROUND(
+                 (julianday(?) - julianday(COALESCE(started_at, claimed_at)))
+                 * 86400000
+               ) AS INTEGER))
                WHERE id=? AND status IN ('claimed','running')""",
-            (status, now, detail, execution_id),
+            (status, now, detail,
+             None if delivery_outcome is None else str(delivery_outcome),
+             now, execution_id),
         )
         if cur.rowcount != 1:
             return None
@@ -200,6 +320,310 @@ def finish_execution(
         ).fetchone())
     _emit_execution_state(record, delivery_outcome=delivery_outcome)
     return record
+
+
+def is_valid_delivery_token(value: Any) -> bool:
+    """Return whether ``value`` is a bounded callback-safe delivery token."""
+    return isinstance(value, str) and _DELIVERY_TOKEN_RE.fullmatch(value) is not None
+
+
+def _required_text(value: Any, field: str) -> str:
+    text = str(value).strip() if value is not None else ""
+    if not text:
+        raise ValueError(f"{field} must be non-empty")
+    return text
+
+
+def _optional_text(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def record_execution_delivery(
+    execution_id: str,
+    *,
+    platform: str,
+    chat_id: Any,
+    status: str,
+    thread_id: Any = None,
+    message_id: Any = None,
+    error: Optional[str] = None,
+    delivery_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Create or idempotently finalize one exact platform delivery.
+
+    Create a ``pending`` row before sending so its random ``id`` can be used as
+    a Telegram callback token. Pass that ``id`` back after the platform send
+    with ``status='delivered'`` and the returned ``message_id``. Platform,
+    execution, chat, and any already-recorded thread/message identity cannot be
+    relinked.
+    """
+    execution_key = _required_text(execution_id, "execution_id")
+    platform_key = _required_text(platform, "platform").lower()
+    chat_key = _required_text(chat_id, "chat_id")
+    thread_key = _optional_text(thread_id)
+    message_key = _optional_text(message_id)
+    state = _required_text(status, "status").lower()
+    if state not in _DELIVERY_STATES:
+        raise ValueError(
+            "status must be one of: " + ", ".join(_DELIVERY_STATES)
+        )
+    token = delivery_id or uuid.uuid4().hex
+    if not is_valid_delivery_token(token):
+        raise ValueError("delivery_id must be a 32-character lowercase hex token")
+    detail = _optional_text(error)
+    now = _hermes_now().isoformat()
+
+    with _transaction() as conn:
+        existing = conn.execute(
+            "SELECT * FROM execution_deliveries WHERE id=?", (token,)
+        ).fetchone()
+        if existing is None:
+            if conn.execute(
+                "SELECT 1 FROM executions WHERE id=?", (execution_key,)
+            ).fetchone() is None:
+                raise ValueError("execution_id does not exist")
+            if state == "delivered" and message_key is None:
+                raise ValueError("message_id is required for a delivered delivery")
+            try:
+                conn.execute(
+                    """INSERT INTO execution_deliveries
+                       (id, execution_id, platform, chat_id, thread_id,
+                        message_id, status, error, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (token, execution_key, platform_key, chat_key, thread_key,
+                     message_key, state, detail, now, now),
+                )
+            except sqlite3.IntegrityError as exc:
+                if "execution_deliveries.platform" in str(exc):
+                    raise ValueError(
+                        "platform/chat/message is already linked to another delivery"
+                    ) from exc
+                raise
+        else:
+            if existing["execution_id"] != execution_key:
+                raise ValueError("delivery belongs to a different execution")
+            if existing["platform"] != platform_key:
+                raise ValueError("delivery platform cannot be changed")
+            if existing["chat_id"] != chat_key:
+                raise ValueError("delivery chat_id cannot be changed")
+            if (
+                existing["thread_id"] is not None
+                and thread_key is not None
+                and existing["thread_id"] != thread_key
+            ):
+                raise ValueError("delivery thread_id cannot be changed")
+            if (
+                existing["message_id"] is not None
+                and message_key is not None
+                and existing["message_id"] != message_key
+            ):
+                raise ValueError("delivery message_id cannot be changed")
+            if existing["status"] == "delivered" and state != "delivered":
+                raise ValueError("delivered delivery cannot return to a non-terminal state")
+            if existing["status"] == "failed" and state == "pending":
+                raise ValueError("failed delivery cannot return to pending")
+
+            final_thread = existing["thread_id"] or thread_key
+            final_message = existing["message_id"] or message_key
+            if state == "delivered" and final_message is None:
+                raise ValueError("message_id is required for a delivered delivery")
+            unchanged = (
+                existing["thread_id"] == final_thread
+                and existing["message_id"] == final_message
+                and existing["status"] == state
+                and existing["error"] == detail
+            )
+            if unchanged:
+                return dict(existing)
+            try:
+                conn.execute(
+                    """UPDATE execution_deliveries
+                       SET thread_id=?, message_id=?, status=?, error=?, updated_at=?
+                       WHERE id=?""",
+                    (final_thread, final_message, state, detail, now, token),
+                )
+            except sqlite3.IntegrityError as exc:
+                if "execution_deliveries.platform" in str(exc):
+                    raise ValueError(
+                        "platform/chat/message is already linked to another delivery"
+                    ) from exc
+                raise
+        row = conn.execute(
+            "SELECT * FROM execution_deliveries WHERE id=?", (token,)
+        ).fetchone()
+    return dict(row)
+
+
+def lookup_execution_delivery(
+    delivery_token: Any,
+    *,
+    platform: Optional[str] = None,
+    chat_id: Any = None,
+    message_id: Any = None,
+) -> Optional[Dict[str, Any]]:
+    """Resolve a callback-safe token, optionally requiring message coordinates."""
+    if not is_valid_delivery_token(delivery_token):
+        return None
+    clauses = ["id=?"]
+    params: List[Any] = [delivery_token]
+    if platform is not None:
+        clauses.append("platform=?")
+        params.append(_required_text(platform, "platform").lower())
+    if chat_id is not None:
+        clauses.append("chat_id=?")
+        params.append(_required_text(chat_id, "chat_id"))
+    if message_id is not None:
+        clauses.append("message_id=?")
+        params.append(_required_text(message_id, "message_id"))
+    with _transaction() as conn:
+        row = conn.execute(
+            "SELECT * FROM execution_deliveries WHERE " + " AND ".join(clauses),
+            params,
+        ).fetchone()
+    return _record(row)
+
+
+def _validated_feedback(
+    *, telegram_user_id: Any, vote: int, reason: Optional[str]
+) -> tuple[str, int, Optional[str]]:
+    user_key = _required_text(telegram_user_id, "telegram_user_id")
+    if isinstance(vote, bool) or not isinstance(vote, int) or vote not in (-1, 1):
+        raise ValueError("vote must be either -1 or 1")
+    return user_key, vote, _optional_text(reason)
+
+
+def _upsert_feedback_unlocked(
+    conn: sqlite3.Connection,
+    delivery_id: str,
+    *,
+    telegram_user_id: str,
+    vote: int,
+    reason: Optional[str],
+) -> Dict[str, Any]:
+    now = _hermes_now().isoformat()
+    conn.execute(
+        """INSERT INTO execution_feedback
+           (id, delivery_id, telegram_user_id, vote, reason, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(delivery_id, telegram_user_id)
+           DO UPDATE SET vote=excluded.vote, reason=excluded.reason,
+                         updated_at=excluded.updated_at""",
+        (uuid.uuid4().hex, delivery_id, telegram_user_id, vote, reason, now, now),
+    )
+    row = conn.execute(
+        """SELECT * FROM execution_feedback
+           WHERE delivery_id=? AND telegram_user_id=?""",
+        (delivery_id, telegram_user_id),
+    ).fetchone()
+    return dict(row)
+
+
+def upsert_execution_feedback(
+    delivery_token: Any,
+    *,
+    telegram_user_id: Any,
+    vote: int,
+    reason: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Upsert one Telegram user's vote for an already-delivered message."""
+    if not is_valid_delivery_token(delivery_token):
+        return None
+    user_key, clean_vote, clean_reason = _validated_feedback(
+        telegram_user_id=telegram_user_id, vote=vote, reason=reason
+    )
+    with _transaction() as conn:
+        delivery = conn.execute(
+            """SELECT id FROM execution_deliveries
+               WHERE id=? AND platform='telegram' AND status='delivered'
+                 AND message_id IS NOT NULL""",
+            (delivery_token,),
+        ).fetchone()
+        if delivery is None:
+            return None
+        return _upsert_feedback_unlocked(
+            conn,
+            delivery["id"],
+            telegram_user_id=user_key,
+            vote=clean_vote,
+            reason=clean_reason,
+        )
+
+
+def record_execution_feedback(
+    feedback_token: Any,
+    *,
+    vote: int,
+    telegram_user_id: Any,
+    chat_id: Any,
+    message_id: Any,
+    thread_id: Any = None,
+    reason: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Persist a Telegram callback only when token and message exactly match.
+
+    Invalid, expired, or mismatched tokens return ``None``. A valid repeat vote
+    from the same user updates the existing row, so users can change feedback.
+    """
+    if not is_valid_delivery_token(feedback_token):
+        return None
+    user_key, clean_vote, clean_reason = _validated_feedback(
+        telegram_user_id=telegram_user_id, vote=vote, reason=reason
+    )
+    chat_key = _required_text(chat_id, "chat_id")
+    message_key = _required_text(message_id, "message_id")
+    thread_key = _optional_text(thread_id)
+    with _transaction() as conn:
+        delivery = conn.execute(
+            """SELECT id, status, message_id FROM execution_deliveries
+               WHERE id=? AND platform='telegram' AND chat_id=?
+                 AND ((thread_id IS NULL AND ? IS NULL) OR thread_id=?)""",
+            (feedback_token, chat_key, thread_key, thread_key),
+        ).fetchone()
+        if delivery is None:
+            return None
+        if delivery["status"] == "failed":
+            return None
+        if (
+            delivery["message_id"] is not None
+            and delivery["message_id"] != message_key
+        ):
+            return None
+        if delivery["status"] == "pending":
+            try:
+                conn.execute(
+                    """UPDATE execution_deliveries
+                       SET status='delivered', message_id=?, error=NULL, updated_at=?
+                       WHERE id=? AND status='pending'""",
+                    (message_key, _hermes_now().isoformat(), delivery["id"]),
+                )
+            except sqlite3.IntegrityError:
+                # Another delivery already owns these Telegram coordinates.
+                return None
+        elif delivery["message_id"] != message_key:
+            return None
+        return _upsert_feedback_unlocked(
+            conn,
+            delivery["id"],
+            telegram_user_id=user_key,
+            vote=clean_vote,
+            reason=clean_reason,
+        )
+
+
+def list_execution_feedback(delivery_token: Any) -> List[Dict[str, Any]]:
+    """Return all current user votes for one callback-safe delivery token."""
+    if not is_valid_delivery_token(delivery_token):
+        return []
+    with _transaction() as conn:
+        rows = conn.execute(
+            """SELECT * FROM execution_feedback WHERE delivery_id=?
+               ORDER BY updated_at DESC, id DESC""",
+            (delivery_token,),
+        ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def recover_interrupted_executions() -> int:
@@ -218,12 +642,16 @@ def recover_interrupted_executions() -> int:
             if _owner_is_live(int(row["pid"]), row["process_started_at"]):
                 continue
             cur = conn.execute(
-                """UPDATE executions SET status='unknown', finished_at=?, error=?
+                """UPDATE executions SET status='unknown', finished_at=?, error=?,
+                   duration_ms=MAX(0, CAST(ROUND(
+                     (julianday(?) - julianday(COALESCE(started_at, claimed_at)))
+                     * 86400000
+                   ) AS INTEGER))
                    WHERE id=? AND status IN ('claimed','running')""",
                 (now,
                  "Scheduler restarted after this execution's owner exited before a durable "
                  "terminal state; whether side effects ran is unknown.",
-                 row["id"]),
+                 now, row["id"]),
             )
             changed += cur.rowcount
             if cur.rowcount:
