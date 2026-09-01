@@ -3206,20 +3206,21 @@ class DockerEnvironment(BaseEnvironment):
             missing_labels = {"", "<no value>"}
             task_key_missing = actual_task_key in missing_labels
             profile_key_missing = actual_profile_key in missing_labels
-            if task_key_missing != profile_key_missing:
-                logger.warning(
-                    "Ignoring Docker container %s with incomplete identity labels",
-                    container_id[:12],
+            if task_key_missing or profile_key_missing:
+                label_state = (
+                    "missing" if task_key_missing and profile_key_missing
+                    else "incomplete"
                 )
-                continue
-            legacy_identity = task_key_missing and profile_key_missing
-            if legacy_identity:
-                self._remove_container_for_recreation(
-                    container_id,
-                    context="legacy container lacks exact identity labels",
+                message = (
+                    f"Docker container {container_id[:12]} has {label_state} "
+                    "exact identity labels. Its legacy task/profile labels are "
+                    "lossy, so Hermes cannot verify ownership and will not "
+                    "remove or reuse it. Stop/remove it manually after "
+                    "verifying ownership, then retry."
                 )
-                continue
-            if not legacy_identity and (
+                logger.error(message)
+                raise RuntimeError(message)
+            if (
                 actual_task_key != task_key or actual_profile_key != profile_key
             ):
                 # Sanitized legacy labels can collide. Never remove a container

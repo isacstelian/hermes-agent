@@ -1319,8 +1319,11 @@ def test_stale_cleanup_preserves_running_mismatched_container(monkeypatch):
     assert not any(cmd[1:3] == ["rm", "running-cid"] for cmd, _ in calls)
 
 
-def test_pre_identity_label_container_is_removed_before_upgrade(monkeypatch):
-    """Base containers without exact identity labels must not block upgrade."""
+@pytest.mark.parametrize("state", ["exited", "running"])
+def test_pre_identity_label_collision_blocks_without_removal(
+    monkeypatch, caplog, state
+):
+    """Lossy legacy labels cannot prove ownership across colliding identities."""
     monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
     calls = _mock_subprocess_run(monkeypatch)
     env = _make_dummy_env(
@@ -1334,21 +1337,57 @@ def test_pre_identity_label_container_is_removed_before_upgrade(monkeypatch):
             return subprocess.CompletedProcess(
                 cmd,
                 0,
-                stdout="legacy-cid\texited\tnew-mounts\toff\t\t\n",
+                stdout=f"legacy-cid\t{state}\tnew-mounts\toff\t\t\n",
                 stderr="",
             )
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
     monkeypatch.setattr(docker_env.subprocess, "run", _run)
 
-    env._remove_stale_config_containers(
-        "session_tenant", "default", "off", "new-mounts"
-    )
+    with caplog.at_level(logging.ERROR):
+        with pytest.raises(RuntimeError, match="exact identity labels"):
+            env._remove_stale_config_containers(
+                "session_tenant", "default", "off", "new-mounts"
+            )
 
     ps_cmd = next(cmd for cmd, _ in calls if cmd[1:3] == ["ps", "-a"])
     assert not any("hermes-task-key=" in part for part in ps_cmd)
     assert not any("hermes-profile-key=" in part for part in ps_cmd)
-    assert any(cmd[1:4] == ["rm", "-f", "legacy-cid"] for cmd, _ in calls)
+    assert not any(cmd[1] == "rm" for cmd, _ in calls)
+    assert any(
+        "remove it manually after verifying ownership" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+def test_incomplete_identity_labels_block_without_removal(monkeypatch):
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+    env = _make_dummy_env(persist_across_processes=False)
+    calls.clear()
+
+    def _run(cmd, **kwargs):
+        calls.append((list(cmd), kwargs))
+        if cmd[1:3] == ["ps", "-a"]:
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout=(
+                    "partial-cid\texited\told-mounts\toff\t"
+                    f"{env._labels[docker_env._TASK_KEY_LABEL_KEY]}\t\n"
+                ),
+                stderr="",
+            )
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(docker_env.subprocess, "run", _run)
+
+    with pytest.raises(RuntimeError, match="incomplete exact identity labels"):
+        env._remove_stale_config_containers(
+            "test-task", "default", "off", "new-mounts"
+        )
+
+    assert not any(cmd[1] == "rm" for cmd, _ in calls)
 
 
 def test_stale_cleanup_preserves_exact_identity_collision(monkeypatch):
