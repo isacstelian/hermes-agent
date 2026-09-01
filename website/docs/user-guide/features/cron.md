@@ -465,7 +465,9 @@ cron:
 
 Hermes can add `👍 Util` and `👎 Nu m-a ajutat` inline buttons to successful,
 non-silent Telegram cron deliveries. These are Telegram inline keyboard
-buttons, not message reactions. A negative vote opens a short list of reasons.
+buttons, not message reactions. In a private chat, a negative vote opens a short
+list of reasons. In groups, Hermes records the vote and keeps the buttons for
+other members.
 
 Feedback is off by default. Enable it through `hermes setup telemetry`, the
 `hermes tools` menu, or `config.yaml`:
