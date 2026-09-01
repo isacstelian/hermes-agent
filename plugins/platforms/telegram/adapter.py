@@ -224,6 +224,100 @@ from utils import env_float, env_int
 
 _TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 
+_TELEGRAM_CALLBACK_DATA_MAX_BYTES = 64
+_ROUTINE_FEEDBACK_REASONS = (
+    ("wrong", "Greșită"),
+    ("irrelevant", "Irelevantă"),
+    ("too_long", "Prea lungă"),
+    ("repetitive", "Repetitivă"),
+    ("unclear_action", "Acțiune neclară"),
+    ("too_frequent", "Prea des"),
+)
+_ROUTINE_FEEDBACK_REASON_CODES = frozenset(
+    code for code, _label in _ROUTINE_FEEDBACK_REASONS
+)
+_ROUTINE_FEEDBACK_TOKEN_MAX_BYTES = _TELEGRAM_CALLBACK_DATA_MAX_BYTES - max(
+    len(f"rf:r:{code}:".encode("utf-8"))
+    for code in _ROUTINE_FEEDBACK_REASON_CODES
+)
+
+
+def _validate_routine_feedback_token(feedback_token: Any) -> str:
+    """Return a callback-safe opaque delivery token.
+
+    Telegram caps callback_data at 64 bytes. Tokens stay ASCII and cannot
+    contain the colon used by the compact ``rf:`` callback protocol.
+    """
+    if feedback_token is None:
+        raise ValueError("routine feedback token is required")
+    token = str(feedback_token)
+    if not token or not token.isascii() or not re.fullmatch(r"[A-Za-z0-9_-]+", token):
+        raise ValueError("routine feedback token must contain only ASCII letters, digits, _ or -")
+    if len(token.encode("utf-8")) > _ROUTINE_FEEDBACK_TOKEN_MAX_BYTES:
+        raise ValueError(
+            f"routine feedback token exceeds {_ROUTINE_FEEDBACK_TOKEN_MAX_BYTES} bytes"
+        )
+    return token
+
+
+def _routine_feedback_callback_data(*parts: str) -> str:
+    data = ":".join(("rf", *parts))
+    if len(data.encode("utf-8")) > _TELEGRAM_CALLBACK_DATA_MAX_BYTES:
+        raise ValueError("routine feedback callback_data exceeds Telegram's 64-byte limit")
+    return data
+
+
+def build_routine_feedback_keyboard(feedback_token: Any):
+    """Build the shared 👍/👎 keyboard for one delivered routine."""
+    token = _validate_routine_feedback_token(feedback_token)
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "👍 Util",
+                callback_data=_routine_feedback_callback_data("u", token),
+            ),
+            InlineKeyboardButton(
+                "👎 Nu m-a ajutat",
+                callback_data=_routine_feedback_callback_data("d", token),
+            ),
+        ]
+    ])
+
+
+def build_routine_feedback_reason_keyboard(feedback_token: Any):
+    """Build the DM-only structured reason keyboard after a negative vote."""
+    token = _validate_routine_feedback_token(feedback_token)
+    buttons = [
+        InlineKeyboardButton(
+            label,
+            callback_data=_routine_feedback_callback_data("r", code, token),
+        )
+        for code, label in _ROUTINE_FEEDBACK_REASONS
+    ]
+    return InlineKeyboardMarkup([
+        buttons[index:index + 2]
+        for index in range(0, len(buttons), 2)
+    ])
+
+
+def _parse_routine_feedback_callback(data: Any) -> tuple[str, int, Optional[str]]:
+    """Parse ``rf:`` callback_data into delivery token, vote and reason."""
+    if not isinstance(data, str) or len(data.encode("utf-8")) > _TELEGRAM_CALLBACK_DATA_MAX_BYTES:
+        raise ValueError("invalid routine feedback callback")
+    parts = data.split(":")
+    if len(parts) == 3 and parts[0] == "rf" and parts[1] in {"u", "d"}:
+        token = _validate_routine_feedback_token(parts[2])
+        return token, 1 if parts[1] == "u" else -1, None
+    if (
+        len(parts) == 4
+        and parts[0] == "rf"
+        and parts[1] == "r"
+        and parts[2] in _ROUTINE_FEEDBACK_REASON_CODES
+    ):
+        token = _validate_routine_feedback_token(parts[3])
+        return token, -1, parts[2]
+    raise ValueError("invalid routine feedback callback")
+
 # Max seconds a send/edit coroutine may sleep inline on a Telegram
 # flood-control RetryAfter. Longer server penalties fail closed with a
 # ``flood_control:{wait}`` SendResult so the caller's retry machinery
@@ -871,6 +965,11 @@ class TelegramAdapter(BasePlatformAdapter):
         # Clarify button state: clarify_id → session_key (for the clarify tool's
         # multiple-choice prompts; see GatewayRunner clarify_callback wiring).
         self._clarify_state: Dict[str, str] = {}
+        # Optional integration seam for routine-delivery feedback. The
+        # callback signature mirrors cron.executions.record_execution_feedback;
+        # when unset, callbacks persist through that profile-local ledger
+        # function directly.
+        self._routine_feedback_handler: Optional[Callable[..., Any]] = None
         # Notification mode for message sends.
         # "important" — only final responses, approvals, and slash confirmations
         #               trigger notifications; tool progress, streaming, status
@@ -1196,6 +1295,162 @@ class TelegramAdapter(BasePlatformAdapter):
         if (metadata or {}).get("notify"):
             return {}
         return {"disable_notification": True}
+
+    def set_routine_feedback_handler(
+        self, handler: Optional[Callable[..., Any]]
+    ) -> None:
+        """Install an optional routine-feedback persistence callback.
+
+        The handler may be synchronous or asynchronous and must match
+        ``record_execution_feedback(feedback_token, *, vote,
+        telegram_user_id, chat_id, message_id, thread_id=None, reason=None)``.
+        Passing ``None`` restores direct profile-local ledger persistence.
+        """
+        self._routine_feedback_handler = handler
+
+    async def _record_routine_feedback(
+        self,
+        feedback_token: str,
+        *,
+        vote: int,
+        telegram_user_id: str,
+        chat_id: str,
+        message_id: str,
+        thread_id: Optional[str],
+        reason: Optional[str],
+    ) -> bool:
+        """Persist one vote inside this adapter's anchored profile context."""
+        handler = getattr(self, "_routine_feedback_handler", None)
+        if handler is None:
+            from cron.executions import record_execution_feedback
+
+            handler = record_execution_feedback
+
+        home_token = None
+        anchored_home = getattr(self, "_hermes_home", None)
+        if anchored_home is not None:
+            from hermes_constants import set_hermes_home_override
+
+            home_token = set_hermes_home_override(anchored_home)
+        try:
+            result = handler(
+                feedback_token,
+                vote=vote,
+                telegram_user_id=telegram_user_id,
+                chat_id=chat_id,
+                message_id=message_id,
+                thread_id=thread_id,
+                reason=reason,
+            )
+            if inspect.isawaitable(result):
+                result = await result
+            return bool(result)
+        finally:
+            if home_token is not None:
+                from hermes_constants import reset_hermes_home_override
+
+                reset_hermes_home_override(home_token)
+
+    @staticmethod
+    async def _edit_routine_feedback_markup(query, reply_markup) -> None:
+        """Best-effort inline keyboard edit without changing routine text."""
+        try:
+            await query.edit_message_reply_markup(reply_markup=reply_markup)
+        except Exception:
+            logger.debug(
+                "[Telegram] Could not update routine feedback keyboard",
+                exc_info=True,
+            )
+
+    async def _handle_routine_feedback_callback(
+        self,
+        query,
+        data: str,
+        *,
+        query_chat_id: Any,
+        query_chat_type: Any,
+        query_thread_id: Any,
+        query_user_name: Optional[str],
+    ) -> None:
+        """Authorize, persist and acknowledge one ``rf:`` callback."""
+        try:
+            feedback_token, vote, reason = _parse_routine_feedback_callback(data)
+        except (TypeError, ValueError):
+            await query.answer(text="Feedback invalid sau expirat.")
+            await self._edit_routine_feedback_markup(query, None)
+            return
+
+        query_user = getattr(query, "from_user", None)
+        caller_id = str(getattr(query_user, "id", "") or "").strip()
+        chat_id = str(query_chat_id or "").strip()
+        query_message = getattr(query, "message", None)
+        message_id = str(getattr(query_message, "message_id", "") or "").strip()
+        thread_id = (
+            str(query_thread_id)
+            if query_thread_id is not None and str(query_thread_id).strip()
+            else None
+        )
+        if not caller_id or not chat_id or not message_id:
+            await query.answer(text="Feedback invalid sau expirat.")
+            await self._edit_routine_feedback_markup(query, None)
+            return
+
+        if not self._is_callback_user_authorized(
+            caller_id,
+            chat_id=chat_id,
+            chat_type=str(query_chat_type) if query_chat_type is not None else None,
+            thread_id=thread_id,
+            user_name=query_user_name,
+        ):
+            await query.answer(text="⛔ Nu ești autorizat să trimiți acest feedback.")
+            return
+
+        try:
+            saved = await self._record_routine_feedback(
+                feedback_token,
+                vote=vote,
+                telegram_user_id=caller_id,
+                chat_id=chat_id,
+                message_id=message_id,
+                thread_id=thread_id,
+                reason=reason,
+            )
+        except Exception:
+            logger.warning(
+                "[%s] Failed to persist routine feedback token=%s",
+                self.name,
+                feedback_token,
+                exc_info=True,
+            )
+            await query.answer(
+                text="Nu am putut salva feedbackul. Încearcă din nou."
+            )
+            return
+
+        if not saved:
+            await query.answer(text="Feedbackul a expirat.")
+            await self._edit_routine_feedback_markup(query, None)
+            return
+
+        normalized_chat_type = str(query_chat_type or "").split(".")[-1].lower()
+        is_dm = normalized_chat_type in {"dm", "private"}
+        if reason is not None:
+            await query.answer(text="Mulțumesc, am salvat motivul.")
+            if is_dm:
+                await self._edit_routine_feedback_markup(query, None)
+            return
+
+        if vote < 0 and is_dm:
+            await query.answer(text="Mulțumesc. Ce nu te-a ajutat?")
+            await self._edit_routine_feedback_markup(
+                query,
+                build_routine_feedback_reason_keyboard(feedback_token),
+            )
+            return
+
+        await query.answer(text="Mulțumesc pentru feedback.")
+        if is_dm:
+            await self._edit_routine_feedback_markup(query, None)
 
     def _is_callback_user_authorized(
         self,
@@ -2261,6 +2516,7 @@ class TelegramAdapter(BasePlatformAdapter):
         content: str,
         reply_to: Optional[str],
         metadata: Optional[Dict[str, Any]],
+        feedback_markup=None,
     ) -> Optional[SendResult]:
         """Attempt a single ``sendRichMessage`` send.
 
@@ -2291,6 +2547,25 @@ class TelegramAdapter(BasePlatformAdapter):
             # params are silently ignored by the Bot API, so the scalar would
             # quietly drop the reply anchor instead of erroring.
             payload["reply_parameters"] = {"message_id": reply_to_id}
+        if feedback_markup is not None:
+            to_dict = getattr(feedback_markup, "to_dict", None)
+            if callable(to_dict):
+                payload["reply_markup"] = to_dict()
+            else:
+                # Lightweight test doubles may not implement TelegramObject's
+                # to_dict(). Keep the raw API payload JSON-compatible.
+                payload["reply_markup"] = {
+                    "inline_keyboard": [
+                        [
+                            {
+                                "text": button.text,
+                                "callback_data": button.callback_data,
+                            }
+                            for button in row
+                        ]
+                        for row in feedback_markup.inline_keyboard
+                    ]
+                }
 
         try:
             # Take the raw Bot API result (dict under real PTB). Passing
@@ -5401,6 +5676,21 @@ class TelegramAdapter(BasePlatformAdapter):
         # Skip whitespace-only text to prevent Telegram 400 empty-text errors.
         if not content or not content.strip():
             return SendResult(success=True, message_id=None)
+
+        feedback_markup = None
+        feedback_token = (metadata or {}).get("routine_feedback_token")
+        if feedback_token is not None:
+            try:
+                feedback_markup = build_routine_feedback_keyboard(feedback_token)
+            except Exception:
+                # Delivery remains more important than the optional feedback
+                # controls. Invalid integration metadata is logged and the
+                # routine still reaches the user without a keyboard.
+                logger.warning(
+                    "[%s] Ignoring invalid routine_feedback_token",
+                    self.name,
+                    exc_info=True,
+                )
         
         try:
             # Bot API 10.1 rich fast-path: send the raw agent markdown via
@@ -5409,7 +5699,13 @@ class TelegramAdapter(BasePlatformAdapter):
             # errors or DM-topic routing skips; returns directly on success or
             # on a transient failure (which must NOT be legacy-resent).
             if self._should_attempt_rich(content, metadata=metadata):
-                rich_result = await self._try_send_rich(chat_id, content, reply_to, metadata)
+                rich_result = await self._try_send_rich(
+                    chat_id,
+                    content,
+                    reply_to,
+                    metadata,
+                    feedback_markup=feedback_markup,
+                )
                 if rich_result is not None:
                     if rich_result.success:
                         # Re-trigger typing like the legacy success path does,
@@ -5469,6 +5765,11 @@ class TelegramAdapter(BasePlatformAdapter):
 
             for i, chunk in enumerate(chunks):
                 retried_thread_not_found = False
+                feedback_kwargs = (
+                    {"reply_markup": feedback_markup}
+                    if feedback_markup is not None and i == len(chunks) - 1
+                    else {}
+                )
                 metadata_reply_to = self._metadata_reply_to_message_id(metadata)
                 private_dm_topic_send = self._is_private_dm_topic_send(chat_id, thread_id, metadata)
                 # reply_to_mode="off" on the existing telegram_dm_topic_reply_fallback path
@@ -5523,6 +5824,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                 **thread_kwargs,
                                 **self._link_preview_kwargs(),
                                 **self._notification_kwargs(metadata),
+                                **feedback_kwargs,
                             )
                         except Exception as md_error:
                             # Markdown parsing failed, try plain text
@@ -5537,6 +5839,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                     **thread_kwargs,
                                     **self._link_preview_kwargs(),
                                     **self._notification_kwargs(metadata),
+                                    **feedback_kwargs,
                                 )
                             else:
                                 raise
@@ -5696,12 +5999,24 @@ class TelegramAdapter(BasePlatformAdapter):
 
             result = SendResult(
                 success=True,
-                message_id=message_ids[0] if message_ids else None,
+                # Feedback controls live on the last visible chunk. Return its
+                # id so the delivery ledger links callbacks to the exact
+                # message that Telegram will send back in CallbackQuery.
+                message_id=(
+                    message_ids[-1]
+                    if feedback_markup is not None and message_ids
+                    else (message_ids[0] if message_ids else None)
+                ),
                 raw_response={
                     "message_ids": message_ids,
                     "requested_thread_id": requested_thread_id,
                     "thread_fallback": used_thread_fallback,
                 },
+                continuation_message_ids=(
+                    tuple(message_ids[:-1])
+                    if feedback_markup is not None and len(message_ids) > 1
+                    else ()
+                ),
             )
             return self._record_bot_loop_guard_send(
                 result,
@@ -7318,7 +7633,7 @@ class TelegramAdapter(BasePlatformAdapter):
         query_chat = getattr(query_message, "chat", None)
         query_chat_type = getattr(query_chat, "type", None)
         query_thread_id = getattr(query_message, "message_thread_id", None)
-        query_user_name = getattr(query.from_user, "first_name", None)
+        query_user_name = getattr(getattr(query, "from_user", None), "first_name", None)
 
         # Inline buttons can mutate model, approval, clarify, and session state
         # without passing through message admission. Apply the same strict chat
@@ -7343,6 +7658,18 @@ class TelegramAdapter(BasePlatformAdapter):
             ):
                 await query.answer(text="⛔ This group is not authorized.")
                 return
+
+        # --- Routine-delivery feedback callbacks ---
+        if data.startswith("rf:"):
+            await self._handle_routine_feedback_callback(
+                query,
+                data,
+                query_chat_id=query_chat_id,
+                query_chat_type=query_chat_type,
+                query_thread_id=query_thread_id,
+                query_user_name=query_user_name,
+            )
+            return
 
         # --- Model picker callbacks ---
         if data.startswith(("mp:", "mpg:", "mpv:", "mm:", "mc:", "mb", "mx", "mg:")):
