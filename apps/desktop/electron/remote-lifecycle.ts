@@ -664,17 +664,21 @@ async function cleanupStale(ssh, ownershipId, lock, pidAlive = true) {
       lock.profile
     ))
   ) {
-    try {
-      const result = (
-        await ssh.exec(
-          `kill ${Number(lock.pid)} && ` +
-            `i=0; while kill -0 ${Number(lock.pid)} 2>/dev/null; do ` +
-            `i=$((i+1)); [ "$i" -ge 50 ] && exit 1; sleep 0.1; done`
-        )
-      ).trim()
+    let gracefulResult = ''
 
-      void result
+    try {
+      gracefulResult = String(await ssh.exec(buildOwnedStaleTerminationCommand(lock, ownershipId))).trim()
     } catch {
+      // Preserve the existing best-effort escalation for transport failures.
+    }
+
+    if (gracefulResult === 'REFUSED') {
+      const error: any = new Error('The stale SSH backend process identity changed before termination.')
+      error.kind = 'ownership-changed'
+      throw error
+    }
+
+    if (gracefulResult !== 'TERMINATED' && gracefulResult !== 'ALREADY_STOPPED') {
       // A backend mid-turn (in-flight LLM call, live MCP children) can ride
       // out SIGTERM past the 5s graceful wait — and before-quit races this
       // whole teardown against 6s before closing SSH, so giving up here
@@ -682,11 +686,13 @@ async function cleanupStale(ssh, ownershipId, lock, pidAlive = true) {
       // the quit-during-active-turn path. Escalate to SIGKILL and require a
       // confirmed exit before treating the record as reclaimed.
       try {
-        await ssh.exec(
-          `kill -9 ${Number(lock.pid)} 2>/dev/null; ` +
-            `i=0; while kill -0 ${Number(lock.pid)} 2>/dev/null; do ` +
-            `i=$((i+1)); [ "$i" -ge 20 ] && exit 1; sleep 0.1; done`
-        )
+        const forcedResult = String(
+          await ssh.exec(buildOwnedStaleTerminationCommand(lock, ownershipId, true))
+        ).trim()
+
+        if (forcedResult !== 'TERMINATED' && forcedResult !== 'ALREADY_STOPPED') {
+          throw new Error(`force termination refused: ${forcedResult || 'empty response'}`)
+        }
       } catch (cause) {
         // Even SIGKILL could not confirm death (D-state, permissions). Keep
         // the lockfile so the next connect's reap pass retries.
@@ -733,7 +739,7 @@ async function disconnect(ssh, ownershipId) {
   await cleanupStale(ssh, ownershipId, lock, pidAlive)
 }
 
-function buildOwnedStaleTerminationCommand(lock, ownershipId) {
+function buildOwnedStaleTerminationCommand(lock, ownershipId, force = false) {
   const pid = Number(lock.pid)
   // expandRemotePath() output is already a shell-quoted fragment; embed it
   // raw so $HOME expands at assignment. Double-quoting stores the quote
@@ -744,6 +750,8 @@ function buildOwnedStaleTerminationCommand(lock, ownershipId) {
   const nonce = shq(lock.spawnNonce)
   const profile = shq(lock.profile || '')
   const command = `$(ps -ww -o command= -p ${pid} 2>/dev/null || true)`
+  const signal = force ? '-9 ' : ''
+  const waitIterations = force ? 20 : 50
 
   const executableMatch = lock.hermesHome
     ? `case "$cmd" in *"$path"*|*"$home"*) ;; *) printf REFUSED; exit 0;; esac; `
@@ -751,6 +759,7 @@ function buildOwnedStaleTerminationCommand(lock, ownershipId) {
 
   const identity =
     `cmd=${command}; ` +
+    `[ -n "$cmd" ] || { printf ALREADY_STOPPED; exit 0; }; ` +
     `path=${expectedPath}; home=${expectedHome}; token=${expectedToken}; nonce=${nonce}; profile=${profile}; ` +
     executableMatch +
     `case "$cmd" in *" serve"*|*" serve "*) ;; *) printf REFUSED; exit 0;; esac; ` +
@@ -762,9 +771,10 @@ function buildOwnedStaleTerminationCommand(lock, ownershipId) {
   // signaling in this same shell command; never use the earlier probe's PID
   // verdict as authority for the kill.
   return (
-    `${identity} kill ${pid} && ` +
+    `${identity} kill ${signal}${pid} 2>/dev/null || { ` +
+    `kill -0 ${pid} 2>/dev/null && printf REFUSED || printf ALREADY_STOPPED; exit 0; }; ` +
     `i=0; while kill -0 ${pid} 2>/dev/null; do ` +
-    `i=$((i+1)); [ "$i" -ge 50 ] && printf TIMEOUT && exit 0; sleep 0.1; done; printf TERMINATED`
+    `i=$((i+1)); [ "$i" -ge ${waitIterations} ] && printf TIMEOUT && exit 0; sleep 0.1; done; printf TERMINATED`
   )
 }
 

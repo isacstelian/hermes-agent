@@ -101,16 +101,16 @@ function fakeSsh(rules: any[] = []) {
       const mutexWrapped = cmd.includes('fcntl.flock(fd,fcntl.LOCK_EX)')
 
       const applicableRules = rules.filter(([matcher]) => {
-        if (cmd.includes('marker_clear()') && matcher instanceof RegExp && /kill -0/.test(matcher.source)) {
+        if (
+          (cmd.includes('marker_clear()') || cmd.includes('cmd=$(ps -ww -o command=')) &&
+          matcher instanceof RegExp &&
+          /kill -0/.test(matcher.source)
+        ) {
           return false
         }
 
         return !(mutexWrapped && matcher instanceof RegExp && /python3 -c/.test(matcher.source))
       })
-
-      if ((cmd.includes('os.kill(pid') && !cmd.includes('pidfd_open')) || cmd.includes('printf TERMINATED')) {
-        return 'TERMINATED'
-      }
 
       for (const [matcher, resp] of applicableRules) {
         const hit = typeof matcher === 'function' ? matcher(cmd) : matcher.test(cmd)
@@ -124,6 +124,10 @@ function fakeSsh(rules: any[] = []) {
 
           return out
         }
+      }
+
+      if ((cmd.includes('os.kill(pid') && !cmd.includes('pidfd_open')) || cmd.includes('printf TERMINATED')) {
+        return 'TERMINATED'
       }
 
       return ''
@@ -1809,7 +1813,7 @@ test('cleanupStale escalates to SIGKILL when the backend survives the graceful w
   // graceful-wait failure must escalate to SIGKILL and still drop the lock.
   const ssh = fakeSsh([
     [/print\("OWNED"/, 'OWNED\n'],
-    [(cmd: string) => /kill 9 &&/.test(cmd), new Error('exit 1: pid alive after graceful wait')]
+    [(cmd: string) => /kill 9\b/.test(cmd) && !/kill -9 9\b/.test(cmd), 'TIMEOUT\n']
   ])
 
   await cleanupStale(ssh, OWNERSHIP_ID, {
@@ -1832,8 +1836,8 @@ test('cleanupStale escalates to SIGKILL when the backend survives the graceful w
 test('cleanupStale keeps the lockfile when even SIGKILL cannot confirm the pid died', async () => {
   const ssh = fakeSsh([
     [/print\("OWNED"/, 'OWNED\n'],
-    [(cmd: string) => /kill 9 &&/.test(cmd), new Error('exit 1: pid alive after graceful wait')],
-    [(cmd: string) => /kill -9 9\b/.test(cmd), new Error('exit 1: unkillable (D-state)')]
+    [(cmd: string) => /kill 9\b/.test(cmd) && !/kill -9 9\b/.test(cmd), 'TIMEOUT\n'],
+    [(cmd: string) => /kill -9 9\b/.test(cmd), 'REFUSED\n']
   ])
 
   await assert.rejects(
@@ -1848,4 +1852,27 @@ test('cleanupStale keeps the lockfile when even SIGKILL cannot confirm the pid d
 
   // The record must survive so the next connect's reap pass retries.
   assert.ok(!ssh.calls.some(c => /rm -f .*backend\.lock\.json/.test(c)))
+})
+
+test('cleanupStale refuses a recycled pid at the signal boundary', async () => {
+  const ssh = fakeSsh([
+    [/print\("OWNED"/, 'OWNED\n'],
+    [(cmd: string) => /cmd=\$\(ps .*kill 9\b/.test(cmd), 'REFUSED\n']
+  ])
+
+  await assert.rejects(
+    cleanupStale(ssh, OWNERSHIP_ID, {
+      pid: 9,
+      spawnNonce: SPAWN_NONCE,
+      hermesPath: '/x/hermes',
+      logPath: spawnLogPath(OWNERSHIP_ID, SPAWN_NONCE)
+    }),
+    /identity changed/
+  )
+
+  const signalCommand = ssh.calls.find(c => /cmd=\$\(ps .*kill 9\b/.test(c)) || ''
+  assert.match(signalCommand, /--ssh-owner-nonce/)
+  assert.match(signalCommand, /--ssh-session-token-file/)
+  assert.ok(!ssh.calls.some(c => /^kill 9\b/.test(c.trim())), 'must not signal from a standalone PID-only command')
+  assert.ok(!ssh.calls.some(c => /rm -f .*backend\.lock\.json/.test(c)), 'must keep ownership evidence for retry')
 })
