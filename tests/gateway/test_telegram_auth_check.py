@@ -370,3 +370,55 @@ def test_multiplex_closure_handler_without_callback_falls_back_to_env(monkeypatc
     assert adapter._is_user_authorized_from_message(
         _make_message(from_user_id=555, chat_id=-100123, chat_type="group")
     ) is False
+
+
+def test_callback_auth_uses_registered_check_inside_anchored_profile(tmp_path):
+    from agent.secret_scope import (
+        current_secret_scope,
+        reset_secret_scope,
+        set_secret_scope,
+    )
+    from hermes_constants import (
+        get_hermes_home,
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+
+    profile_home = tmp_path / "profiles" / "worker"
+    profile_home.mkdir(parents=True)
+    (profile_home / ".env").write_text(
+        "TELEGRAM_ALLOWED_USERS=123\n",
+        encoding="utf-8",
+    )
+    adapter = _make_adapter()
+    adapter._hermes_home = profile_home
+    adapter._message_handler = lambda _event: None
+    observed = []
+
+    def auth_check(user_id, chat_type=None, chat_id=None):
+        scope = current_secret_scope() or {}
+        observed.append((get_hermes_home(), scope, user_id, chat_type, chat_id))
+        return (
+            get_hermes_home() == profile_home
+            and scope.get("TELEGRAM_ALLOWED_USERS") == "123"
+            and user_id == "123"
+        )
+
+    adapter.set_authorization_check(auth_check)
+    ambient_home = tmp_path / "profiles" / "other"
+    home_token = set_hermes_home_override(ambient_home)
+    secret_token = set_secret_scope({"TELEGRAM_ALLOWED_USERS": "999"})
+    try:
+        assert adapter._is_callback_user_authorized(
+            "123",
+            chat_id="-100123",
+            chat_type="group",
+            thread_id="9",
+        ) is True
+        assert get_hermes_home() == ambient_home
+        assert current_secret_scope() == {"TELEGRAM_ALLOWED_USERS": "999"}
+    finally:
+        reset_secret_scope(secret_token)
+        reset_hermes_home_override(home_token)
+
+    assert observed[0][0] == profile_home

@@ -13,7 +13,7 @@ def test_shared_metrics_are_registered_disabled_by_default():
     assert DEFAULT_CONFIG["telemetry"]["shared_metrics"]["enabled"] is False
 
 
-def test_setup_telemetry_enables_shared_metrics(monkeypatch):
+def test_setup_telemetry_enables_shared_metrics(monkeypatch, capsys):
     config = {}
     monkeypatch.setattr(
         "hermes_cli.setup.prompt_yes_no",
@@ -23,6 +23,8 @@ def test_setup_telemetry_enables_shared_metrics(monkeypatch):
     setup_telemetry(config)
 
     assert config["telemetry"]["shared_metrics"]["enabled"] is True
+    assert config["cron"]["feedback"]["enabled"] is True
+    assert "Telegram user ID" in capsys.readouterr().out
 
 
 def test_setup_parser_accepts_telemetry_section():

@@ -461,6 +461,36 @@ cron:
   wrap_response: false
 ```
 
+### Telegram routine feedback
+
+Hermes can add `👍 Util` and `👎 Nu m-a ajutat` inline buttons to successful,
+non-silent Telegram cron deliveries. These are Telegram inline keyboard
+buttons, not message reactions. In a private chat, a negative vote opens a short
+list of reasons. In groups, Hermes records the vote and keeps the buttons for
+other members.
+
+Feedback is off by default. Enable it through `hermes setup telemetry`, the
+`hermes tools` menu, or `config.yaml`:
+
+```yaml
+cron:
+  feedback:
+    enabled: true
+```
+
+Runs, delivery coordinates, duration, routine definition hash, votes, negative
+reasons, and each voter's numeric Telegram user ID stay in the active profile's
+local `cron/executions.db`. Hermes does not upload this data. Review aggregate
+run counts, runtime, delivery totals, response rate, and recent votes with:
+
+```bash
+hermes cron feedback
+hermes cron feedback <job_id> --limit 50
+```
+
+Feedback collection does not rewrite routine prompts automatically. Use the
+report as evidence for a reviewed improvement loop.
+
 ### Continuable jobs (reply to a cron delivery)
 
 By default a cron delivery is fire-and-forget: the message is sent, but it does

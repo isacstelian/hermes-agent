@@ -181,7 +181,7 @@ class TestLiveAdapterMediaFailuresSurfaced:
 
             t = threading.Thread(target=loop.run_forever, daemon=True)
             t.start()
-            errors = _send_media_via_adapter(
+            errors, _message_id = _send_media_via_adapter(
                 FailingAdapter(), "D01", [(media_file, False)], None, loop, slack_job
             )
             assert errors, (
@@ -208,7 +208,7 @@ class TestLiveAdapterMediaFailuresSurfaced:
 
             t = threading.Thread(target=loop.run_forever, daemon=True)
             t.start()
-            errors = _send_media_via_adapter(
+            errors, _message_id = _send_media_via_adapter(
                 NeverCalledAdapter(), "D01",
                 [("/nonexistent/definitely-missing.pdf", False)],
                 None, loop, slack_job,

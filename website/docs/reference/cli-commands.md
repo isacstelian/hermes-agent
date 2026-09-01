@@ -598,7 +598,7 @@ hermes status [--all] [--deep]
 ## `hermes cron`
 
 ```bash
-hermes cron <list|create|edit|pause|resume|run|remove|status|tick>
+hermes cron <list|create|edit|pause|resume|run|remove|status|runs|feedback|tick>
 ```
 
 | Subcommand | Description |
@@ -611,6 +611,8 @@ hermes cron <list|create|edit|pause|resume|run|remove|status|tick>
 | `run` | Trigger a job on the next scheduler tick. |
 | `remove` | Delete a scheduled job. |
 | `status` | Check whether the cron scheduler is running. |
+| `runs` / `history` | Show durable execution attempts, optionally filtered by job ID. |
+| `feedback` | Show local run counts, runtime, delivery totals, and recent Telegram votes with voter user IDs, optionally filtered by job ID. |
 | `tick` | Run due jobs once and exit. |
 
 The cron **trigger** is pluggable via the `cron.provider` config key. Empty

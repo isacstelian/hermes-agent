@@ -284,6 +284,14 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     cron_runs.add_argument("job_id", nargs="?", help="Optional job ID filter")
     cron_runs.add_argument("--limit", type=int, default=20, help="Rows to show (1-500)")
 
+    cron_feedback = cron_subparsers.add_parser(
+        "feedback", help="Show local routine runs and Telegram feedback"
+    )
+    cron_feedback.add_argument("job_id", nargs="?", help="Optional job ID filter")
+    cron_feedback.add_argument(
+        "--limit", type=int, default=20, help="Recent votes to show (1-500)"
+    )
+
     # cron incidents — durable failure incidents (list/ack)
     cron_incidents = cron_subparsers.add_parser(
         "incidents", help="List or acknowledge durable cron failure incidents"

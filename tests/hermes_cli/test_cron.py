@@ -239,6 +239,54 @@ def test_cron_tick_invokes_scheduler_tick_with_verbose(monkeypatch):
     assert calls == [True]
 
 
+def test_cron_feedback_surfaces_local_aggregates(monkeypatch, capsys):
+    monkeypatch.setattr(
+        "cron.executions.routine_feedback_summary",
+        lambda **_kwargs: [
+            {
+                "job_id": "daily-brief",
+                "job_name": "Daily brief",
+                "runs": 4,
+                "completed_runs": 3,
+                "failed_runs": 1,
+                "deliveries": 4,
+                "delivered_deliveries": 3,
+                "failed_deliveries": 1,
+                "pending_deliveries": 0,
+                "total_duration_ms": 12000,
+                "average_duration_ms": 3000,
+                "votes": 2,
+                "positive_votes": 1,
+                "negative_votes": 1,
+                "rated_deliveries": 2,
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        "cron.executions.list_routine_feedback",
+        lambda **_kwargs: [
+            {
+                "updated_at": "2026-09-01T09:00:00+00:00",
+                "vote": -1,
+                "reason": "too_long",
+                "job_id": "daily-brief",
+                "execution_id": "execution-1",
+                "telegram_user_id": "42",
+            }
+        ],
+    )
+
+    cron_cli.cron_feedback()
+
+    out = capsys.readouterr().out
+    assert "Runs: 4" in out
+    assert "Deliveries: 4" in out
+    assert "Runtime: total=12.0s" in out
+    assert "response=67%" in out
+    assert "not-useful" in out
+    assert "reason=too_long" in out
+
+
 def test_cron_create_failure_returns_nonzero(monkeypatch, capsys):
     monkeypatch.setattr(cron_cli, "_cron_api", lambda **kwargs: {"success": False, "error": "boom"})
 

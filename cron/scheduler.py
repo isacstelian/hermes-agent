@@ -14,6 +14,7 @@ import concurrent.futures
 import contextlib
 import contextvars
 import errno
+import hashlib
 import json
 import logging
 import os
@@ -653,12 +654,139 @@ from cron.jobs import (
     save_job_output,
     use_cron_store,
 )
-from cron.executions import create_execution, finish_execution, mark_execution_running
+from cron.executions import (
+    create_execution,
+    finish_execution,
+    mark_execution_running,
+    record_execution_delivery,
+    update_execution_context,
+)
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
 # locally for audit.
 SILENT_MARKER = "[SILENT]"
+
+_ROUTINE_DEFINITION_RUNTIME_FIELDS = frozenset({
+    "created_at",
+    "drift_alerted",
+    "enabled",
+    "execution_id",
+    "failure_streak",
+    "fire_claim",
+    "last_delivery_error",
+    "last_error",
+    "last_fire_error",
+    "last_output",
+    "last_run_at",
+    "last_status",
+    "manual_run_at",
+    "manual_run_prompt",
+    "monitor_state",
+    "next_run_at",
+    "paused_at",
+    "paused_reason",
+    "preflight_alerted",
+    "run_claim",
+    "state",
+})
+
+
+def _routine_definition_hash(job: dict) -> str:
+    """Hash the durable routine definition without per-run scheduler state."""
+    definition = {
+        key: value
+        for key, value in job.items()
+        if key not in _ROUTINE_DEFINITION_RUNTIME_FIELDS and key != "id"
+    }
+    repeat = definition.get("repeat")
+    if isinstance(repeat, dict):
+        definition["repeat"] = {
+            key: value for key, value in repeat.items() if key != "completed"
+        }
+    payload = json.dumps(
+        definition,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(payload).hexdigest()
+
+
+def _cron_feedback_enabled(config: Optional[dict] = None) -> bool:
+    """Return True only for the explicit ``cron.feedback.enabled: true`` opt-in."""
+    try:
+        user_config = load_config() if config is None else config
+        cron_config = user_config.get("cron", {}) if isinstance(user_config, dict) else {}
+        feedback_config = (
+            cron_config.get("feedback", {}) if isinstance(cron_config, dict) else {}
+        )
+        return (
+            isinstance(feedback_config, dict)
+            and feedback_config.get("enabled") is True
+        )
+    except Exception:
+        return False
+
+
+def _start_routine_feedback_delivery(
+    execution_id: Optional[str],
+    *,
+    platform_name: str,
+    chat_id: Any,
+) -> Optional[str]:
+    """Create a pending Telegram receipt without risking the actual delivery."""
+    if not execution_id or str(platform_name).lower() != "telegram":
+        return None
+    try:
+        receipt = record_execution_delivery(
+            execution_id,
+            platform="telegram",
+            chat_id=chat_id,
+            status="pending",
+        )
+        return receipt["id"]
+    except Exception:
+        logger.warning(
+            "Could not create routine feedback receipt for execution %s",
+            execution_id,
+            exc_info=True,
+        )
+        return None
+
+
+def _finish_routine_feedback_delivery(
+    execution_id: Optional[str],
+    feedback_token: Optional[str],
+    *,
+    chat_id: Any,
+    thread_id: Any = None,
+    message_id: Any = None,
+    status: str,
+    error: Optional[str] = None,
+) -> None:
+    """Best-effort finalization for one pending Telegram feedback receipt."""
+    if not execution_id or not feedback_token:
+        return
+    try:
+        record_execution_delivery(
+            execution_id,
+            delivery_id=feedback_token,
+            platform="telegram",
+            chat_id=chat_id,
+            thread_id=thread_id,
+            message_id=message_id,
+            status=status,
+            error=error,
+        )
+    except Exception:
+        logger.warning(
+            "Could not finalize routine feedback receipt %s as %s",
+            feedback_token,
+            status,
+            exc_info=True,
+        )
 
 # Canonical silence tokens recognized in cron output.  Cron's contract is
 # intentionally looser than the gateway's exact-whole-response rule: the cron
@@ -2905,24 +3033,23 @@ def _send_media_via_adapter(
     loop,
     job: dict,
     platform=None,
-) -> list:
+    feedback_token: Optional[str] = None,
+) -> tuple[list, Optional[str]]:
     """Send extracted MEDIA files as native platform attachments via a live adapter.
 
     Routes each file to the appropriate adapter method (send_voice, send_image_file,
     send_video, send_document) based on file extension — mirroring the routing logic
     in ``BasePlatformAdapter._process_message_background``.
 
-    Returns a list of per-file error strings (empty when every attachment
-    delivered). Callers surface these into the job's delivery errors so a
-    dropped attachment is visible in ``last_error``/run status instead of
-    only in the gateway log (the silent-drop half of the manual-run
-    attachment bug: text delivered, file vanished, job marked ok).
+    Returns per-file errors plus the message id of the media carrying feedback
+    controls. The token is attached only to the last eligible attachment.
     """
     from pathlib import Path
 
     from gateway.platforms.base import BasePlatformAdapter, should_send_media_as_audio
 
     errors: list = []
+    feedback_message_id: Optional[str] = None
     requested = [(str(p), v) for p, v in (media_files or [])]
     media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
     # Report paths the safety filter dropped: the model referenced them in
@@ -2940,18 +3067,25 @@ def _send_media_via_adapter(
         except Exception:
             errors.append(f"attachment dropped by media path policy: {raw_path}")
 
-    for media_path, _is_voice in media_files:
+    for media_index, (media_path, _is_voice) in enumerate(media_files):
         try:
             ext = Path(media_path).suffix.lower()
             route_platform = platform if platform is not None else getattr(adapter, "platform", None)
+            send_metadata = metadata
+            carries_feedback = (
+                feedback_token is not None and media_index == len(media_files) - 1
+            )
+            if carries_feedback:
+                send_metadata = dict(metadata or {})
+                send_metadata["routine_feedback_token"] = feedback_token
             if should_send_media_as_audio(route_platform, ext, is_voice=_is_voice):
-                coro = adapter.send_voice(chat_id=chat_id, audio_path=media_path, metadata=metadata)
+                coro = adapter.send_voice(chat_id=chat_id, audio_path=media_path, metadata=send_metadata)
             elif ext in _VIDEO_EXTS:
-                coro = adapter.send_video(chat_id=chat_id, video_path=media_path, metadata=metadata)
+                coro = adapter.send_video(chat_id=chat_id, video_path=media_path, metadata=send_metadata)
             elif ext in _IMAGE_EXTS:
-                coro = adapter.send_image_file(chat_id=chat_id, image_path=media_path, metadata=metadata)
+                coro = adapter.send_image_file(chat_id=chat_id, image_path=media_path, metadata=send_metadata)
             else:
-                coro = adapter.send_document(chat_id=chat_id, file_path=media_path, metadata=metadata)
+                coro = adapter.send_document(chat_id=chat_id, file_path=media_path, metadata=send_metadata)
 
             from agent.async_utils import safe_schedule_threadsafe
             future = safe_schedule_threadsafe(coro, loop)
@@ -2959,7 +3093,7 @@ def _send_media_via_adapter(
                 msg = f"cannot send media {media_path}: gateway loop unavailable"
                 logger.warning("Job '%s': %s", job.get("id", "?"), msg)
                 errors.append(msg)
-                return errors
+                return errors, feedback_message_id
             try:
                 # Large attachments (long TTS audio, concatenated recordings,
                 # big exports) can legitimately exceed a fixed 30s upload
@@ -2977,6 +3111,8 @@ def _send_media_via_adapter(
                 )
                 logger.warning("Job '%s': %s", job.get("id", "?"), msg)
                 errors.append(msg)
+            elif carries_feedback:
+                feedback_message_id = getattr(result, "message_id", None)
         except Exception as e:
             # Argument-less exceptions (notably TimeoutError, the most likely
             # failure on this path) have an empty str(), which would render
@@ -2986,7 +3122,7 @@ def _send_media_via_adapter(
             )
             logger.warning("Job '%s': %s", job.get("id", "?"), msg)
             errors.append(msg)
-    return errors
+    return errors, feedback_message_id
 
 
 def _confirm_adapter_delivery(send_result) -> bool:
@@ -3066,7 +3202,14 @@ def _is_channel_dm_topic(
     return is_channel
 
 
-def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
+def _deliver_result(
+    job: dict,
+    content: str,
+    adapters=None,
+    loop=None,
+    *,
+    feedback_execution_id: Optional[str] = None,
+) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
 
@@ -3328,6 +3471,17 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         )
         delivered = False
         target_errors = []
+        feedback_token = None
+
+        def _fail_feedback_receipt(detail: str) -> None:
+            _finish_routine_feedback_delivery(
+                feedback_execution_id,
+                feedback_token,
+                chat_id=chat_id,
+                thread_id=thread_id,
+                status="failed",
+                error=detail,
+            )
 
         # Continuable cron surface (D1/D2/D6): resolve the delivery surface for
         # this platform generically from its config ``extra``. Default "thread"
@@ -3454,6 +3608,13 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 thread_id = new_thread_id
                 opened_thread_id = new_thread_id
 
+        if cleaned_delivery_content.strip() or media_files:
+            feedback_token = _start_routine_feedback_delivery(
+                feedback_execution_id,
+                platform_name=platform_name,
+                chat_id=chat_id,
+            )
+
         if live_adapter_ready:
             # Telegram topic routing (#22773, regression fixed #52060): a
             # ``telegram:<positive_chat_id>:<numeric_thread_id>`` cron target is
@@ -3522,6 +3683,8 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 route_metadata.setdefault("scope_id", str(origin["scope_id"]))
                 media_metadata = dict(media_metadata or {})
                 media_metadata.setdefault("scope_id", str(origin["scope_id"]))
+            if feedback_token and not media_files:
+                route_metadata["routine_feedback_token"] = feedback_token
 
             try:
                 # Send cleaned text (MEDIA tags stripped) — not the raw content.
@@ -3535,6 +3698,9 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 adapter_ok = True
                 timed_out = False
                 delivered_message_id = None
+                feedback_message_id = None
+                _media_errors = []
+                send_raw_response = None
                 if text_to_send:
                     from agent.async_utils import safe_schedule_threadsafe
 
@@ -3661,6 +3827,8 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                                     )
                                 target_errors.append(msg)
                                 adapter_ok = False  # fall through to standalone path
+                            elif feedback_token and not media_files:
+                                feedback_message_id = delivered_message_id
                             elif (
                                 send_raw_response
                                 and thread_id
@@ -3693,7 +3861,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                                 routed_media_metadata["user_id"] = logical_home.user_id
                             if logical_home.scope_id:
                                 routed_media_metadata["scope_id"] = logical_home.scope_id
-                    _media_errors = _send_media_via_adapter(
+                    _media_errors, media_feedback_message_id = _send_media_via_adapter(
                         runtime_adapter,
                         chat_id,
                         media_files,
@@ -3701,7 +3869,10 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                         loop,
                         job,
                         platform=platform,
+                        feedback_token=feedback_token,
                     )
+                    if media_feedback_message_id is not None:
+                        feedback_message_id = media_feedback_message_id
                     # Surface per-file failures into the run status (parity
                     # with the standalone lane): text delivered but an
                     # attachment didn't is a visible partial failure, not ok.
@@ -3717,6 +3888,46 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     delivery_errors.append(msg)
 
                 if adapter_ok:
+                    if feedback_token and feedback_message_id is not None:
+                        actual_thread_id = (
+                            None
+                            if isinstance(send_raw_response, dict)
+                            and send_raw_response.get("thread_fallback")
+                            else thread_id
+                        )
+                        _finish_routine_feedback_delivery(
+                            feedback_execution_id,
+                            feedback_token,
+                            chat_id=chat_id,
+                            thread_id=actual_thread_id,
+                            message_id=feedback_message_id,
+                            status="delivered",
+                        )
+                    elif feedback_token and timed_out and not media_files:
+                        _finish_routine_feedback_delivery(
+                            feedback_execution_id,
+                            feedback_token,
+                            chat_id=chat_id,
+                            thread_id=thread_id,
+                            status="pending",
+                            error="Live Telegram send confirmation timed out",
+                        )
+                    elif feedback_token:
+                        _finish_routine_feedback_delivery(
+                            feedback_execution_id,
+                            feedback_token,
+                            chat_id=chat_id,
+                            thread_id=thread_id,
+                            status="failed",
+                            error=(
+                                "; ".join(_media_errors)
+                                or (
+                                    "Telegram media feedback message was not sent"
+                                    if media_files
+                                    else "Telegram send returned no feedback message_id"
+                                )
+                            ),
+                        )
                     logger.info("Job '%s': delivered to %s:%s via live adapter", job["id"], platform_name, chat_id)
                     delivered = True
                     # Seed the thread session only now that delivery into it
@@ -3817,6 +4028,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     target_errors.append(
                         f"relay delivery to {platform_name}:{chat_id} failed"
                     )
+                _fail_feedback_receipt("; ".join(target_errors))
                 delivery_errors.extend(target_errors)
                 continue
             # If the interpreter is finalizing (gateway SIGTERM / restart /
@@ -3829,10 +4041,30 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 msg = f"delivery to {platform_name}:{chat_id} skipped — interpreter is shutting down"
                 logger.warning("Job '%s': %s", job["id"], msg)
                 target_errors.append(msg)
+                _fail_feedback_receipt(msg)
                 delivery_errors.extend(target_errors)
                 continue
+            if feedback_token is None and (cleaned_delivery_content.strip() or media_files):
+                feedback_token = _start_routine_feedback_delivery(
+                    feedback_execution_id,
+                    platform_name=platform_name,
+                    chat_id=chat_id,
+                )
+            send_args = (
+                {"routine_feedback_token": feedback_token}
+                if feedback_token
+                else None
+            )
             # Standalone path: run the async send in a fresh event loop (safe from any thread)
-            coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files)
+            coro = _send_to_platform(
+                platform,
+                pconfig,
+                chat_id,
+                cleaned_delivery_content,
+                thread_id=thread_id,
+                media_files=media_files,
+                args=send_args,
+            )
             try:
                 result = asyncio.run(coro)
             except RuntimeError as run_err:
@@ -3848,6 +4080,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     msg = f"delivery to {platform_name}:{chat_id} skipped — interpreter is shutting down"
                     logger.warning("Job '%s': %s", job["id"], msg)
                     target_errors.append(msg)
+                    _fail_feedback_receipt(msg)
                     delivery_errors.extend(target_errors)
                     continue
                 # The thread-pool fallback can itself raise (SMTP ConnectionError,
@@ -3861,7 +4094,18 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 try:
                     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
                     try:
-                        future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files))
+                        future = pool.submit(
+                            asyncio.run,
+                            _send_to_platform(
+                                platform,
+                                pconfig,
+                                chat_id,
+                                cleaned_delivery_content,
+                                thread_id=thread_id,
+                                media_files=media_files,
+                                args=send_args,
+                            ),
+                        )
                         result = future.result(timeout=30)
                     finally:
                         pool.shutdown(wait=False)
@@ -3872,17 +4116,20 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                         msg = f"delivery to {platform_name}:{chat_id} skipped — interpreter is shutting down"
                         logger.warning("Job '%s': %s", job["id"], msg)
                         target_errors.append(msg)
+                        _fail_feedback_receipt(msg)
                         delivery_errors.extend(target_errors)
                         continue
                     msg = f"delivery to {platform_name}:{chat_id} failed: {e}"
                     logger.error("Job '%s': %s", job["id"], msg, exc_info=True)
                     target_errors.extend([msg])
+                    _fail_feedback_receipt(msg)
                     delivery_errors.extend(target_errors)
                     continue
             except Exception as e:
                 msg = f"delivery to {platform_name}:{chat_id} failed: {e}"
                 logger.error("Job '%s': %s", job["id"], msg, exc_info=True)
                 target_errors.extend([msg])
+                _fail_feedback_receipt(msg)
                 delivery_errors.extend(target_errors)
                 continue
 
@@ -3894,6 +4141,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 msg = f"delivery error: {result['error']} (target {platform_name}:{chat_id})"
                 logger.error("Job '%s': %s", job["id"], msg)
                 target_errors.extend([msg])
+                _fail_feedback_receipt(msg)
                 delivery_errors.extend(target_errors)
                 continue
 
@@ -3910,6 +4158,29 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 logger.error("Job '%s': %s", job["id"], msg)
                 delivery_errors.append(msg)
 
+            if feedback_token and isinstance(result, dict):
+                feedback_message_id = result.get("feedback_message_id")
+                if feedback_message_id:
+                    _finish_routine_feedback_delivery(
+                        feedback_execution_id,
+                        feedback_token,
+                        chat_id=chat_id,
+                        thread_id=result.get("thread_id", thread_id),
+                        message_id=feedback_message_id,
+                        status="delivered",
+                    )
+                else:
+                    _finish_routine_feedback_delivery(
+                        feedback_execution_id,
+                        feedback_token,
+                        chat_id=chat_id,
+                        thread_id=result.get("thread_id", thread_id),
+                        status="failed",
+                        error=(
+                            "; ".join(str(w) for w in _sender_warnings)
+                            or "Telegram send returned no feedback message_id"
+                        ),
+                    )
             logger.info("Job '%s': delivered to %s:%s", job["id"], platform_name, chat_id)
             _maybe_mirror_cron_delivery(
                 job, platform_name, chat_id, mirror_text,
@@ -7150,6 +7421,18 @@ def _run_one_job_body(
     execution_id = job.get("execution_id")
     if not execution_id:
         execution_id = create_execution(job["id"], source="direct")["id"]
+    try:
+        update_execution_context(
+            execution_id,
+            job_name=job.get("name") or job["id"],
+            definition_hash=_routine_definition_hash(job),
+        )
+    except Exception:
+        logger.warning(
+            "Could not attach routine definition metadata to execution %s",
+            execution_id,
+            exc_info=True,
+        )
     delivery_attempted = False
     delivery_error = None
     # Durable failure-incident bookkeeping for this run (see cron.incidents):
@@ -7402,11 +7685,16 @@ def _run_one_job_body(
                         if not owns_delivery:
                             raise _FireClaimLostDuringSideEffect
                         delivery_attempted = True
+                        delivery_kwargs = {
+                            "adapters": adapters,
+                            "loop": loop,
+                        }
+                        if success and _cron_feedback_enabled():
+                            delivery_kwargs["feedback_execution_id"] = execution_id
                         delivery_error = _deliver_result(
                             job,
                             deliver_content,
-                            adapters=adapters,
-                            loop=loop,
+                            **delivery_kwargs,
                         )
                 except Exception as de:
                     if isinstance(de, _FireClaimLostDuringSideEffect):
@@ -7455,6 +7743,20 @@ def _run_one_job_body(
             success = False
             error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
+        normalized_deliver = _normalize_deliver_value(job.get("deliver", "local"))
+        if delivery_error:
+            delivery_outcome = "failed"
+        elif should_deliver and unresolved_origin:
+            delivery_outcome = "not_configured"
+        elif should_deliver and normalized_deliver != "local":
+            delivery_outcome = "delivered"
+        elif incident_acked and not success:
+            # The operator acknowledged this exact failure signature, so the
+            # failure ping was intentionally withheld.
+            delivery_outcome = "suppressed_acked"
+        else:
+            delivery_outcome = "suppressed"
+
         interrupted = _consume_interrupted_flag(job["id"], execution_token)
         if interrupted:
             if delivery_error:
@@ -7478,6 +7780,8 @@ def _run_one_job_body(
                 execution_id,
                 success=False,
                 error="Interrupted by gateway shutdown before terminal completion.",
+                delivery_outcome=delivery_outcome,
+                delivery_error=delivery_error,
             )
             return True
 
@@ -7494,20 +7798,6 @@ def _run_one_job_body(
                 error="Fire claim ownership lost before terminal completion.",
             )
             return True
-        normalized_deliver = _normalize_deliver_value(job.get("deliver", "local"))
-        if delivery_error:
-            delivery_outcome = "failed"
-        elif should_deliver and unresolved_origin:
-            delivery_outcome = "not_configured"
-        elif should_deliver and normalized_deliver != "local":
-            delivery_outcome = "delivered"
-        elif incident_acked and not success:
-            # Distinct from plain "suppressed" (silence marker / local jobs):
-            # the failure ping was withheld because the operator acked this
-            # exact signature via `hermes cron incidents ack`.
-            delivery_outcome = "suppressed_acked"
-        else:
-            delivery_outcome = "suppressed"
         if delivery_outcome in ("delivered", "not_configured") and not success:
             # The failure ping left the process (or was composed for a
             # configured target) — record it on the incident so the CLI
@@ -7518,6 +7808,7 @@ def _run_one_job_body(
             success=success,
             error=error,
             delivery_outcome=delivery_outcome,
+            delivery_error=delivery_error,
         )
         return True
 
@@ -7608,6 +7899,7 @@ def _run_one_job_body(
                 success=False,
                 error=_err_text,
                 delivery_outcome=delivery_outcome,
+                delivery_error=delivery_error,
             )
         except Exception as record_err:
             logger.error(

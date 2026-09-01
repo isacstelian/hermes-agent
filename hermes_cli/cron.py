@@ -274,6 +274,68 @@ def cron_runs(job_id: Optional[str] = None, limit: int = 20):
             print(f"    {record['error']}")
 
 
+def _format_duration(duration_ms: Optional[int]) -> str:
+    if duration_ms is None:
+        return "n/a"
+    seconds = max(0, int(duration_ms)) / 1000
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    if seconds < 3600:
+        return f"{seconds / 60:.1f}m"
+    return f"{seconds / 3600:.1f}h"
+
+
+def cron_feedback(job_id: Optional[str] = None, limit: int = 20) -> None:
+    """Show local routine execution and Telegram feedback aggregates."""
+    from cron.executions import list_routine_feedback, routine_feedback_summary
+
+    summaries = routine_feedback_summary(job_id=job_id)
+    if not summaries:
+        print("No cron execution feedback recorded.")
+        return
+
+    print()
+    print(color("Routine feedback", Colors.CYAN, Colors.BOLD))
+    print()
+    for row in summaries:
+        name = row.get("job_name") or row["job_id"]
+        delivered = int(row.get("delivered_deliveries") or 0)
+        rated = int(row.get("rated_deliveries") or 0)
+        rate = f"{rated / delivered:.0%}" if delivered else "n/a"
+        print(f"  {color(str(name), Colors.BOLD)}  {color(row['job_id'], Colors.DIM)}")
+        print(
+            f"    Runs: {row['runs']}  completed={row['completed_runs']}  "
+            f"failed={row['failed_runs']}"
+        )
+        print(
+            f"    Deliveries: {row['deliveries']}  delivered={delivered}  "
+            f"failed={row['failed_deliveries']}  pending={row['pending_deliveries']}"
+        )
+        print(
+            f"    Runtime: total={_format_duration(row.get('total_duration_ms'))}  "
+            f"average={_format_duration(row.get('average_duration_ms'))}"
+        )
+        print(
+            f"    Feedback: {row['votes']}  useful={row['positive_votes']}  "
+            f"not-useful={row['negative_votes']}  response={rate}"
+        )
+        print()
+
+    feedback_rows = list_routine_feedback(job_id=job_id, limit=limit)
+    if not feedback_rows:
+        print(color("  No votes yet.", Colors.DIM))
+        return
+
+    print(color("  Recent votes", Colors.CYAN))
+    for row in feedback_rows:
+        vote = "useful" if row["vote"] == 1 else "not-useful"
+        reason = f"  reason={row['reason']}" if row.get("reason") else ""
+        print(
+            f"    {row['updated_at']}  {vote}  job={row['job_id']}  "
+            f"run={row['execution_id']}  user={row['telegram_user_id']}{reason}"
+        )
+
+
 _INCIDENT_STATE_COLORS = {
     "detected": Colors.RED,
     "alerted": Colors.YELLOW,
@@ -814,6 +876,10 @@ def cron_command(args):
         cron_runs(getattr(args, "job_id", None), getattr(args, "limit", 20))
         return 0
 
+    if subcmd == "feedback":
+        cron_feedback(getattr(args, "job_id", None), getattr(args, "limit", 20))
+        return 0
+
     if subcmd == "incidents":
         return cron_incidents(args)
 
@@ -839,5 +905,5 @@ def cron_command(args):
         return _job_action("remove", args.job_id, "Removed")
 
     print(f"Unknown cron command: {subcmd}")
-    print("Usage: hermes cron [list|create|edit|pause|resume|run|remove|status|runs|tick]")
+    print("Usage: hermes cron [list|create|edit|pause|resume|run|remove|status|runs|feedback|tick]")
     sys.exit(1)

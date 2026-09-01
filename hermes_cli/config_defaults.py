@@ -2647,6 +2647,12 @@ DEFAULT_CONFIG = {
     },
 
     "cron": {
+        # Add native feedback controls to successful Telegram routine
+        # deliveries and persist votes in the profile-local execution ledger.
+        # Off by default because feedback collection is opt-in analytics.
+        "feedback": {
+            "enabled": False,
+        },
         # Allow cron-spawned agents to use the cronjob toolset (create/edit/
         # remove scheduled jobs from within a cron run — the "cron-librarian"
         # pattern). Off by default: the cronjob toolset is policy-denied in

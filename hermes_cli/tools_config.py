@@ -5604,11 +5604,28 @@ def tools_command(args=None, first_install: bool = False, config: dict = None):
                     print(color(f"    ✓ {label}", Colors.GREEN))
             else:
                 print(color("    (none enabled)", Colors.DIM))
+        feedback_enabled = (
+            isinstance(config.get("cron"), dict)
+            and isinstance(config["cron"].get("feedback"), dict)
+            and config["cron"]["feedback"].get("enabled") is True
+        )
+        feedback_status = "enabled" if feedback_enabled else "disabled"
+        print()
+        print(
+            f"  Routine feedback: {feedback_status} "
+            "(stores voter Telegram user IDs locally)"
+        )
         print()
         return
     print(color("⚕ Hermes Tool Configuration", Colors.CYAN, Colors.BOLD))
     print(color("  Enable or disable tools per platform.", Colors.DIM))
     print(color("  Tools that need API keys will be configured when enabled.", Colors.DIM))
+    print(
+        color(
+            "  Routine feedback stores voter Telegram user IDs locally in this profile.",
+            Colors.DIM,
+        )
+    )
     print(color("  Guide: https://hermes-agent.nousresearch.com/docs/user-guide/features/tools", Colors.DIM))
     print()
 
@@ -5700,13 +5717,22 @@ def tools_command(args=None, first_install: bool = False, config: dict = None):
     if _has_mcp:
         platform_choices.append("Configure MCP server tools")
 
+    feedback_enabled = (
+        isinstance(config.get("cron"), dict)
+        and isinstance(config["cron"].get("feedback"), dict)
+        and config["cron"]["feedback"].get("enabled") is True
+    )
+    platform_choices.append(
+        f"Toggle routine feedback ({'enabled' if feedback_enabled else 'disabled'})"
+    )
     platform_choices.append("Done")
 
     # Index offsets for the extra options after per-platform entries
     _global_idx = len(platform_keys) if len(platform_keys) > 1 else -1
     _reconfig_idx = len(platform_keys) + (1 if len(platform_keys) > 1 else 0)
     _mcp_idx = (_reconfig_idx + 1) if _has_mcp else -1
-    _done_idx = _reconfig_idx + (2 if _has_mcp else 1)
+    _feedback_idx = _reconfig_idx + (2 if _has_mcp else 1)
+    _done_idx = _feedback_idx + 1
 
     while True:
         idx = _prompt_choice("Select an option:", platform_choices, default=0)
@@ -5724,6 +5750,27 @@ def tools_command(args=None, first_install: bool = False, config: dict = None):
         # "Configure MCP tools" selected
         if idx == _mcp_idx:
             _configure_mcp_tools_interactive(config)
+            print()
+            continue
+
+        if idx == _feedback_idx:
+            feedback_enabled = not feedback_enabled
+            cron_cfg = config.setdefault("cron", {})
+            if not isinstance(cron_cfg, dict):
+                cron_cfg = {}
+                config["cron"] = cron_cfg
+            feedback_cfg = cron_cfg.setdefault("feedback", {})
+            if not isinstance(feedback_cfg, dict):
+                feedback_cfg = {}
+                cron_cfg["feedback"] = feedback_cfg
+            feedback_cfg["enabled"] = feedback_enabled
+            save_config(config)
+            platform_choices[_feedback_idx] = (
+                "Toggle routine feedback "
+                f"({'enabled' if feedback_enabled else 'disabled'})"
+            )
+            state = "enabled" if feedback_enabled else "disabled"
+            print(color(f"  ✓ Routine feedback {state}", Colors.GREEN))
             print()
             continue
 

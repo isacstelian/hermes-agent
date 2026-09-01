@@ -128,6 +128,7 @@ def test_run_one_job_exception_delivers_failure_alert(monkeypatch):
                 "success": False,
                 "error": "Gemini HTTP 503 (UNAVAILABLE)",
                 "delivery_outcome": "delivered",
+                "delivery_error": None,
             },
         )
     ]
@@ -136,6 +137,7 @@ def test_run_one_job_exception_delivers_failure_alert(monkeypatch):
 def test_run_one_job_exception_records_failure_alert_delivery_error(monkeypatch):
     """A failed fallback alert must populate last_delivery_error."""
     marked = []
+    finished = []
 
     monkeypatch.setattr(
         s, "create_execution", lambda *_a, **_kw: {"id": "exec-j4"}
@@ -153,11 +155,26 @@ def test_run_one_job_exception_records_failure_alert_delivery_error(monkeypatch)
         "mark_job_run",
         lambda *args, **kwargs: marked.append((args, kwargs)),
     )
-    monkeypatch.setattr(s, "finish_execution", lambda *_a, **_kw: None)
+    monkeypatch.setattr(
+        s,
+        "finish_execution",
+        lambda *args, **kwargs: finished.append((args, kwargs)),
+    )
 
     assert s.run_one_job({"id": "j4", "deliver": "telegram"}) is False
     assert marked == [
         (("j4", False, "provider failed"), {"delivery_error": "send failed: 502"})
+    ]
+    assert finished == [
+        (
+            ("exec-j4",),
+            {
+                "success": False,
+                "error": "provider failed",
+                "delivery_outcome": "failed",
+                "delivery_error": "send failed: 502",
+            },
+        )
     ]
 
 
@@ -322,6 +339,7 @@ def test_run_one_job_keyboard_interrupt_skips_delivery_and_reraises(monkeypatch)
                 "success": False,
                 "error": "KeyboardInterrupt",
                 "delivery_outcome": "suppressed",
+                "delivery_error": None,
             },
         )
     ]
@@ -368,5 +386,4 @@ def test_run_one_job_installs_secret_scope_under_multiplex(monkeypatch, tmp_path
     assert scope_during_run["base_url"] == "https://openrouter.ai/api/v1"
     # And it was torn down after run_one_job returned (no leak).
     assert ss.current_secret_scope() is None
-
 
