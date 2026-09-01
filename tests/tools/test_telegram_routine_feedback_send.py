@@ -1,0 +1,133 @@
+"""Standalone Telegram delivery preserves routine feedback controls."""
+
+from __future__ import annotations
+
+import asyncio
+import os
+import sys
+import tempfile
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
+
+from gateway.config import Platform, PlatformConfig
+
+
+def _install_telegram_mock(monkeypatch, bot_factory):
+    parse_mode = SimpleNamespace(MARKDOWN_V2="MarkdownV2", HTML="HTML")
+    constants = SimpleNamespace(ParseMode=parse_mode)
+    telegram = SimpleNamespace(
+        Bot=bot_factory,
+        MessageEntity=lambda **kwargs: SimpleNamespace(**kwargs),
+        constants=constants,
+    )
+    monkeypatch.setitem(sys.modules, "telegram", telegram)
+    monkeypatch.setitem(sys.modules, "telegram.constants", constants)
+
+
+def _disable_proxy(monkeypatch):
+    for name in (
+        "TELEGRAM_PROXY",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+        "NO_PROXY",
+        "no_proxy",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: None)
+    monkeypatch.setattr(
+        "gateway.platforms.base._detect_macos_system_proxy",
+        lambda: None,
+    )
+
+
+def test_send_to_platform_forwards_feedback_token_to_telegram(monkeypatch):
+    from tools import send_message_tool
+
+    send = AsyncMock(return_value={"success": True, "message_id": "1"})
+    monkeypatch.setattr(send_message_tool, "_send_telegram", send)
+
+    result = asyncio.run(
+        send_message_tool._send_to_platform(
+            Platform.TELEGRAM,
+            PlatformConfig(enabled=True, token="token", extra={}),
+            "123",
+            "Raport",
+            args={"routine_feedback_token": "delivery-token"},
+        )
+    )
+
+    assert result["success"] is True
+    assert send.await_args.kwargs["routine_feedback_token"] == "delivery-token"
+
+
+def test_standalone_text_send_attaches_keyboard_and_returns_actual_thread(
+    monkeypatch,
+):
+    from plugins.platforms.telegram import adapter as telegram_adapter
+    from tools.send_message_tool import _send_telegram
+
+    _disable_proxy(monkeypatch)
+    markup = object()
+    monkeypatch.setattr(
+        telegram_adapter,
+        "build_routine_feedback_keyboard",
+        lambda _token: markup,
+    )
+    bot = MagicMock()
+    bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=42))
+    _install_telegram_mock(monkeypatch, MagicMock(return_value=bot))
+
+    result = asyncio.run(
+        _send_telegram(
+            "token",
+            "123",
+            "Raport",
+            thread_id="9",
+            routine_feedback_token="delivery-token",
+        )
+    )
+
+    assert bot.send_message.await_args.kwargs["reply_markup"] is markup
+    assert result["message_id"] == "42"
+    assert result["thread_id"] == "9"
+
+
+def test_standalone_media_only_send_attaches_keyboard_to_the_visible_message(
+    monkeypatch,
+):
+    from plugins.platforms.telegram import adapter as telegram_adapter
+    from tools.send_message_tool import _send_telegram
+
+    _disable_proxy(monkeypatch)
+    markup = object()
+    monkeypatch.setattr(
+        telegram_adapter,
+        "build_routine_feedback_keyboard",
+        lambda _token: markup,
+    )
+    bot = MagicMock()
+    bot.send_photo = AsyncMock(return_value=SimpleNamespace(message_id=77))
+    _install_telegram_mock(monkeypatch, MagicMock(return_value=bot))
+
+    media = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+    media.write(b"image")
+    media.close()
+    try:
+        result = asyncio.run(
+            _send_telegram(
+                "token",
+                "123",
+                "",
+                media_files=[(media.name, False)],
+                routine_feedback_token="delivery-token",
+            )
+        )
+    finally:
+        os.unlink(media.name)
+
+    assert bot.send_photo.await_args.kwargs["reply_markup"] is markup
+    assert result["message_id"] == "77"

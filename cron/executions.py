@@ -577,14 +577,19 @@ def record_execution_feedback(
     thread_key = _optional_text(thread_id)
     with _transaction() as conn:
         delivery = conn.execute(
-            """SELECT id, status, message_id FROM execution_deliveries
-               WHERE id=? AND platform='telegram' AND chat_id=?
-                 AND ((thread_id IS NULL AND ? IS NULL) OR thread_id=?)""",
-            (feedback_token, chat_key, thread_key, thread_key),
+            """SELECT id, status, message_id, thread_id
+               FROM execution_deliveries
+               WHERE id=? AND platform='telegram' AND chat_id=?""",
+            (feedback_token, chat_key),
         ).fetchone()
         if delivery is None:
             return None
         if delivery["status"] == "failed":
+            return None
+        if (
+            delivery["status"] == "delivered"
+            and delivery["thread_id"] != thread_key
+        ):
             return None
         if (
             delivery["message_id"] is not None
@@ -595,9 +600,15 @@ def record_execution_feedback(
             try:
                 conn.execute(
                     """UPDATE execution_deliveries
-                       SET status='delivered', message_id=?, error=NULL, updated_at=?
+                       SET status='delivered', thread_id=?, message_id=?,
+                           error=NULL, updated_at=?
                        WHERE id=? AND status='pending'""",
-                    (message_key, _hermes_now().isoformat(), delivery["id"]),
+                    (
+                        thread_key,
+                        message_key,
+                        _hermes_now().isoformat(),
+                        delivery["id"],
+                    ),
                 )
             except sqlite3.IntegrityError:
                 # Another delivery already owns these Telegram coordinates.

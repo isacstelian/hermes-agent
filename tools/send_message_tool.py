@@ -1065,6 +1065,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             thread_id=thread_id,
             disable_link_previews=disable_link_previews,
             force_document=force_document,
+            routine_feedback_token=(args or {}).get("routine_feedback_token"),
         )
 
     # --- Discord: chunked delivery via the registry's standalone_sender_fn.
@@ -1411,7 +1412,16 @@ def _is_telegram_thread_not_found(error: Exception) -> bool:
     return "thread not found" in str(error).lower()
 
 
-async def _send_telegram(token, chat_id, message, media_files=None, thread_id=None, disable_link_previews=False, force_document=False):
+async def _send_telegram(
+    token,
+    chat_id,
+    message,
+    media_files=None,
+    thread_id=None,
+    disable_link_previews=False,
+    force_document=False,
+    routine_feedback_token=None,
+):
     """Send via Telegram Bot API (one-shot, no polling needed).
 
     Applies markdown→MarkdownV2 formatting (same as the gateway adapter)
@@ -1473,6 +1483,28 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
         # rather than force-int so username home channels don't crash (#13206).
         int_chat_id = normalize_telegram_chat_id(chat_id)
         media_files = media_files or []
+        feedback_markup = None
+        if routine_feedback_token is not None:
+            try:
+                from plugins.platforms.telegram.adapter import (
+                    build_routine_feedback_keyboard,
+                )
+
+                feedback_markup = build_routine_feedback_keyboard(
+                    routine_feedback_token
+                )
+            except Exception:
+                logger.warning(
+                    "Ignoring invalid routine_feedback_token on standalone "
+                    "Telegram delivery",
+                    exc_info=True,
+                )
+        deliverable_media_indexes = {
+            index
+            for index, (media_path, _is_voice) in enumerate(media_files)
+            if os.path.exists(media_path)
+        }
+        last_deliverable_media_index = max(deliverable_media_indexes, default=None)
         thread_kwargs = {}
         if thread_id is not None:
             # Reuse the gateway adapter's General-topic mapping: in Telegram
@@ -1504,6 +1536,7 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
             text_kwargs["disable_web_page_preview"] = True
 
         last_msg = None
+        delivered_thread_id = None
         warnings = []
 
         # MEDIA:<path> caption: when a single captionable file is accompanied
@@ -1522,6 +1555,9 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
         if _cap is not None and _utf16_len(formatted) <= _TELEGRAM_CAPTION_LIMIT:
             _tg_caption = formatted
             formatted = ""  # suppress the separate text send below
+        feedback_on_text = (
+            feedback_markup is not None and not deliverable_media_indexes
+        )
 
         if formatted.strip():
             # Chunk *after* formatting: MarkdownV2/HTML escaping inflates the
@@ -1535,12 +1571,19 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
             text_chunks = BasePlatformAdapter.truncate_message(
                 formatted, 4096, len_fn=utf16_len
             )
-            for chunk in text_chunks:
+            for chunk_index, chunk in enumerate(text_chunks):
+                feedback_kwargs = (
+                    {"reply_markup": feedback_markup}
+                    if feedback_on_text and chunk_index == len(text_chunks) - 1
+                    else {}
+                )
                 try:
                     last_msg = await _send_telegram_message_with_retry(
                         bot,
                         chat_id=int_chat_id, text=chunk,
-                        parse_mode=send_parse_mode, **text_kwargs
+                        parse_mode=send_parse_mode,
+                        **text_kwargs,
+                        **feedback_kwargs,
                     )
                 except Exception as md_error:
                     # Thread not found — retry without message_thread_id so the
@@ -1555,7 +1598,9 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                         last_msg = await _send_telegram_message_with_retry(
                             bot,
                             chat_id=int_chat_id, text=chunk,
-                            parse_mode=send_parse_mode, **text_kwargs
+                            parse_mode=send_parse_mode,
+                            **text_kwargs,
+                            **feedback_kwargs,
                         )
                     elif "parse" in str(md_error).lower() or "markdown" in str(md_error).lower() or "html" in str(md_error).lower():
                         logger.warning(
@@ -1574,12 +1619,15 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                         last_msg = await _send_telegram_message_with_retry(
                             bot,
                             chat_id=int_chat_id, text=plain,
-                            parse_mode=None, **text_kwargs
+                            parse_mode=None,
+                            **text_kwargs,
+                            **feedback_kwargs,
                         )
                     else:
                         raise
+                delivered_thread_id = text_kwargs.get("message_thread_id")
 
-        for media_path, is_voice in media_files:
+        for media_index, (media_path, is_voice) in enumerate(media_files):
             if not os.path.exists(media_path):
                 warning = f"Media file not found, skipping: {media_path}"
                 logger.warning(warning)
@@ -1591,8 +1639,11 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                     try:
                         last_msg = await _send_telegram_message_with_retry(
                             bot, chat_id=int_chat_id, text=_tg_caption,
-                            parse_mode=send_parse_mode, **text_kwargs
+                            parse_mode=send_parse_mode,
+                            **text_kwargs,
+                            **({"reply_markup": feedback_markup} if feedback_on_text else {}),
                         )
+                        delivered_thread_id = text_kwargs.get("message_thread_id")
                         _tg_caption = None  # delivered — don't re-caption a later file
                     except Exception as _cap_err:
                         logger.warning(
@@ -1605,6 +1656,11 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
             try:
                 with open(media_path, "rb") as f:
                     media_kwargs = dict(thread_kwargs)
+                    if (
+                        feedback_markup is not None
+                        and media_index == last_deliverable_media_index
+                    ):
+                        media_kwargs["reply_markup"] = feedback_markup
                     # Attach the MEDIA:<path> caption to the bubble itself for
                     # captionable kinds (photo/video/document). _tg_caption is
                     # only set for a single captionable file, so this never
@@ -1705,6 +1761,7 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                                 )
                         else:
                             raise
+                    delivered_thread_id = media_kwargs.get("message_thread_id")
             except Exception as e:
                 warning = _sanitize_error_text(f"Failed to send media {media_path}: {e}")
                 logger.error(warning)
@@ -1721,6 +1778,11 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
             "platform": "telegram",
             "chat_id": chat_id,
             "message_id": str(last_msg.message_id),
+            "thread_id": (
+                str(delivered_thread_id)
+                if delivered_thread_id is not None
+                else None
+            ),
         }
         if warnings:
             result["warnings"] = warnings

@@ -172,7 +172,6 @@ def test_callback_can_confirm_a_pending_telegram_delivery(monkeypatch, tmp_path)
         execution["id"],
         platform="telegram",
         chat_id="123",
-        thread_id="9",
         status="pending",
     )
 
