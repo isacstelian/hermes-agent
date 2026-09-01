@@ -9,6 +9,8 @@ import tempfile
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
+
 from gateway.config import Platform, PlatformConfig
 
 
@@ -97,8 +99,9 @@ def test_standalone_text_send_attaches_keyboard_and_returns_actual_thread(
     assert result["thread_id"] == "9"
 
 
+@pytest.mark.parametrize("target_thread_id", ["1", None], ids=["explicit", "implicit"])
 def test_general_topic_delivery_and_button_vote_use_the_same_coordinates(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, target_thread_id
 ):
     from cron import executions
     from plugins.platforms.telegram import adapter as telegram_adapter
@@ -114,7 +117,14 @@ def test_general_topic_delivery_and_button_vote_use_the_same_coordinates(
         lambda _token: object(),
     )
     bot = MagicMock()
-    bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=42))
+    bot.send_message = AsyncMock(
+        return_value=SimpleNamespace(
+            message_id=42,
+            message_thread_id=None,
+            is_topic_message=False,
+            chat=SimpleNamespace(type="supergroup", is_forum=True),
+        )
+    )
     _install_telegram_mock(monkeypatch, MagicMock(return_value=bot))
 
     execution = executions.create_execution("general-topic", source="builtin")
@@ -129,7 +139,7 @@ def test_general_topic_delivery_and_button_vote_use_the_same_coordinates(
             "token",
             "-100123",
             "Raport",
-            thread_id="1",
+            thread_id=target_thread_id,
             routine_feedback_token=delivery["id"],
         )
     )
@@ -170,6 +180,23 @@ def test_general_topic_delivery_and_button_vote_use_the_same_coordinates(
     assert "message_thread_id" not in bot.send_message.await_args.kwargs
     assert send_result["thread_id"] == "1"
     assert executions.list_execution_feedback(delivery["id"])[0]["vote"] == 1
+
+
+@pytest.mark.parametrize("chat_type", ["private", "group"])
+def test_implicit_non_forum_delivery_stays_unthreaded(chat_type):
+    from tools.send_message_tool import _telegram_delivery_thread_id
+
+    message = SimpleNamespace(
+        message_thread_id=None,
+        is_topic_message=False,
+        chat=SimpleNamespace(type=chat_type, is_forum=False),
+    )
+
+    assert _telegram_delivery_thread_id(
+        message,
+        requested_thread_id=None,
+        sent_thread_id=None,
+    ) is None
 
 
 def test_standalone_media_only_send_attaches_keyboard_to_the_visible_message(

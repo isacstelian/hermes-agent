@@ -1412,6 +1412,23 @@ def _is_telegram_thread_not_found(error: Exception) -> bool:
     return "thread not found" in str(error).lower()
 
 
+def _telegram_delivery_thread_id(
+    message, *, requested_thread_id=None, sent_thread_id=None
+):
+    """Return the canonical topic coordinate of a delivered Telegram message."""
+    if sent_thread_id is not None:
+        return str(sent_thread_id)
+    try:
+        from plugins.platforms.telegram.adapter import TelegramAdapter
+
+        inferred = TelegramAdapter._effective_message_thread_id(message)
+        if inferred is not None:
+            return inferred
+    except Exception:
+        pass
+    return "1" if str(requested_thread_id) == "1" else None
+
+
 async def _send_telegram(
     token,
     chat_id,
@@ -1528,9 +1545,6 @@ async def _send_telegram(
                 )
             if effective_thread_id is not None:
                 thread_kwargs["message_thread_id"] = effective_thread_id
-        canonical_general_thread_id = (
-            "1" if str(thread_id) == "1" else None
-        )
         # disable_web_page_preview is only valid for send_message, not
         # send_photo/send_video/etc.  Keep it separate so media sends
         # don't inherit an invalid parameter (issue #27012).
@@ -1631,8 +1645,10 @@ async def _send_telegram(
                         raise
                 if feedback_kwargs:
                     feedback_msg = last_msg
-                delivered_thread_id = text_kwargs.get(
-                    "message_thread_id", canonical_general_thread_id
+                delivered_thread_id = _telegram_delivery_thread_id(
+                    last_msg,
+                    requested_thread_id=thread_id,
+                    sent_thread_id=text_kwargs.get("message_thread_id"),
                 )
 
         for media_index, (media_path, is_voice) in enumerate(media_files):
@@ -1653,8 +1669,10 @@ async def _send_telegram(
                         )
                         if feedback_on_text:
                             feedback_msg = last_msg
-                        delivered_thread_id = text_kwargs.get(
-                            "message_thread_id", canonical_general_thread_id
+                        delivered_thread_id = _telegram_delivery_thread_id(
+                            last_msg,
+                            requested_thread_id=thread_id,
+                            sent_thread_id=text_kwargs.get("message_thread_id"),
                         )
                         _tg_caption = None  # delivered — don't re-caption a later file
                     except Exception as _cap_err:
@@ -1776,8 +1794,10 @@ async def _send_telegram(
                             raise
                     if carries_feedback:
                         feedback_msg = last_msg
-                    delivered_thread_id = media_kwargs.get(
-                        "message_thread_id", canonical_general_thread_id
+                    delivered_thread_id = _telegram_delivery_thread_id(
+                        last_msg,
+                        requested_thread_id=thread_id,
+                        sent_thread_id=media_kwargs.get("message_thread_id"),
                     )
             except Exception as e:
                 warning = _sanitize_error_text(f"Failed to send media {media_path}: {e}")
