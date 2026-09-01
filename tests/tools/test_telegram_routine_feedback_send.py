@@ -97,6 +97,81 @@ def test_standalone_text_send_attaches_keyboard_and_returns_actual_thread(
     assert result["thread_id"] == "9"
 
 
+def test_general_topic_delivery_and_button_vote_use_the_same_coordinates(
+    monkeypatch, tmp_path
+):
+    from cron import executions
+    from plugins.platforms.telegram import adapter as telegram_adapter
+    from tools.send_message_tool import _send_telegram
+
+    _disable_proxy(monkeypatch)
+    monkeypatch.setattr(
+        executions, "EXECUTIONS_FILE", tmp_path / "cron" / "executions.db"
+    )
+    monkeypatch.setattr(
+        telegram_adapter,
+        "build_routine_feedback_keyboard",
+        lambda _token: object(),
+    )
+    bot = MagicMock()
+    bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=42))
+    _install_telegram_mock(monkeypatch, MagicMock(return_value=bot))
+
+    execution = executions.create_execution("general-topic", source="builtin")
+    delivery = executions.record_execution_delivery(
+        execution["id"],
+        platform="telegram",
+        chat_id="-100123",
+        status="pending",
+    )
+    send_result = asyncio.run(
+        _send_telegram(
+            "token",
+            "-100123",
+            "Raport",
+            thread_id="1",
+            routine_feedback_token=delivery["id"],
+        )
+    )
+    executions.record_execution_delivery(
+        execution["id"],
+        delivery_id=delivery["id"],
+        platform="telegram",
+        chat_id="-100123",
+        thread_id=send_result["thread_id"],
+        message_id=send_result["feedback_message_id"],
+        status="delivered",
+    )
+
+    adapter = telegram_adapter.TelegramAdapter(
+        PlatformConfig(enabled=True, token="token", extra={})
+    )
+    adapter._is_callback_user_authorized = MagicMock(return_value=True)
+    query = SimpleNamespace(
+        data=f"cl:rf:u:{delivery['id']}",
+        message=SimpleNamespace(
+            chat_id=-100123,
+            message_id=42,
+            message_thread_id=None,
+            is_topic_message=False,
+            direct_messages_topic=None,
+            chat=SimpleNamespace(type="supergroup", is_forum=True),
+        ),
+        from_user=SimpleNamespace(id=111, first_name="Isac"),
+        answer=AsyncMock(),
+        edit_message_reply_markup=AsyncMock(),
+    )
+    asyncio.run(
+        adapter._handle_callback_query(
+            SimpleNamespace(callback_query=query), SimpleNamespace()
+        )
+    )
+
+    assert "message_thread_id" not in bot.send_message.await_args.kwargs
+    assert send_result["thread_id"] == "1"
+    assert executions.list_execution_feedback(delivery["id"])[0]["vote"] == 1
+
+
 def test_standalone_media_only_send_attaches_keyboard_to_the_visible_message(
     monkeypatch,
 ):

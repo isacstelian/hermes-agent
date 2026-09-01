@@ -1528,6 +1528,9 @@ async def _send_telegram(
                 )
             if effective_thread_id is not None:
                 thread_kwargs["message_thread_id"] = effective_thread_id
+        canonical_general_thread_id = (
+            "1" if str(thread_id) == "1" else None
+        )
         # disable_web_page_preview is only valid for send_message, not
         # send_photo/send_video/etc.  Keep it separate so media sends
         # don't inherit an invalid parameter (issue #27012).
@@ -1628,7 +1631,9 @@ async def _send_telegram(
                         raise
                 if feedback_kwargs:
                     feedback_msg = last_msg
-                delivered_thread_id = text_kwargs.get("message_thread_id")
+                delivered_thread_id = text_kwargs.get(
+                    "message_thread_id", canonical_general_thread_id
+                )
 
         for media_index, (media_path, is_voice) in enumerate(media_files):
             if not os.path.exists(media_path):
@@ -1648,7 +1653,9 @@ async def _send_telegram(
                         )
                         if feedback_on_text:
                             feedback_msg = last_msg
-                        delivered_thread_id = text_kwargs.get("message_thread_id")
+                        delivered_thread_id = text_kwargs.get(
+                            "message_thread_id", canonical_general_thread_id
+                        )
                         _tg_caption = None  # delivered — don't re-caption a later file
                     except Exception as _cap_err:
                         logger.warning(
@@ -1769,7 +1776,9 @@ async def _send_telegram(
                             raise
                     if carries_feedback:
                         feedback_msg = last_msg
-                    delivered_thread_id = media_kwargs.get("message_thread_id")
+                    delivered_thread_id = media_kwargs.get(
+                        "message_thread_id", canonical_general_thread_id
+                    )
             except Exception as e:
                 warning = _sanitize_error_text(f"Failed to send media {media_path}: {e}")
                 logger.error(warning)
