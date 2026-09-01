@@ -183,6 +183,93 @@ def test_feedback_requires_exact_telegram_callback_coordinates_and_upserts(
         )
 
 
+def test_general_topic_alias_keeps_other_callback_coordinates_strict(
+    monkeypatch, tmp_path
+):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    execution = executions.create_execution("general-topic", source="builtin")
+    implicit_general = executions.record_execution_delivery(
+        execution["id"],
+        platform="telegram",
+        chat_id="-10055",
+        message_id="9001",
+        status="delivered",
+    )
+
+    assert executions.record_execution_feedback(
+        implicit_general["id"],
+        vote=1,
+        telegram_user_id="42",
+        chat_id="-10055",
+        message_id="wrong",
+        thread_id="1",
+    ) is None
+    saved = executions.record_execution_feedback(
+        implicit_general["id"],
+        vote=1,
+        telegram_user_id="42",
+        chat_id="-10055",
+        message_id="9001",
+        thread_id="1",
+    )
+
+    assert saved["vote"] == 1
+    assert executions.lookup_execution_delivery(implicit_general["id"])[
+        "thread_id"
+    ] == "1"
+
+    explicit_general = executions.record_execution_delivery(
+        execution["id"],
+        platform="telegram",
+        chat_id="-10055",
+        thread_id="1",
+        message_id="9004",
+        status="delivered",
+    )
+    assert executions.record_execution_feedback(
+        explicit_general["id"],
+        vote=1,
+        telegram_user_id="42",
+        chat_id="-10055",
+        message_id="9004",
+        thread_id="1",
+    )["vote"] == 1
+
+    explicit_topic = executions.record_execution_delivery(
+        execution["id"],
+        platform="telegram",
+        chat_id="-10055",
+        thread_id="12",
+        message_id="9002",
+        status="delivered",
+    )
+    assert executions.record_execution_feedback(
+        explicit_topic["id"],
+        vote=1,
+        telegram_user_id="42",
+        chat_id="-10055",
+        message_id="9002",
+        thread_id="1",
+    ) is None
+
+    non_forum = executions.record_execution_delivery(
+        execution["id"],
+        platform="telegram",
+        chat_id="222",
+        message_id="9003",
+        status="delivered",
+    )
+    assert executions.record_execution_feedback(
+        non_forum["id"],
+        vote=1,
+        telegram_user_id="42",
+        chat_id="222",
+        message_id="9003",
+        thread_id=None,
+    )["vote"] == 1
+    assert executions.lookup_execution_delivery(non_forum["id"])["thread_id"] is None
+
+
 def test_one_user_has_one_vote_per_execution_across_multiple_deliveries(
     monkeypatch, tmp_path
 ):

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from unittest.mock import Mock
 
+import pytest
+
 
 def _patch_run_pipeline(
     monkeypatch, scheduler, *, success=True, final="Raport", error=None
@@ -421,6 +423,128 @@ def test_live_media_only_feedback_uses_last_attachment_message(monkeypatch, tmp_
     receipt = executions.lookup_execution_delivery(token)
     assert receipt["status"] == "delivered"
     assert receipt["message_id"] == "media-42"
+
+
+@pytest.mark.parametrize("delivery_kind", ["text", "media"])
+def test_live_gateway_implicit_general_callback_saves_feedback(
+    monkeypatch, tmp_path, delivery_kind
+):
+    import asyncio
+    from concurrent.futures import Future
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from cron import executions
+    import cron.scheduler as scheduler
+    from gateway.config import Platform, PlatformConfig
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+
+    monkeypatch.setattr(
+        executions,
+        "EXECUTIONS_FILE",
+        tmp_path / "cron" / "executions.db",
+    )
+    media_root = tmp_path / "media"
+    media_root.mkdir()
+    document_path = media_root / "report.pdf"
+    document_path.write_bytes(b"report")
+    monkeypatch.setattr(
+        "gateway.platforms.base.MEDIA_DELIVERY_SAFE_ROOTS",
+        (media_root,),
+    )
+
+    execution = executions.create_execution(
+        f"implicit-general-{delivery_kind}", source="test"
+    )
+    pconfig = PlatformConfig(
+        enabled=True,
+        token="test-token",
+        extra={"rich_messages": False},
+    )
+    gateway_config = SimpleNamespace(
+        platforms={Platform.TELEGRAM: pconfig},
+        get_home_channel=lambda _platform: None,
+    )
+    adapter = TelegramAdapter(pconfig)
+    adapter._hermes_home = tmp_path
+    adapter._is_callback_user_authorized = Mock(return_value=True)
+    bot = SimpleNamespace(
+        send_message=AsyncMock(return_value=SimpleNamespace(message_id=42)),
+        send_document=AsyncMock(return_value=SimpleNamespace(message_id=43)),
+    )
+    adapter._bot = bot
+    loop = Mock()
+    loop.is_running.return_value = True
+
+    def run_now(coro, _loop):
+        future = Future()
+        try:
+            future.set_result(asyncio.run(coro))
+        except BaseException as exc:  # noqa: BLE001
+            future.set_exception(exc)
+        return future
+
+    monkeypatch.setattr(
+        scheduler,
+        "_resolve_delivery_targets",
+        lambda _job: [
+            {"platform": "telegram", "chat_id": "-100123", "thread_id": None}
+        ],
+    )
+    monkeypatch.setattr(
+        "gateway.config.load_gateway_config",
+        lambda: gateway_config,
+    )
+    monkeypatch.setattr(
+        scheduler, "load_config", lambda: {"cron": {"wrap_response": False}}
+    )
+    monkeypatch.setattr("agent.async_utils.safe_schedule_threadsafe", run_now)
+
+    content = (
+        "Raportul de azi"
+        if delivery_kind == "text"
+        else f"MEDIA:{document_path}"
+    )
+    assert scheduler._deliver_result(
+        {"id": execution["job_id"], "deliver": "telegram"},
+        content,
+        adapters={Platform.TELEGRAM: adapter},
+        loop=loop,
+        feedback_execution_id=execution["id"],
+    ) is None
+
+    sent = (
+        bot.send_message.await_args.kwargs
+        if delivery_kind == "text"
+        else bot.send_document.await_args.kwargs
+    )
+    message_id = str(42 if delivery_kind == "text" else 43)
+    callback_data = sent["reply_markup"].inline_keyboard[0][0].callback_data
+    token = callback_data.rsplit(":", 1)[-1]
+    assert executions.lookup_execution_delivery(token)["thread_id"] is None
+
+    query = SimpleNamespace(
+        data=callback_data,
+        message=SimpleNamespace(
+            chat_id=-100123,
+            message_id=int(message_id),
+            message_thread_id=None,
+            is_topic_message=False,
+            direct_messages_topic=None,
+            chat=SimpleNamespace(type="supergroup", is_forum=True),
+        ),
+        from_user=SimpleNamespace(id=111, first_name="Isac"),
+        answer=AsyncMock(),
+        edit_message_reply_markup=AsyncMock(),
+    )
+    asyncio.run(
+        adapter._handle_callback_query(
+            SimpleNamespace(callback_query=query), SimpleNamespace()
+        )
+    )
+
+    assert executions.list_execution_feedback(token)[0]["vote"] == 1
+    assert executions.lookup_execution_delivery(token)["thread_id"] == "1"
 
 
 def test_live_text_plus_media_failure_does_not_link_feedback_to_plain_text(

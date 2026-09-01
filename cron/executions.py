@@ -412,6 +412,17 @@ def _optional_text(value: Any) -> Optional[str]:
     return text or None
 
 
+def _telegram_feedback_threads_match(
+    stored_thread_id: Optional[str], callback_thread_id: Optional[str]
+) -> bool:
+    """Match exact Telegram threads plus the forum General ``None``/``1`` alias."""
+    return (
+        stored_thread_id == callback_thread_id
+        or (stored_thread_id is None and callback_thread_id == "1")
+        or (stored_thread_id == "1" and callback_thread_id is None)
+    )
+
+
 def record_execution_delivery(
     execution_id: str,
     *,
@@ -671,22 +682,33 @@ def record_execution_feedback(
         if delivery["status"] == "failed":
             return None
         if (
-            delivery["status"] == "pending"
-            and delivery["thread_id"] is not None
-            and delivery["thread_id"] != thread_key
-        ):
-            return None
-        if (
-            delivery["status"] == "delivered"
-            and delivery["thread_id"] != thread_key
-        ):
-            return None
-        if (
             delivery["message_id"] is not None
             and delivery["message_id"] != message_key
         ):
             return None
+        if delivery["status"] == "delivered" and delivery["message_id"] is None:
+            return None
+        if (
+            delivery["status"] == "pending"
+            and delivery["thread_id"] is not None
+            and not _telegram_feedback_threads_match(
+                delivery["thread_id"], thread_key
+            )
+        ):
+            return None
+        if (
+            delivery["status"] == "delivered"
+            and not _telegram_feedback_threads_match(
+                delivery["thread_id"], thread_key
+            )
+        ):
+            return None
         if delivery["status"] == "pending":
+            confirmed_thread = (
+                "1"
+                if "1" in (delivery["thread_id"], thread_key)
+                else thread_key
+            )
             try:
                 conn.execute(
                     """UPDATE execution_deliveries
@@ -694,7 +716,7 @@ def record_execution_feedback(
                            error=NULL, updated_at=?
                        WHERE id=? AND status='pending'""",
                     (
-                        thread_key,
+                        confirmed_thread,
                         message_key,
                         _hermes_now().isoformat(),
                         delivery["id"],
@@ -703,8 +725,12 @@ def record_execution_feedback(
             except sqlite3.IntegrityError:
                 # Another delivery already owns these Telegram coordinates.
                 return None
-        elif delivery["message_id"] != message_key:
-            return None
+        elif delivery["thread_id"] != thread_key:
+            conn.execute(
+                """UPDATE execution_deliveries SET thread_id='1', updated_at=?
+                   WHERE id=? AND status='delivered'""",
+                (_hermes_now().isoformat(), delivery["id"]),
+            )
         return _upsert_feedback_unlocked(
             conn,
             delivery["execution_id"],
