@@ -2979,9 +2979,9 @@ class DockerEnvironment(BaseEnvironment):
         ``none``, ``host``), or ``None`` when inspection fails.
 
         Used by the reuse path to make sure a persisted container's network
-        mode still matches the operator's ``docker_network`` setting; callers
-        treat ``None`` (unknown) as a mismatch when lockdown was requested,
-        so a failed inspect fails closed rather than open.
+        mode still matches the operator's ``docker_network`` setting. Callers
+        treat ``None`` as a mismatch, so a failed inspect cannot silently
+        preserve the previous network posture.
         """
         try:
             result = subprocess.run(
@@ -3088,32 +3088,45 @@ class DockerEnvironment(BaseEnvironment):
         *,
         context: str,
     ) -> bool:
-        """Return whether an existing container honors network lockdown."""
-        if not getattr(self, "_network_disabled", False):
-            return True
+        """Return whether an existing container honors the network setting."""
         container_id, _state = existing
         actual_mode = self._container_network_mode(container_id)
-        if actual_mode == "none":
+        network_disabled = getattr(self, "_network_disabled", False)
+        network_matches = (
+            actual_mode == "none" if network_disabled
+            else actual_mode not in {None, "none"}
+        )
+        if network_matches:
             return True
         self._remove_container_for_recreation(
-            container_id,
+            existing,
             context=(
                 f"NetworkMode={actual_mode or 'unknown'} does not satisfy "
-                f"docker_network=false ({context})"
+                f"docker_network={'false' if network_disabled else 'true'} "
+                f"({context})"
             ),
         )
         return False
 
     def _remove_container_for_recreation(
         self,
-        container_id: str,
+        existing: tuple[str, str],
         *,
         context: str,
     ) -> None:
         """Remove an owned persistent container before a config-safe rebuild."""
+        container_id, state = existing
+        if state.lower() not in {"created", "exited", "dead"}:
+            message = (
+                f"Refusing to remove {state or 'unknown-state'} Docker container "
+                f"{container_id[:12]} after a configuration change: {context}. "
+                "Stop it after its background work finishes, then retry."
+            )
+            logger.error(message)
+            raise RuntimeError(message)
         try:
             removed = subprocess.run(
-                [self._docker_exe, "rm", "-f", container_id],
+                [self._docker_exe, "rm", container_id],
                 capture_output=True,
                 text=True,
                 encoding="utf-8",

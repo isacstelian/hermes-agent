@@ -1494,6 +1494,10 @@ def _mock_subprocess_run_with_reuse(monkeypatch, ps_state: str | None,
                     stdout=f"reused-cid\t{ps_state}\t<no value>\n",
                     stderr="",
                 )
+            if sub == "inspect":
+                return subprocess.CompletedProcess(
+                    cmd, 0, stdout="bridge\n", stderr=""
+                )
             if sub == "start":
                 if not start_succeeds:
                     # Real subprocess.run with check=True raises on non-zero exit;
@@ -1544,6 +1548,10 @@ def test_concurrent_identical_identity_reuses_single_container(monkeypatch):
                 0,
                 stdout=f"{winner}\trunning\toff\n",
                 stderr="",
+            )
+        if command[1] == "inspect":
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout="bridge\n", stderr=""
             )
         if command[1] == "run":
             name = command[command.index("--name") + 1]
@@ -1838,6 +1846,10 @@ def test_persistent_docker_run_oserror_reprobes_and_reuses_winner(monkeypatch):
             reuse_probes += 1
             stdout = "" if reuse_probes == 1 else "winner-cid\trunning\toff\n"
             return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
+        if command[1] == "inspect":
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout="bridge\n", stderr=""
+            )
         if command[1] == "run":
             raise OSError("docker client disappeared")
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
@@ -1876,6 +1888,10 @@ def test_persistent_failed_created_container_is_preserved_without_ownership(
             reuse_probes += 1
             stdout = "" if reuse_probes == 1 else "created-cid\tcreated\toff\n"
             return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
+        if command[1] == "inspect":
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout="bridge\n", stderr=""
+            )
         if command[1] == "run":
             raise subprocess.CalledProcessError(
                 125, cmd, output="", stderr="daemon unavailable"
@@ -2456,6 +2472,7 @@ def test_recreate_container_increments_generation(monkeypatch):
         docker_env._EGRESS_LABEL_KEY: "off",
     }
     env._find_reusable_container = lambda *_args: ("replacement-cid", "running")
+    env._container_network_mode = lambda _container_id: "bridge"
     env._snapshot_ready = True
     env.init_session = lambda: None
 
@@ -2495,6 +2512,10 @@ def test_recreate_container_reuses_deterministic_name_race_winner(monkeypatch):
 
     def _run(cmd, **kwargs):
         calls.append(list(cmd))
+        if cmd[1] == "inspect":
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout="bridge\n", stderr=""
+            )
         if cmd[1] == "run":
             raise subprocess.CalledProcessError(
                 125, cmd, output="", stderr="container name is already in use"

@@ -6,6 +6,8 @@ expose it, so operators could not request networkless Docker execution from
 config.yaml.
 """
 
+import pytest
+
 import tools.terminal_tool as terminal_tool
 from tools.environments import docker as docker_env
 
@@ -47,13 +49,21 @@ def test_sibling_container_config_sites_carry_docker_network():
         assert sites >= 1, f"expected at least one container_config site in {module.__name__}"
 
 
-def _reuse_guard_harness(monkeypatch, *, existing_mode: str, network: bool):
+def _reuse_guard_harness(
+    monkeypatch,
+    *,
+    existing_mode: str,
+    network: bool,
+    existing_state: str = "running",
+    commands=None,
+):
     """Drive DockerEnvironment through the cross-process reuse path with a
     fake existing container whose NetworkMode is *existing_mode*.
 
     Returns the list of docker commands issued.
     """
-    commands = []
+    if commands is None:
+        commands = []
 
     def fake_run(cmd, *args, **kwargs):
         commands.append(cmd)
@@ -72,7 +82,9 @@ def _reuse_guard_harness(monkeypatch, *, existing_mode: str, network: bool):
             # Matches the egress-aware reuse probe: with egress off the
             # format string is ID\tState\tEgressLabel and docker renders a
             # missing label as "<no value>".
-            Result.stdout = "existing-container-id\trunning\t<no value>\n"
+            Result.stdout = (
+                f"existing-container-id\t{existing_state}\t<no value>\n"
+            )
         elif len(cmd) > 1 and cmd[1] == "inspect":
             Result.stdout = f"{existing_mode}\n"
         elif len(cmd) > 1 and cmd[1] == "run":
@@ -94,13 +106,46 @@ def _reuse_guard_harness(monkeypatch, *, existing_mode: str, network: bool):
     return commands
 
 
-def test_reuse_removes_networked_container_before_lockdown_recreation(monkeypatch):
-    commands = _reuse_guard_harness(monkeypatch, existing_mode="bridge", network=False)
+@pytest.mark.parametrize(
+    ("existing_mode", "network", "expected_network_arg"),
+    [("bridge", False, "--network=none"), ("none", True, None)],
+)
+def test_reuse_removes_exited_network_mismatch_before_recreation(
+    monkeypatch, existing_mode, network, expected_network_arg
+):
+    commands = _reuse_guard_harness(
+        monkeypatch,
+        existing_mode=existing_mode,
+        network=network,
+        existing_state="exited",
+    )
 
     rm_cmd = next(cmd for cmd in commands if cmd[1] == "rm")
-    assert rm_cmd[1:] == ["rm", "-f", "existing-container-id"]
+    assert rm_cmd[1:] == ["rm", "existing-container-id"]
     run_cmd = next(cmd for cmd in commands if len(cmd) > 2 and cmd[1:3] == ["run", "-d"])
-    assert "--network=none" in run_cmd
+    if expected_network_arg is None:
+        assert "--network=none" not in run_cmd
+    else:
+        assert expected_network_arg in run_cmd
+
+
+@pytest.mark.parametrize(
+    ("existing_mode", "network"), [("bridge", False), ("none", True)]
+)
+def test_reuse_blocks_running_network_mismatch_without_removal(
+    monkeypatch, existing_mode, network
+):
+    commands = []
+    with pytest.raises(RuntimeError, match="running Docker container"):
+        _reuse_guard_harness(
+            monkeypatch,
+            existing_mode=existing_mode,
+            network=network,
+            commands=commands,
+        )
+
+    assert not any(cmd[1] == "rm" for cmd in commands)
+    assert not any(cmd[1] == "run" for cmd in commands)
 
 
 def test_reuse_keeps_airgapped_container_when_lockdown_requested(monkeypatch):
@@ -108,6 +153,16 @@ def test_reuse_keeps_airgapped_container_when_lockdown_requested(monkeypatch):
 
     assert not any(cmd[1] == "rm" for cmd in commands)
     assert not any(cmd[1] == "run" for cmd in commands), "matching container must be reused"
+
+
+def test_reuse_keeps_networked_container_when_network_enabled(monkeypatch):
+    commands = _reuse_guard_harness(
+        monkeypatch, existing_mode="bridge", network=True
+    )
+
+    assert any(cmd[1] == "inspect" for cmd in commands)
+    assert not any(cmd[1] == "rm" for cmd in commands)
+    assert not any(cmd[1] == "run" for cmd in commands)
 
 
 def test_network_lockdown_reuses_legacy_container_without_network_label(monkeypatch):
@@ -207,14 +262,4 @@ def test_network_lockdown_removes_exited_legacy_bridge(monkeypatch):
 
     assert env._container_id == "new-cid"
     rm_cmd = next(cmd for cmd in commands if cmd[1] == "rm")
-    assert rm_cmd[1:] == ["rm", "-f", "old-cid"]
-
-
-def test_reuse_skips_inspect_when_network_enabled(monkeypatch):
-    commands = _reuse_guard_harness(monkeypatch, existing_mode="none", network=True)
-
-    # Default-network config never churns containers, even air-gapped ones
-    # (operators may have created them via docker_extra_args).
-    assert not any(cmd[1] == "inspect" for cmd in commands)
-    assert not any(cmd[1] == "rm" for cmd in commands)
-    assert not any(cmd[1] == "run" for cmd in commands)
+    assert rm_cmd[1:] == ["rm", "old-cid"]
