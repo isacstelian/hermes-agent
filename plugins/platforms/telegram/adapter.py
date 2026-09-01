@@ -1296,6 +1296,23 @@ class TelegramAdapter(BasePlatformAdapter):
             return {}
         return {"disable_notification": True}
 
+    def _routine_feedback_markup(
+        self, metadata: Optional[Dict[str, Any]]
+    ):
+        """Build optional routine-feedback controls without blocking delivery."""
+        feedback_token = (metadata or {}).get("routine_feedback_token")
+        if feedback_token is None:
+            return None
+        try:
+            return build_routine_feedback_keyboard(feedback_token)
+        except Exception:
+            logger.warning(
+                "[%s] Ignoring invalid routine_feedback_token",
+                self.name,
+                exc_info=True,
+            )
+            return None
+
     def set_routine_feedback_handler(
         self, handler: Optional[Callable[..., Any]]
     ) -> None:
@@ -1433,7 +1450,10 @@ class TelegramAdapter(BasePlatformAdapter):
             return
 
         normalized_chat_type = str(query_chat_type or "").split(".")[-1].lower()
-        is_dm = normalized_chat_type in {"dm", "private"}
+        is_dm = (
+            normalized_chat_type in {"dm", "private"}
+            or getattr(query_message, "direct_messages_topic", None) is not None
+        )
         if reason is not None:
             await query.answer(text="Mulțumesc, am salvat motivul.")
             if is_dm:
@@ -1466,17 +1486,46 @@ class TelegramAdapter(BasePlatformAdapter):
         if not normalized_user_id:
             return False
 
-        runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
-        auth_fn = getattr(runner, "_is_user_authorized", None)
-        if callable(auth_fn):
-            try:
-                from gateway.session import SessionSource
+        normalized_chat_type = str(chat_type or "dm").strip().lower() or "dm"
+        if normalized_chat_type == "private":
+            normalized_chat_type = "dm"
+        elif normalized_chat_type == "supergroup":
+            normalized_chat_type = "forum" if thread_id is not None else "group"
 
-                normalized_chat_type = str(chat_type or "dm").strip().lower() or "dm"
-                if normalized_chat_type == "private":
-                    normalized_chat_type = "dm"
-                elif normalized_chat_type == "supergroup":
-                    normalized_chat_type = "forum" if thread_id is not None else "group"
+        home_token = None
+        secret_token = None
+        try:
+            anchored_home = getattr(self, "_hermes_home", None)
+            if anchored_home is not None:
+                from agent.secret_scope import (
+                    build_profile_secret_scope,
+                    set_secret_scope,
+                )
+                from hermes_constants import set_hermes_home_override
+
+                home_token = set_hermes_home_override(anchored_home)
+                secret_token = set_secret_scope(
+                    build_profile_secret_scope(_Path(anchored_home))
+                )
+
+            decision = (
+                self._is_sender_authorized(
+                    normalized_user_id,
+                    chat_type=normalized_chat_type,
+                    chat_id=str(chat_id or normalized_user_id),
+                )
+                if getattr(self, "_authorization_check", None) is not None
+                else None
+            )
+            if decision is not None:
+                return decision
+
+            runner = getattr(
+                getattr(self, "_message_handler", None), "__self__", None
+            )
+            auth_fn = getattr(runner, "_is_user_authorized", None)
+            if callable(auth_fn):
+                from gateway.session import SessionSource
 
                 source = SessionSource(
                     platform=Platform.TELEGRAM,
@@ -1487,22 +1536,35 @@ class TelegramAdapter(BasePlatformAdapter):
                     thread_id=str(thread_id) if thread_id is not None else None,
                 )
                 return bool(auth_fn(source))
-            except Exception:
-                logger.debug(
-                    "[Telegram] Falling back to env-only callback auth for user %s",
-                    normalized_user_id,
-                    exc_info=True,
-                )
 
-        allowed_csv = _scoped_gate_env("TELEGRAM_ALLOWED_USERS").strip()
-        if not allowed_csv:
-            # Fail-closed: no allowlist means deny by default.
-            # The runner auth path in _is_user_authorized() handles
-            # GATEWAY_ALLOW_ALL_USERS; this fallback must not silently
-            # allow everyone (fixes #24457).
-            return _scoped_gate_env("GATEWAY_ALLOW_ALL_USERS").lower() in {"true", "1", "yes"}
-        allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
-        return "*" in allowed_ids or normalized_user_id in allowed_ids
+            allowed_csv = _scoped_gate_env("TELEGRAM_ALLOWED_USERS").strip()
+            if not allowed_csv:
+                # Fail closed when neither the runner nor an allowlist can decide.
+                return _scoped_gate_env("GATEWAY_ALLOW_ALL_USERS").lower() in {
+                    "true",
+                    "1",
+                    "yes",
+                }
+            allowed_ids = {
+                uid.strip() for uid in allowed_csv.split(",") if uid.strip()
+            }
+            return "*" in allowed_ids or normalized_user_id in allowed_ids
+        except Exception:
+            logger.debug(
+                "[Telegram] Callback authorization failed for user %s",
+                normalized_user_id,
+                exc_info=True,
+            )
+            return False
+        finally:
+            if secret_token is not None:
+                from agent.secret_scope import reset_secret_scope
+
+                reset_secret_scope(secret_token)
+            if home_token is not None:
+                from hermes_constants import reset_hermes_home_override
+
+                reset_hermes_home_override(home_token)
 
     def _source_from_message_for_auth(self, message: Message):
         """Build the same Telegram source shape the gateway auth path expects.
@@ -5677,20 +5739,7 @@ class TelegramAdapter(BasePlatformAdapter):
         if not content or not content.strip():
             return SendResult(success=True, message_id=None)
 
-        feedback_markup = None
-        feedback_token = (metadata or {}).get("routine_feedback_token")
-        if feedback_token is not None:
-            try:
-                feedback_markup = build_routine_feedback_keyboard(feedback_token)
-            except Exception:
-                # Delivery remains more important than the optional feedback
-                # controls. Invalid integration metadata is logged and the
-                # routine still reaches the user without a keyboard.
-                logger.warning(
-                    "[%s] Ignoring invalid routine_feedback_token",
-                    self.name,
-                    exc_info=True,
-                )
+        feedback_markup = self._routine_feedback_markup(metadata)
         
         try:
             # Bot API 10.1 rich fast-path: send the raw agent markdown via
@@ -7632,7 +7681,12 @@ class TelegramAdapter(BasePlatformAdapter):
         query_chat_id = getattr(query_message, "chat_id", None)
         query_chat = getattr(query_message, "chat", None)
         query_chat_type = getattr(query_chat, "type", None)
-        query_thread_id = getattr(query_message, "message_thread_id", None)
+        direct_messages_topic = getattr(
+            query_message, "direct_messages_topic", None
+        )
+        query_thread_id = getattr(direct_messages_topic, "topic_id", None)
+        if query_thread_id is None and query_message is not None:
+            query_thread_id = self._effective_message_thread_id(query_message)
         query_user_name = getattr(getattr(query, "from_user", None), "first_name", None)
 
         # Inline buttons can mutate model, approval, clarify, and session state
@@ -8207,6 +8261,12 @@ class TelegramAdapter(BasePlatformAdapter):
         try:
             if not os.path.exists(audio_path):
                 return SendResult(success=False, error=self._missing_media_path_error("Audio", audio_path))
+            feedback_markup = self._routine_feedback_markup(metadata)
+            feedback_kwargs = (
+                {"reply_markup": feedback_markup}
+                if feedback_markup is not None
+                else {}
+            )
             
             # Compute duration locally — Telegram drops it for long clips
             # (~5 min+), which then show 0:00 in the player.
@@ -8266,6 +8326,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                     "read_timeout": _MEDIA_SEND_READ_TIMEOUT,
                                     **voice_thread_kwargs,
                                     **self._notification_kwargs(metadata),
+                                    **feedback_kwargs,
                                 },
                                 metadata,
                                 reply_to_id,
@@ -8316,6 +8377,7 @@ class TelegramAdapter(BasePlatformAdapter):
                             "read_timeout": _MEDIA_SEND_READ_TIMEOUT,
                             **audio_thread_kwargs,
                             **self._notification_kwargs(metadata),
+                            **feedback_kwargs,
                         },
                         metadata,
                         reply_to_id,
@@ -8494,6 +8556,7 @@ class TelegramAdapter(BasePlatformAdapter):
         try:
             if not os.path.exists(image_path):
                 return SendResult(success=False, error=self._missing_media_path_error("Image", image_path))
+            feedback_markup = self._routine_feedback_markup(metadata)
 
             _thread = self._metadata_thread_id(metadata)
             reply_to_id = self._reply_to_message_id_for_send(reply_to, metadata, reply_to_mode=self._reply_to_mode)
@@ -8515,6 +8578,11 @@ class TelegramAdapter(BasePlatformAdapter):
                         "read_timeout": _MEDIA_SEND_READ_TIMEOUT,
                         **thread_kwargs,
                         **self._notification_kwargs(metadata),
+                        **(
+                            {"reply_markup": feedback_markup}
+                            if feedback_markup is not None
+                            else {}
+                        ),
                     },
                     metadata,
                     reply_to_id,
@@ -8589,6 +8657,7 @@ class TelegramAdapter(BasePlatformAdapter):
         try:
             if not os.path.exists(file_path):
                 return SendResult(success=False, error=self._missing_media_path_error("File", file_path))
+            feedback_markup = self._routine_feedback_markup(metadata)
             max_bytes = self.media_delivery_max_bytes()
             if os.path.getsize(file_path) > max_bytes:
                 return SendResult(
@@ -8622,6 +8691,11 @@ class TelegramAdapter(BasePlatformAdapter):
                         "read_timeout": _MEDIA_SEND_READ_TIMEOUT,
                         **thread_kwargs,
                         **self._notification_kwargs(metadata),
+                        **(
+                            {"reply_markup": feedback_markup}
+                            if feedback_markup is not None
+                            else {}
+                        ),
                     },
                     metadata,
                     reply_to_id,
@@ -8658,6 +8732,7 @@ class TelegramAdapter(BasePlatformAdapter):
         try:
             if not os.path.exists(video_path):
                 return SendResult(success=False, error=self._missing_media_path_error("Video", video_path))
+            feedback_markup = self._routine_feedback_markup(metadata)
 
             _thread = self._metadata_thread_id(metadata)
             reply_to_id = self._reply_to_message_id_for_send(reply_to, metadata, reply_to_mode=self._reply_to_mode)
@@ -8679,6 +8754,11 @@ class TelegramAdapter(BasePlatformAdapter):
                         "read_timeout": _MEDIA_SEND_READ_TIMEOUT,
                         **thread_kwargs,
                         **self._notification_kwargs(metadata),
+                        **(
+                            {"reply_markup": feedback_markup}
+                            if feedback_markup is not None
+                            else {}
+                        ),
                     },
                     metadata,
                     reply_to_id,

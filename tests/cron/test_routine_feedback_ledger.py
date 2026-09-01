@@ -31,6 +31,7 @@ def test_execution_context_outcome_and_duration_are_persisted(monkeypatch, tmp_p
     assert claimed["job_name"] == "Daily brief"
     assert claimed["definition_hash"] == "sha256:original"
     assert claimed["delivery_outcome"] is None
+    assert claimed["delivery_error"] is None
     assert claimed["duration_ms"] is None
 
     current[0] += timedelta(seconds=2)
@@ -51,6 +52,23 @@ def test_execution_context_outcome_and_duration_are_persisted(monkeypatch, tmp_p
     assert completed["delivery_outcome"] == "delivered"
     assert completed["duration_ms"] == 3250
     assert executions.latest_execution("daily-brief") == completed
+
+
+def test_successful_execution_keeps_delivery_failure_reason(monkeypatch, tmp_path):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    execution = executions.create_execution("delivery-failed", source="builtin")
+
+    completed = executions.finish_execution(
+        execution["id"],
+        success=True,
+        delivery_outcome="failed",
+        delivery_error="Telegram send rejected",
+    )
+
+    assert completed["status"] == "completed"
+    assert completed["error"] is None
+    assert completed["delivery_outcome"] == "failed"
+    assert completed["delivery_error"] == "Telegram send rejected"
 
 
 def test_pending_delivery_is_finalized_idempotently_and_linked_to_execution(
@@ -223,6 +241,42 @@ def test_callback_can_confirm_a_pending_telegram_delivery(monkeypatch, tmp_path)
     ) is None
 
 
+def test_pending_delivery_cannot_be_relinked_to_another_thread(
+    monkeypatch, tmp_path
+):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    execution = executions.create_execution("thread-bound", source="builtin")
+    pending = executions.record_execution_delivery(
+        execution["id"],
+        platform="telegram",
+        chat_id="123",
+        thread_id="12",
+        status="pending",
+    )
+
+    assert executions.record_execution_feedback(
+        pending["id"],
+        vote=1,
+        telegram_user_id="42",
+        chat_id="123",
+        thread_id="99",
+        message_id="700",
+    ) is None
+    assert executions.lookup_execution_delivery(pending["id"])["status"] == (
+        "pending"
+    )
+
+    saved = executions.record_execution_feedback(
+        pending["id"],
+        vote=1,
+        telegram_user_id="42",
+        chat_id="123",
+        thread_id="12",
+        message_id="700",
+    )
+    assert saved["vote"] == 1
+
+
 def test_delivery_message_cannot_be_relinked(monkeypatch, tmp_path):
     executions = _point_ledger(monkeypatch, tmp_path)
     first_execution = executions.create_execution("first", source="builtin")
@@ -283,6 +337,54 @@ def test_retention_preserves_voted_executions(monkeypatch, tmp_path):
     remaining = executions.list_executions(limit=100)
     assert {row["job_id"] for row in remaining} == {"voted", "unvoted-new"}
     assert executions.list_execution_feedback(delivery["id"])[0]["vote"] == 1
+
+
+def test_database_triggers_preserve_feedback_across_binary_rollback(
+    monkeypatch, tmp_path
+):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    voted = executions.create_execution("voted", source="builtin")
+    voted_delivery = executions.record_execution_delivery(
+        voted["id"],
+        platform="telegram",
+        chat_id="123",
+        message_id="1",
+        status="delivered",
+    )
+    executions.record_execution_feedback(
+        voted_delivery["id"],
+        vote=1,
+        telegram_user_id="42",
+        chat_id="123",
+        message_id="1",
+    )
+    unvoted = executions.create_execution("unvoted", source="builtin")
+    unvoted_delivery = executions.record_execution_delivery(
+        unvoted["id"],
+        platform="telegram",
+        chat_id="123",
+        message_id="2",
+        status="delivered",
+    )
+
+    with sqlite3.connect(executions.EXECUTIONS_FILE) as conn:
+        assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 0
+        conn.execute(
+            "DELETE FROM executions WHERE id IN (?, ?)",
+            (voted["id"], unvoted["id"]),
+        )
+
+        assert conn.execute(
+            "SELECT 1 FROM executions WHERE id=?", (voted["id"],)
+        ).fetchone()
+        assert conn.execute(
+            "SELECT 1 FROM execution_feedback WHERE delivery_id=?",
+            (voted_delivery["id"],),
+        ).fetchone()
+        assert conn.execute(
+            "SELECT 1 FROM execution_deliveries WHERE id=?",
+            (unvoted_delivery["id"],),
+        ).fetchone() is None
 
 
 def test_existing_execution_database_is_migrated_without_losing_rows(

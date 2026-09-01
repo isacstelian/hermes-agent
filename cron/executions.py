@@ -63,6 +63,7 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
              job_name TEXT,
              definition_hash TEXT,
              delivery_outcome TEXT,
+             delivery_error TEXT,
              duration_ms INTEGER
            )"""
     )
@@ -71,6 +72,7 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         ("job_name", "TEXT"),
         ("definition_hash", "TEXT"),
         ("delivery_outcome", "TEXT"),
+        ("delivery_error", "TEXT"),
         ("duration_ms", "INTEGER"),
     ):
         if name in columns:
@@ -128,6 +130,32 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_execution_feedback_delivery "
         "ON execution_feedback(delivery_id, updated_at DESC, id DESC)"
+    )
+    # These triggers remain in the database during a binary rollback. Older
+    # Hermes versions do not enable foreign keys, so their retention delete
+    # would otherwise orphan feedback or erase its execution linkage.
+    conn.execute(
+        """CREATE TRIGGER IF NOT EXISTS preserve_execution_feedback_history
+           BEFORE DELETE ON executions
+           WHEN EXISTS (
+             SELECT 1 FROM execution_deliveries d
+             JOIN execution_feedback f ON f.delivery_id=d.id
+             WHERE d.execution_id=OLD.id
+           )
+           BEGIN
+             SELECT RAISE(IGNORE);
+           END"""
+    )
+    conn.execute(
+        """CREATE TRIGGER IF NOT EXISTS cleanup_execution_deliveries
+           AFTER DELETE ON executions
+           BEGIN
+             DELETE FROM execution_feedback
+             WHERE delivery_id IN (
+               SELECT id FROM execution_deliveries WHERE execution_id=OLD.id
+             );
+             DELETE FROM execution_deliveries WHERE execution_id=OLD.id;
+           END"""
     )
 
 
@@ -293,6 +321,7 @@ def mark_execution_running(execution_id: str) -> Optional[Dict[str, Any]]:
 def finish_execution(
     execution_id: str, *, success: bool, error: Optional[str] = None,
     delivery_outcome: Optional[str] = None,
+    delivery_error: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Write a terminal result once; terminal attempts cannot be rewritten."""
     finished = _hermes_now()
@@ -302,7 +331,7 @@ def finish_execution(
     with _transaction() as conn:
         cur = conn.execute(
             """UPDATE executions SET status=?, finished_at=?, error=?,
-               delivery_outcome=?,
+               delivery_outcome=?, delivery_error=?,
                duration_ms=MAX(0, CAST(ROUND(
                  (julianday(?) - julianday(COALESCE(started_at, claimed_at)))
                  * 86400000
@@ -310,6 +339,7 @@ def finish_execution(
                WHERE id=? AND status IN ('claimed','running')""",
             (status, now, detail,
              None if delivery_outcome is None else str(delivery_outcome),
+             None if delivery_error is None else str(delivery_error),
              now, execution_id),
         )
         if cur.rowcount != 1:
@@ -585,6 +615,12 @@ def record_execution_feedback(
         if delivery is None:
             return None
         if delivery["status"] == "failed":
+            return None
+        if (
+            delivery["status"] == "pending"
+            and delivery["thread_id"] is not None
+            and delivery["thread_id"] != thread_key
+        ):
             return None
         if (
             delivery["status"] == "delivered"

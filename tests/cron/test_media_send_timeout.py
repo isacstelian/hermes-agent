@@ -79,7 +79,7 @@ class TestEmptyReasonFallback:
             async def send_voice(self, **kw):  # pragma: no cover - never awaited
                 pass
 
-        errors = _send_media_via_adapter(
+        errors, _message_id = _send_media_via_adapter(
             _Adapter(), "C123", [(str(media), False)], None, loop=object(),
             job={"id": "job-x"},
         )

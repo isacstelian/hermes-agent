@@ -38,12 +38,30 @@ def _adapter():
     return adapter
 
 
-def _query(data, *, chat_type="private", user_id=111, thread_id=None):
+def _query(
+    data,
+    *,
+    chat_type="private",
+    user_id=111,
+    thread_id=None,
+    is_forum=False,
+    direct_messages_topic_id=None,
+):
     message = SimpleNamespace(
-        chat_id=-100123 if chat_type in {"group", "supergroup"} else 222,
+        chat_id=(
+            -100123
+            if chat_type in {"group", "supergroup", "channel"}
+            else 222
+        ),
         message_id=333,
         message_thread_id=thread_id,
-        chat=SimpleNamespace(type=chat_type),
+        is_topic_message=thread_id is not None,
+        direct_messages_topic=(
+            SimpleNamespace(topic_id=direct_messages_topic_id)
+            if direct_messages_topic_id is not None
+            else None
+        ),
+        chat=SimpleNamespace(type=chat_type, is_forum=is_forum),
     )
     return SimpleNamespace(
         data=data,
@@ -135,6 +153,49 @@ async def test_rich_routine_keeps_native_formatting_and_feedback_keyboard():
     ] == ["rf:u:delivery123", "rf:d:delivery123"]
     assert result.success is True
     assert result.message_id == "12"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("adapter_method", "file_name", "bot_method"),
+    [
+        ("send_voice", "routine.ogg", "send_voice"),
+        ("send_image_file", "routine.png", "send_photo"),
+        ("send_document", "routine.pdf", "send_document"),
+        ("send_video", "routine.mp4", "send_video"),
+    ],
+)
+async def test_native_media_sends_attach_feedback_keyboard(
+    monkeypatch, tmp_path, adapter_method, file_name, bot_method
+):
+    adapter = _adapter()
+    media_path = tmp_path / file_name
+    media_path.write_bytes(b"media")
+    monkeypatch.setattr(
+        telegram_module,
+        "_probe_voice_duration_seconds",
+        lambda _path: None,
+    )
+    adapter._bot = SimpleNamespace(
+        send_voice=AsyncMock(return_value=SimpleNamespace(message_id=41)),
+        send_audio=AsyncMock(return_value=SimpleNamespace(message_id=41)),
+        send_photo=AsyncMock(return_value=SimpleNamespace(message_id=42)),
+        send_document=AsyncMock(return_value=SimpleNamespace(message_id=43)),
+        send_video=AsyncMock(return_value=SimpleNamespace(message_id=44)),
+    )
+
+    result = await getattr(adapter, adapter_method)(
+        "222",
+        str(media_path),
+        metadata={"routine_feedback_token": "delivery123"},
+    )
+
+    call = getattr(adapter._bot, bot_method).await_args
+    assert _callback_data(call.kwargs["reply_markup"]) == [
+        "rf:u:delivery123",
+        "rf:d:delivery123",
+    ]
+    assert result.success is True
 
 
 @pytest.mark.asyncio
@@ -241,6 +302,56 @@ async def test_group_feedback_keeps_shared_keyboard_for_other_users():
     )
     query.answer.assert_awaited_once()
     query.edit_message_reply_markup.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_channel_direct_message_feedback_uses_native_topic_id():
+    adapter = _adapter()
+    handler = AsyncMock(return_value={"id": "feedback-row"})
+    adapter.set_routine_feedback_handler(handler)
+    query = _query(
+        "rf:d:delivery123",
+        chat_type="channel",
+        thread_id=None,
+        direct_messages_topic_id=20189,
+    )
+
+    await adapter._handle_callback_query(
+        SimpleNamespace(callback_query=query), SimpleNamespace()
+    )
+
+    handler.assert_awaited_once_with(
+        "delivery123",
+        vote=-1,
+        telegram_user_id="111",
+        chat_id="-100123",
+        message_id="333",
+        thread_id="20189",
+        reason=None,
+    )
+    reason_markup = query.edit_message_reply_markup.await_args.kwargs[
+        "reply_markup"
+    ]
+    assert _callback_data(reason_markup)[0] == "rf:r:wrong:delivery123"
+
+
+@pytest.mark.asyncio
+async def test_forum_general_feedback_uses_canonical_thread_one():
+    adapter = _adapter()
+    handler = AsyncMock(return_value={"id": "feedback-row"})
+    adapter.set_routine_feedback_handler(handler)
+    query = _query(
+        "rf:u:delivery123",
+        chat_type="supergroup",
+        thread_id=None,
+        is_forum=True,
+    )
+
+    await adapter._handle_callback_query(
+        SimpleNamespace(callback_query=query), SimpleNamespace()
+    )
+
+    assert handler.await_args.kwargs["thread_id"] == "1"
 
 
 @pytest.mark.asyncio

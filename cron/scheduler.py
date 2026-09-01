@@ -3033,24 +3033,23 @@ def _send_media_via_adapter(
     loop,
     job: dict,
     platform=None,
-) -> list:
+    feedback_token: Optional[str] = None,
+) -> tuple[list, Optional[str]]:
     """Send extracted MEDIA files as native platform attachments via a live adapter.
 
     Routes each file to the appropriate adapter method (send_voice, send_image_file,
     send_video, send_document) based on file extension — mirroring the routing logic
     in ``BasePlatformAdapter._process_message_background``.
 
-    Returns a list of per-file error strings (empty when every attachment
-    delivered). Callers surface these into the job's delivery errors so a
-    dropped attachment is visible in ``last_error``/run status instead of
-    only in the gateway log (the silent-drop half of the manual-run
-    attachment bug: text delivered, file vanished, job marked ok).
+    Returns per-file errors plus the message id of the media carrying feedback
+    controls. The token is attached only to the last eligible attachment.
     """
     from pathlib import Path
 
     from gateway.platforms.base import BasePlatformAdapter, should_send_media_as_audio
 
     errors: list = []
+    feedback_message_id: Optional[str] = None
     requested = [(str(p), v) for p, v in (media_files or [])]
     media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
     # Report paths the safety filter dropped: the model referenced them in
@@ -3068,18 +3067,25 @@ def _send_media_via_adapter(
         except Exception:
             errors.append(f"attachment dropped by media path policy: {raw_path}")
 
-    for media_path, _is_voice in media_files:
+    for media_index, (media_path, _is_voice) in enumerate(media_files):
         try:
             ext = Path(media_path).suffix.lower()
             route_platform = platform if platform is not None else getattr(adapter, "platform", None)
+            send_metadata = metadata
+            carries_feedback = (
+                feedback_token is not None and media_index == len(media_files) - 1
+            )
+            if carries_feedback:
+                send_metadata = dict(metadata or {})
+                send_metadata["routine_feedback_token"] = feedback_token
             if should_send_media_as_audio(route_platform, ext, is_voice=_is_voice):
-                coro = adapter.send_voice(chat_id=chat_id, audio_path=media_path, metadata=metadata)
+                coro = adapter.send_voice(chat_id=chat_id, audio_path=media_path, metadata=send_metadata)
             elif ext in _VIDEO_EXTS:
-                coro = adapter.send_video(chat_id=chat_id, video_path=media_path, metadata=metadata)
+                coro = adapter.send_video(chat_id=chat_id, video_path=media_path, metadata=send_metadata)
             elif ext in _IMAGE_EXTS:
-                coro = adapter.send_image_file(chat_id=chat_id, image_path=media_path, metadata=metadata)
+                coro = adapter.send_image_file(chat_id=chat_id, image_path=media_path, metadata=send_metadata)
             else:
-                coro = adapter.send_document(chat_id=chat_id, file_path=media_path, metadata=metadata)
+                coro = adapter.send_document(chat_id=chat_id, file_path=media_path, metadata=send_metadata)
 
             from agent.async_utils import safe_schedule_threadsafe
             future = safe_schedule_threadsafe(coro, loop)
@@ -3087,7 +3093,7 @@ def _send_media_via_adapter(
                 msg = f"cannot send media {media_path}: gateway loop unavailable"
                 logger.warning("Job '%s': %s", job.get("id", "?"), msg)
                 errors.append(msg)
-                return errors
+                return errors, feedback_message_id
             try:
                 # Large attachments (long TTS audio, concatenated recordings,
                 # big exports) can legitimately exceed a fixed 30s upload
@@ -3105,6 +3111,8 @@ def _send_media_via_adapter(
                 )
                 logger.warning("Job '%s': %s", job.get("id", "?"), msg)
                 errors.append(msg)
+            elif carries_feedback:
+                feedback_message_id = getattr(result, "message_id", None)
         except Exception as e:
             # Argument-less exceptions (notably TimeoutError, the most likely
             # failure on this path) have an empty str(), which would render
@@ -3114,7 +3122,7 @@ def _send_media_via_adapter(
             )
             logger.warning("Job '%s': %s", job.get("id", "?"), msg)
             errors.append(msg)
-    return errors
+    return errors, feedback_message_id
 
 
 def _confirm_adapter_delivery(send_result) -> bool:
@@ -3600,7 +3608,7 @@ def _deliver_result(
                 thread_id = new_thread_id
                 opened_thread_id = new_thread_id
 
-        if cleaned_delivery_content.strip():
+        if cleaned_delivery_content.strip() or media_files:
             feedback_token = _start_routine_feedback_delivery(
                 feedback_execution_id,
                 platform_name=platform_name,
@@ -3675,7 +3683,7 @@ def _deliver_result(
                 route_metadata.setdefault("scope_id", str(origin["scope_id"]))
                 media_metadata = dict(media_metadata or {})
                 media_metadata.setdefault("scope_id", str(origin["scope_id"]))
-            if feedback_token:
+            if feedback_token and not media_files:
                 route_metadata["routine_feedback_token"] = feedback_token
 
             try:
@@ -3849,7 +3857,7 @@ def _deliver_result(
                                 routed_media_metadata["user_id"] = logical_home.user_id
                             if logical_home.scope_id:
                                 routed_media_metadata["scope_id"] = logical_home.scope_id
-                    _media_errors = _send_media_via_adapter(
+                    _media_errors, media_feedback_message_id = _send_media_via_adapter(
                         runtime_adapter,
                         chat_id,
                         media_files,
@@ -3857,7 +3865,10 @@ def _deliver_result(
                         loop,
                         job,
                         platform=platform,
+                        feedback_token=feedback_token,
                     )
+                    if media_feedback_message_id is not None:
+                        delivered_message_id = media_feedback_message_id
                     # Surface per-file failures into the run status (parity
                     # with the standalone lane): text delivered but an
                     # attachment didn't is a visible partial failure, not ok.
@@ -3896,6 +3907,18 @@ def _deliver_result(
                             thread_id=thread_id,
                             status="pending",
                             error="Live Telegram send confirmation timed out",
+                        )
+                    elif feedback_token and media_files:
+                        _finish_routine_feedback_delivery(
+                            feedback_execution_id,
+                            feedback_token,
+                            chat_id=chat_id,
+                            thread_id=thread_id,
+                            status="failed",
+                            error=(
+                                "; ".join(_media_errors)
+                                or "Telegram media send returned no message_id"
+                            ),
                         )
                     logger.info("Job '%s': delivered to %s:%s via live adapter", job["id"], platform_name, chat_id)
                     delivered = True
@@ -7761,6 +7784,7 @@ def _run_one_job_body(
             success=success,
             error=error,
             delivery_outcome=delivery_outcome,
+            delivery_error=delivery_error,
         )
         return True
 
@@ -7851,6 +7875,7 @@ def _run_one_job_body(
                 success=False,
                 error=_err_text,
                 delivery_outcome=delivery_outcome,
+                delivery_error=delivery_error,
             )
         except Exception as record_err:
             logger.error(

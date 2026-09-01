@@ -182,6 +182,33 @@ def test_silent_success_does_not_create_a_feedback_delivery(monkeypatch):
     assert delivered == []
 
 
+def test_successful_run_records_delivery_error_separately(monkeypatch):
+    import cron.scheduler as scheduler
+
+    _contexts, _delivered = _patch_run_pipeline(monkeypatch, scheduler)
+    monkeypatch.setattr(scheduler, "load_config", lambda: {})
+    monkeypatch.setattr(
+        scheduler,
+        "_deliver_result",
+        lambda *_args, **_kwargs: "Telegram send rejected",
+    )
+    finished = []
+    monkeypatch.setattr(
+        scheduler,
+        "finish_execution",
+        lambda execution_id, **kwargs: finished.append((execution_id, kwargs)),
+    )
+
+    assert scheduler.run_one_job({
+        "id": "delivery-failed",
+        "deliver": "telegram",
+        "execution_id": "execution-delivery-failed",
+    }) is True
+
+    assert finished[-1][1]["delivery_outcome"] == "failed"
+    assert finished[-1][1]["delivery_error"] == "Telegram send rejected"
+
+
 def test_live_telegram_delivery_persists_exact_feedback_receipt(monkeypatch, tmp_path):
     import asyncio
     from concurrent.futures import Future
@@ -256,6 +283,94 @@ def test_live_telegram_delivery_persists_exact_feedback_receipt(monkeypatch, tmp
     assert receipt["chat_id"] == "123"
     assert receipt["thread_id"] == "9"
     assert receipt["message_id"] == "telegram-message-42"
+
+
+def test_live_media_only_feedback_uses_last_attachment_message(monkeypatch, tmp_path):
+    import asyncio
+    from concurrent.futures import Future
+    from types import SimpleNamespace
+
+    from cron import executions
+    import cron.scheduler as scheduler
+    from gateway.config import Platform, PlatformConfig
+    from gateway.platforms.base import SendResult
+
+    monkeypatch.setattr(
+        executions,
+        "EXECUTIONS_FILE",
+        tmp_path / "cron" / "executions.db",
+    )
+    media_root = tmp_path / "media"
+    media_root.mkdir()
+    image_path = media_root / "report.png"
+    document_path = media_root / "details.pdf"
+    image_path.write_bytes(b"image")
+    document_path.write_bytes(b"document")
+    monkeypatch.setattr(
+        "gateway.platforms.base.MEDIA_DELIVERY_SAFE_ROOTS",
+        (media_root,),
+    )
+
+    execution = executions.create_execution("media-brief", source="test")
+    pconfig = PlatformConfig(enabled=True, token="test-token", extra={})
+    gateway_config = SimpleNamespace(
+        platforms={Platform.TELEGRAM: pconfig},
+        get_home_channel=lambda _platform: None,
+    )
+    media_calls = []
+
+    class Adapter:
+        platform = Platform.TELEGRAM
+
+        async def send_image_file(self, **kwargs):
+            media_calls.append(("image", kwargs["metadata"]))
+            return SendResult(success=True, message_id="media-41")
+
+        async def send_document(self, **kwargs):
+            media_calls.append(("document", kwargs["metadata"]))
+            return SendResult(success=True, message_id="media-42")
+
+    loop = Mock()
+    loop.is_running.return_value = True
+
+    def run_now(coro, _loop):
+        future = Future()
+        try:
+            future.set_result(asyncio.run(coro))
+        except BaseException as exc:  # noqa: BLE001
+            future.set_exception(exc)
+        return future
+
+    monkeypatch.setattr(
+        scheduler,
+        "_resolve_delivery_targets",
+        lambda _job: [{"platform": "telegram", "chat_id": "123"}],
+    )
+    monkeypatch.setattr(
+        "gateway.config.load_gateway_config",
+        lambda: gateway_config,
+    )
+    monkeypatch.setattr(
+        scheduler, "load_config", lambda: {"cron": {"wrap_response": False}}
+    )
+    monkeypatch.setattr("agent.async_utils.safe_schedule_threadsafe", run_now)
+
+    assert (
+        scheduler._deliver_result(
+            {"id": "media-brief", "deliver": "telegram"},
+            f"MEDIA:{image_path}\nMEDIA:{document_path}",
+            adapters={Platform.TELEGRAM: Adapter()},
+            loop=loop,
+            feedback_execution_id=execution["id"],
+        )
+        is None
+    )
+
+    assert "routine_feedback_token" not in (media_calls[0][1] or {})
+    token = media_calls[1][1]["routine_feedback_token"]
+    receipt = executions.lookup_execution_delivery(token)
+    assert receipt["status"] == "delivered"
+    assert receipt["message_id"] == "media-42"
 
 
 def test_failed_telegram_delivery_persists_the_receipt_error(monkeypatch, tmp_path):
