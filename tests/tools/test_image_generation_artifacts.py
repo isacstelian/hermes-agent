@@ -40,6 +40,95 @@ def test_postprocess_adds_agent_visible_image_for_active_ssh_env(monkeypatch, tm
     assert sync_calls == [True]
 
 
+def test_postprocess_bridges_generated_image_into_remote_docker(monkeypatch, tmp_path):
+    from tools import image_generation_tool
+
+    hermes_home = tmp_path / ".hermes"
+    image_dir = hermes_home / "cache" / "images"
+    image_dir.mkdir(parents=True)
+    image_path = image_dir / "generated.png"
+    image_path.write_bytes(b"png")
+
+    class DockerEnvironment:
+        remote_endpoint = True
+        _sync_manager = None
+
+    pushed = []
+
+    class FakeArtifactBridge:
+        def __init__(self, environment, **kwargs):
+            assert environment is env
+            assert kwargs == {
+                "cache_dir": hermes_home / "cache" / "artifact-bridge",
+                "host_roots": (image_dir,),
+                "container_roots": ("/root/.hermes/cache/images",),
+            }
+
+        def push(self, host_path, container_path):
+            pushed.append((host_path, container_path))
+
+    env = DockerEnvironment()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setattr(image_generation_tool, "_active_terminal_env", lambda _task_id: env)
+    monkeypatch.setattr(
+        "tools.environments.artifact_bridge.ArtifactBridge",
+        FakeArtifactBridge,
+    )
+
+    raw = json.dumps({"success": True, "image": str(image_path)})
+    result = json.loads(
+        image_generation_tool._postprocess_image_generate_result(raw, task_id="task-1")
+    )
+
+    agent_path = "/root/.hermes/cache/images/generated.png"
+    assert pushed == [(image_path, agent_path)]
+    assert result["host_image"] == str(image_path)
+    assert result["agent_visible_image"] == agent_path
+
+
+def test_postprocess_does_not_publish_unavailable_remote_docker_path(
+    monkeypatch, tmp_path, caplog
+):
+    from tools import image_generation_tool
+
+    hermes_home = tmp_path / ".hermes"
+    image_dir = hermes_home / "cache" / "images"
+    image_dir.mkdir(parents=True)
+    image_path = image_dir / "generated.png"
+    image_path.write_bytes(b"png")
+
+    class DockerEnvironment:
+        remote_endpoint = True
+        _sync_manager = None
+
+    class FailingArtifactBridge:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def push(self, _host_path, _container_path):
+            raise RuntimeError("remote daemon unavailable")
+
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setattr(
+        image_generation_tool,
+        "_active_terminal_env",
+        lambda _task_id: DockerEnvironment(),
+    )
+    monkeypatch.setattr(
+        "tools.environments.artifact_bridge.ArtifactBridge",
+        FailingArtifactBridge,
+    )
+
+    raw = json.dumps({"success": True, "image": str(image_path)})
+    with caplog.at_level("WARNING"):
+        result = json.loads(
+            image_generation_tool._postprocess_image_generate_result(raw, task_id="task-1")
+        )
+
+    assert result == {"success": True, "image": str(image_path)}
+    assert "remote daemon unavailable" in caplog.text
+
+
 def test_concurrent_image_results_preserve_shared_remote_sync_state(monkeypatch, tmp_path):
     from tools import image_generation_tool
     from tools.environments import file_sync

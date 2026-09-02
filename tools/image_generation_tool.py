@@ -23,9 +23,11 @@ update when it's noticed.
 import json
 import logging
 import os
+import posixpath
 import datetime
 import threading
 import uuid
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 # fal_client is imported lazily — see _load_fal_client(). Pulling it
@@ -1034,14 +1036,35 @@ def _agent_visible_cache_path(host_path: str, env: Any) -> str | None:
     return None
 
 
-def _force_artifact_sync(env: Any) -> None:
+def _publish_generated_image(env: Any, host_path: str, agent_path: str) -> bool:
     sync_manager = getattr(env, "_sync_manager", None)
-    if sync_manager is None:
-        return
+    if sync_manager is not None:
+        try:
+            sync_manager.sync(force=True)
+            return True
+        except Exception as exc:  # noqa: BLE001 - keep generation success
+            logger.warning("Could not force-sync generated image artifact: %s", exc)
+            return False
+
+    if not bool(getattr(env, "remote_endpoint", False)):
+        return True
+
     try:
-        sync_manager.sync(force=True)
-    except Exception as exc:  # noqa: BLE001 - keep generation success; log for operators
-        logger.warning("Could not force-sync generated image artifact: %s", exc)
+        from hermes_constants import get_hermes_home
+        from tools.environments.artifact_bridge import ArtifactBridge
+
+        source = Path(host_path)
+        bridge = ArtifactBridge(
+            env,
+            cache_dir=get_hermes_home() / "cache" / "artifact-bridge",
+            host_roots=(source.parent,),
+            container_roots=(posixpath.dirname(agent_path) or "/",),
+        )
+        bridge.push(source, agent_path)
+        return True
+    except Exception as exc:  # noqa: BLE001 - keep the host-side image deliverable
+        logger.warning("Could not bridge generated image into remote Docker: %s", exc)
+        return False
 
 
 def _postprocess_image_generate_result(raw: str, task_id: str | None = None) -> str:
@@ -1068,8 +1091,8 @@ def _postprocess_image_generate_result(raw: str, task_id: str | None = None) -> 
     if not agent_path or agent_path == image:
         return raw
 
-    if env is not None:
-        _force_artifact_sync(env)
+    if env is not None and not _publish_generated_image(env, image, agent_path):
+        return raw
 
     payload.setdefault("host_image", image)
     payload.setdefault("agent_visible_image", agent_path)
