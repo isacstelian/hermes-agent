@@ -207,6 +207,19 @@ def _peers(root: Path) -> list[str]:
         return []
 
 
+def _hermes_cli() -> str:
+    """Absolute ``hermes`` CLI beside this gateway's interpreter (#93590).
+
+    The background delivery runner is spawned through the user's login
+    shell, whose rc files may put an older ``hermes`` shim first on PATH;
+    a bare name then resolves to a CLI without ``--create-if-missing`` /
+    ``--query-file`` and the delivery dies with exit 2.
+    """
+    from tools.bot_relay import _hermes_cli as _resolve
+
+    return _resolve()
+
+
 def _handle(name: str) -> str:
     return "hermes" if name == "default" else name
 
@@ -313,7 +326,7 @@ def message_agent_tool(
         # local-teammate path's `-p <resolved>` pin below.
         return _start_delivery(
             [
-                "hermes",
+                _hermes_cli(),
                 "-p",
                 _self_profile_name(root),
                 "peer",
@@ -361,7 +374,7 @@ def message_agent_tool(
 
     return _start_delivery(
         [
-            "hermes",
+            _hermes_cli(),
             "-p",
             resolved,
             "chat",
