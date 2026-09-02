@@ -1649,12 +1649,8 @@ class DockerEnvironment(BaseEnvironment):
             migrated = self._remove_stale_config_containers(
                 task_label, profile_name, egress_label, mount_fingerprint
             )
-            existing = (
-                (migrated, "running")
-                if migrated
-                else self._find_reusable_container(
-                    task_label, profile_name, egress_label, mount_fingerprint,
-                )
+            existing = migrated or self._find_reusable_container(
+                task_label, profile_name, egress_label, mount_fingerprint,
             )
             if existing is not None:
                 container_id, state = existing
@@ -2869,8 +2865,8 @@ class DockerEnvironment(BaseEnvironment):
         profile_label: str,
         egress_label: str,
         mounts_label: str,
-    ) -> Optional[str]:
-        """Remove same-owner containers with immutable config mismatches."""
+    ) -> Optional[tuple[str, str]]:
+        """Remove stale containers and return a reusable migration candidate."""
         fmt = (
             '{{.ID}}\t{{.Label "'
             + _MOUNTS_LABEL_KEY
@@ -3026,7 +3022,7 @@ class DockerEnvironment(BaseEnvironment):
                             "could not remove migrated legacy Docker container "
                             f"{container_id[:12]}: {removed_legacy.stderr.strip()}"
                         )
-                    return migrated[0]
+                    return migrated
                 if len(owned_containers) != 1:
                     raise RuntimeError(
                         "found multiple matching Hermes Docker containers with "
@@ -3043,7 +3039,7 @@ class DockerEnvironment(BaseEnvironment):
                         "reset that container before retrying; Hermes will not reuse, "
                         "replace, or race an identity-unknown container."
                     )
-                return self._migrate_legacy_container(container_id)
+                return self._migrate_legacy_container(container_id), "running"
 
         for container_id, actual_mounts, actual_egress, _ in owned_containers:
             egress_matches = (

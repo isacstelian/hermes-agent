@@ -1061,7 +1061,7 @@ def test_verified_persistent_legacy_container_is_migrated(monkeypatch):
         env._labels[docker_env._MOUNTS_LABEL_KEY],
     )
 
-    assert migrated == "replacement-cid"
+    assert migrated == ("replacement-cid", "running")
     commands = [cmd for cmd, _ in calls]
     commit_index = next(i for i, cmd in enumerate(commands) if cmd[1] == "commit")
     stop_index = next(i for i, cmd in enumerate(commands) if cmd[1] == "stop")
@@ -1235,7 +1235,7 @@ def test_legacy_migration_rechecks_for_replacement_inside_lock(monkeypatch):
     monkeypatch.setattr(
         env,
         "_find_reusable_container",
-        lambda *_args: ("replacement-cid", True),
+        lambda *_args: ("replacement-cid", "running"),
     )
 
     result = env._remove_stale_config_containers(
@@ -1245,11 +1245,12 @@ def test_legacy_migration_rechecks_for_replacement_inside_lock(monkeypatch):
         env._labels[docker_env._MOUNTS_LABEL_KEY],
     )
 
-    assert result == "replacement-cid"
+    assert result == ("replacement-cid", "running")
     assert not any(cmd[1] in {"commit", "stop", "run"} for cmd, _ in calls)
 
 
-def test_reused_replacement_removes_verified_legacy_residue(monkeypatch):
+@pytest.mark.parametrize("state", ["running", "exited", "created"])
+def test_reused_replacement_removes_verified_legacy_residue(monkeypatch, state):
     env, calls, mounts = _make_remote_persistent_legacy_env(monkeypatch)
 
     def _run(cmd, **kwargs):
@@ -1278,7 +1279,7 @@ def test_reused_replacement_removes_verified_legacy_residue(monkeypatch):
     monkeypatch.setattr(
         env,
         "_find_reusable_container",
-        lambda *_args: ("replacement-cid", "running"),
+        lambda *_args: ("replacement-cid", state),
     )
 
     result = env._remove_stale_config_containers(
@@ -1288,10 +1289,11 @@ def test_reused_replacement_removes_verified_legacy_residue(monkeypatch):
         env._labels[docker_env._MOUNTS_LABEL_KEY],
     )
 
-    assert result == "replacement-cid"
+    assert result == ("replacement-cid", state)
     assert ["/usr/bin/docker", "rm", "-f", "legacy-cid"] in [
         cmd for cmd, _ in calls
     ]
+    env._container_id = None
 
 
 def test_persistent_legacy_container_with_wrong_mount_is_refused(monkeypatch):
@@ -1626,6 +1628,38 @@ def test_reuse_starts_stopped_container_before_attaching(monkeypatch):
     assert start_invocations, "expected docker start for exited container"
     run_invocations = [c for c in calls if isinstance(c[0], list) and len(c[0]) >= 2 and c[0][1] == "run"]
     assert not run_invocations, "should not docker run when reusing an exited container"
+
+
+@pytest.mark.parametrize(
+    ("state", "expects_start"),
+    [("running", False), ("exited", True), ("created", True)],
+)
+def test_migrated_replacement_preserves_state_before_reuse(
+    monkeypatch, state, expects_start
+):
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(docker_env, "_get_active_profile_name", lambda: "default")
+    monkeypatch.setattr(
+        docker_env.DockerEnvironment,
+        "_remove_stale_config_containers",
+        lambda *_args: ("replacement-cid", state),
+    )
+    calls = _mock_subprocess_run(monkeypatch)
+
+    env = _make_dummy_env(task_id=f"migrated-{state}")
+
+    assert env._container_id == "replacement-cid"
+    start_invocations = [
+        call
+        for call in calls
+        if isinstance(call[0], list) and call[0][1:2] == ["start"]
+    ]
+    assert bool(start_invocations) is expects_start
+    assert not [
+        call
+        for call in calls
+        if isinstance(call[0], list) and call[0][1:2] == ["run"]
+    ]
 
 
 def test_failed_docker_run_cleans_up_orphaned_container(monkeypatch):
