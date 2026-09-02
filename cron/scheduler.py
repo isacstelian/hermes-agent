@@ -7204,6 +7204,7 @@ def _run_one_job_body(
     execution_id = job.get("execution_id")
     if not execution_id:
         execution_id = create_execution(job["id"], source="direct")["id"]
+    delivery_job = dict(job, execution_id=execution_id)
     delivery_attempted = False
     delivery_error = None
     # Durable failure-incident bookkeeping for this run (see cron.incidents):
@@ -7457,7 +7458,7 @@ def _run_one_job_body(
                             raise _FireClaimLostDuringSideEffect
                         delivery_attempted = True
                         delivery_error = _deliver_result(
-                            job,
+                            delivery_job,
                             deliver_content,
                             adapters=adapters,
                             loop=loop,
@@ -7615,7 +7616,7 @@ def _run_one_job_body(
                 try:
                     delivery_attempted = True
                     delivery_error = _deliver_result(
-                        job,
+                        delivery_job,
                         # Composed exactly like the normal failure delivery above.
                         # mark_job_run below records THIS run in failure_streak
                         # whichever layer failed, so a job that fails before the

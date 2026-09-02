@@ -78,6 +78,31 @@ def test_run_one_job_success_sequence(monkeypatch):
     assert calls[-1] == ("mark", "j2", True)
 
 
+def test_direct_run_passes_created_execution_id_to_delivery(monkeypatch):
+    delivered = []
+    monkeypatch.setattr(
+        s, "create_execution", lambda *_a, **_kw: {"id": "exec-direct"}
+    )
+    monkeypatch.setattr(s, "claim_dispatch", lambda _job_id: True)
+    monkeypatch.setattr(s, "mark_execution_running", lambda _execution_id: None)
+    monkeypatch.setattr(
+        s, "run_job", lambda *_a, **_kw: (True, "out", "final response", None)
+    )
+    monkeypatch.setattr(s, "save_job_output", lambda *_a, **_kw: "/tmp/out.txt")
+    monkeypatch.setattr(
+        s,
+        "_deliver_result",
+        lambda job, *_a, **_kw: delivered.append(job["execution_id"]) or None,
+    )
+    monkeypatch.setattr(s, "mark_job_run", lambda *_a, **_kw: None)
+    monkeypatch.setattr(s, "finish_execution", lambda *_a, **_kw: None)
+
+    job = {"id": "direct", "deliver": "telegram"}
+    assert s.run_one_job(job) is True
+    assert delivered == ["exec-direct"]
+    assert "execution_id" not in job
+
+
 def test_run_one_job_exception_delivers_failure_alert(monkeypatch):
     """An exception escaping the run body must not become a silent error row."""
     delivered = []
@@ -99,7 +124,9 @@ def test_run_one_job_exception_delivers_failure_alert(monkeypatch):
     monkeypatch.setattr(
         s,
         "_deliver_result",
-        lambda job, content, **_kw: delivered.append((job["id"], content)) or None,
+        lambda job, content, **_kw: delivered.append(
+            (job["id"], job["execution_id"], content)
+        ) or None,
     )
     monkeypatch.setattr(
         s,
@@ -116,7 +143,11 @@ def test_run_one_job_exception_delivers_failure_alert(monkeypatch):
 
     assert ok is False
     assert delivered == [
-        ("j3", "⚠️ Cron 'morning' failed: Gemini HTTP 503 (UNAVAILABLE)")
+        (
+            "j3",
+            "exec-j3",
+            "⚠️ Cron 'morning' failed: Gemini HTTP 503 (UNAVAILABLE)",
+        )
     ]
     assert marked == [
         (("j3", False, "Gemini HTTP 503 (UNAVAILABLE)"), {"delivery_error": None})
