@@ -531,6 +531,55 @@ class TestSandboxLookupUsesTheAgentSessionId:
         assert all("Couldn't deliver" not in s for s in adapter.sent), adapter.sent
 
     @pytest.mark.asyncio
+    async def test_first_turn_rebinds_lease_after_session_id_is_created(
+        self, tmp_path, monkeypatch
+    ):
+        current_session = [None]
+        session_id = "20260902_120000_deadbeef"
+        acquired = []
+        released = []
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+        monkeypatch.setattr(
+            "gateway.platforms.base.DOCUMENT_CACHE_DIR", tmp_path / "doc_cache"
+        )
+        env = _FakeRemoteEnv({"/root/first-turn.pdf": b"%PDF-first-turn"})
+        monkeypatch.setattr(
+            "tools.terminal_tool.get_active_env",
+            lambda task_id: env if task_id == session_id else None,
+        )
+        monkeypatch.setattr(
+            "tools.terminal_tool.acquire_environment_lease",
+            lambda task_id: acquired.append(task_id)
+            or SimpleNamespace(
+                requested_task_id=task_id,
+                release=lambda: released.append(task_id),
+            ),
+        )
+        adapter = _SessionKeyedAdapter(None)
+        adapter._session_store = SimpleNamespace(
+            peek_session_id=lambda _key: current_session[0]
+        )
+        adapter._keep_typing = _hold_typing
+
+        async def handler(_event):
+            current_session[0] = session_id
+            return "MEDIA:/root/first-turn.pdf"
+
+        adapter.set_message_handler(handler)
+        event = MessageEvent(
+            text="raport",
+            source=SessionSource(platform=Platform.TELEGRAM, chat_id="111"),
+        )
+        session_key = build_session_key(event.source)
+
+        await adapter._process_message_background(event, session_key)
+
+        assert acquired == [session_key, session_id]
+        assert released == [session_key, session_id]
+        assert len(adapter.documents) == 1, adapter.sent
+        assert Path(adapter.documents[0]).read_bytes() == b"%PDF-first-turn"
+
+    @pytest.mark.asyncio
     async def test_session_rotation_keeps_pre_rotation_artifact_environment(
         self, tmp_path, monkeypatch
     ):

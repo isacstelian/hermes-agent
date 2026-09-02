@@ -6514,6 +6514,21 @@ class BasePlatformAdapter(ABC):
 
             # Call the handler (this can take a while with tool calls)
             response = await self._message_handler(event)
+            # A first-turn session does not have a session_id when the outer
+            # adapter starts processing, so the early lease falls back to the
+            # routing key. Rebind after the handler has created the session;
+            # existing turns keep their pre-handler lease so a compression
+            # rotation still delivers artifacts from the old environment.
+            if (
+                _artifact_lease is not None
+                and getattr(_artifact_lease, "requested_task_id", None) == session_key
+            ):
+                _resolved_task_id = self.agent_task_id_for_session(session_key)
+                if _resolved_task_id and _resolved_task_id != session_key:
+                    _resolved_lease = acquire_media_delivery_lease(_resolved_task_id)
+                    if _resolved_lease is not None:
+                        _artifact_lease.release()
+                        _artifact_lease = _resolved_lease
             is_ephemeral_response = isinstance(response, EphemeralReply)
 
             # Slash-command handlers may return an EphemeralReply sentinel to
