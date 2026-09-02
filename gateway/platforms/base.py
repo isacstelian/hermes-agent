@@ -6523,7 +6523,14 @@ class BasePlatformAdapter(ABC):
                 _artifact_lease is not None
                 and getattr(_artifact_lease, "requested_task_id", None) == session_key
             ):
-                _resolved_task_id = self.agent_task_id_for_session(session_key)
+                # The store may already point at a compression child by the
+                # time the handler returns. GatewayRunner records the task id
+                # that actually ran so first-turn artifacts stay attached to
+                # the environment that created them.
+                _resolved_task_id = (
+                    getattr(event, "_artifact_task_id", None)
+                    or self.agent_task_id_for_session(session_key)
+                )
                 if _resolved_task_id and _resolved_task_id != session_key:
                     _resolved_lease = acquire_media_delivery_lease(_resolved_task_id)
                     if _resolved_lease is not None:

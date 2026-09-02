@@ -2958,12 +2958,7 @@ class DockerEnvironment(BaseEnvironment):
                         "legacy Docker container migration requires a cross-process "
                         "filesystem lock on this platform"
                     )
-                migrated = self._find_reusable_container(
-                    task_label, profile_label, egress_label, mounts_label
-                )
-                if migrated is not None:
-                    return migrated[0]
-                if len(legacy_containers) != 1 or len(owned_containers) != 1:
+                if len(legacy_containers) != 1:
                     raise RuntimeError(
                         "found multiple matching Hermes Docker containers with "
                         "ambiguous ownership; refusing automatic migration"
@@ -2974,6 +2969,69 @@ class DockerEnvironment(BaseEnvironment):
                     if egress_label == "off"
                     else actual_egress == egress_label
                 )
+                migrated = self._find_reusable_container(
+                    task_label, profile_label, egress_label, mounts_label
+                )
+                if migrated is not None:
+                    if actual_mounts != mounts_label or not egress_matches:
+                        raise RuntimeError(
+                            "found a legacy Hermes Docker container whose exact "
+                            f"task/profile identity cannot be verified ({container_id[:12]}). "
+                            "Remove or reset that container before retrying; Hermes will "
+                            "not reuse, replace, or race an identity-unknown container."
+                        )
+                    legacy_mounts_verified = (
+                        self._legacy_container_has_expected_mounts(container_id)
+                    )
+                    if not legacy_mounts_verified:
+                        legacy_probe = subprocess.run(
+                            [self._docker_exe, "inspect", container_id],
+                            capture_output=True,
+                            text=True,
+                            encoding="utf-8",
+                            errors="replace",
+                            timeout=10,
+                            check=False,
+                            stdin=subprocess.DEVNULL,
+                        )
+                        legacy_is_gone = (
+                            legacy_probe.returncode != 0
+                            and self._is_container_gone(legacy_probe.stderr or "")
+                        )
+                        if not legacy_is_gone:
+                            raise RuntimeError(
+                                "found a legacy Hermes Docker container whose exact "
+                                "task/profile identity cannot be verified "
+                                f"({container_id[:12]}). Remove or reset that container "
+                                "before retrying; Hermes will not reuse, replace, or race "
+                                "an identity-unknown container."
+                            )
+                    removed_legacy = subprocess.run(
+                        [self._docker_exe, "rm", "-f", container_id],
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        timeout=30,
+                        check=False,
+                        stdin=subprocess.DEVNULL,
+                    )
+                    if (
+                        removed_legacy.returncode != 0
+                        and not self._is_container_gone(
+                            removed_legacy.stderr or ""
+                        )
+                    ):
+                        raise RuntimeError(
+                            "could not remove migrated legacy Docker container "
+                            f"{container_id[:12]}: {removed_legacy.stderr.strip()}"
+                        )
+                    return migrated[0]
+                if len(owned_containers) != 1:
+                    raise RuntimeError(
+                        "found multiple matching Hermes Docker containers with "
+                        "ambiguous ownership; refusing automatic migration"
+                    )
                 if (
                     actual_mounts != mounts_label
                     or not egress_matches
@@ -3157,15 +3215,16 @@ class DockerEnvironment(BaseEnvironment):
                     f"{container_id[:12]}: {committed.stderr.strip()}"
                 )
 
+            stop_attempted = True
             stopped = run("stop", container_id)
             if stopped.returncode != 0:
-                if "is not running" not in (stopped.stderr or "").lower():
+                if "is not running" in (stopped.stderr or "").lower():
+                    stop_attempted = False
+                else:
                     raise RuntimeError(
                         "could not stop legacy Docker container "
                         f"{container_id[:12]}: {stopped.stderr.strip()}"
                     )
-            else:
-                stop_attempted = True
             label_args = []
             for key, value in self._labels.items():
                 label_args.extend(["--label", f"{key}={value}"])

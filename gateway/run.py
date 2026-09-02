@@ -19665,6 +19665,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # below; a /new or another lifecycle transition may move
             # session_entry.session_id while the old run is still unwinding.
             _run_start_session_id = session_entry.session_id
+            # BasePlatformAdapter reacquires its first-turn artifact lease
+            # after this handler returns. Preserve the task id that actually
+            # ran because same-turn compression may rotate the store binding.
+            setattr(event, "_artifact_task_id", _run_start_session_id)
             _turn_started_monotonic = time.monotonic()
             agent_result = await self._run_agent(
                 message=message_text,
