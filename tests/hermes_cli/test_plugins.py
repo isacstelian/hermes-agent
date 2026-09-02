@@ -782,7 +782,20 @@ class TestPluginLoading:
 class TestPluginHooks:
     """Tests for lifecycle hook registration and invocation."""
 
+    def test_gateway_message_delivered_keeps_exact_event_payload(self):
+        payload = {
+            "source": "cron",
+            "execution_id": "exec-1",
+            "job_id": "job-1",
+            "platform": "telegram",
+            "chat_id": "123",
+            "thread_id": None,
+            "message_id": "456",
+        }
+        mgr = PluginManager()
+        mgr._hooks["gateway_message_delivered"] = [lambda **kwargs: kwargs]
 
+        assert mgr.invoke_hook("gateway_message_delivered", **payload) == [payload]
 
     def test_pre_gateway_dispatch_collects_action_dicts(self, tmp_path, monkeypatch):
         """pre_gateway_dispatch callbacks return action dicts (skip/rewrite/allow)."""

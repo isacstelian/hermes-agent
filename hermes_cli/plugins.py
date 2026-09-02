@@ -5606,7 +5606,7 @@ class PluginManager:
         # platform events define event-local additive envelopes instead: injecting
         # a bus-wide version here would turn unrelated adapter payloads into one
         # monolithic compatibility contract (#64176).
-        if hook_name != "gateway_platform_event":
+        if hook_name not in {"gateway_platform_event", "gateway_message_delivered"}:
             kwargs.setdefault("telemetry_schema_version", OBSERVER_SCHEMA_VERSION)
         callbacks = self._hooks.get(hook_name, [])
         results: List[Any] = []
