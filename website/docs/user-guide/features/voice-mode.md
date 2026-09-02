@@ -425,6 +425,7 @@ stt:
                                     # inbound message, useful for custom pipelines
                                     # (diarization, alignment, archival, etc.)
   provider: "local"                  # "local" (free) | "groq" | "openai" | "mistral" | "xai"
+  fallback_provider: ""              # optional explicit second provider; blank disables cloud failover
   local:
     model: "base"                    # tiny, base, small, medium, large-v3
     language: ""                     # optional ISO-639-1 hint; blank = use HERMES_LOCAL_STT_LANGUAGE if set, else auto-detect

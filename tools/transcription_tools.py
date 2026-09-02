@@ -2952,6 +2952,92 @@ def _transcribe_prepared_audio(
         }
 
     provider = _get_provider(stt_config)
+    primary_result = _transcribe_with_provider_preprocessing(
+        file_path,
+        provider,
+        stt_config,
+        model=model,
+        source=source,
+    )
+    if primary_result.get("success"):
+        return primary_result
+
+    fallback_provider, fallback_config_error = _resolve_configured_stt_fallback(
+        stt_config,
+        provider,
+    )
+    if fallback_provider is None and fallback_config_error is None:
+        return primary_result
+
+    primary_provider = str(primary_result.get("provider") or provider or "unknown")
+    primary_error = _stt_result_error(primary_result)
+    configured_fallback = _configured_stt_fallback_name(stt_config) or "unknown"
+
+    if fallback_config_error:
+        logger.warning(
+            "Primary STT provider '%s' failed: %s. Configured fallback '%s' "
+            "was not attempted: %s",
+            primary_provider,
+            primary_error,
+            configured_fallback,
+            fallback_config_error,
+        )
+        return _combined_stt_failure(
+            primary_result,
+            primary_provider,
+            configured_fallback,
+            fallback_config_error=fallback_config_error,
+        )
+
+    logger.warning(
+        "Primary STT provider '%s' failed: %s. Trying explicitly configured "
+        "fallback provider '%s'.",
+        primary_provider,
+        primary_error,
+        fallback_provider,
+    )
+    fallback_result = _transcribe_with_provider_preprocessing(
+        file_path,
+        fallback_provider,
+        stt_config,
+        model=None,
+        source=source,
+    )
+    if fallback_result.get("success"):
+        fallback_result = dict(fallback_result)
+        fallback_result.setdefault("provider", fallback_provider)
+        logger.info(
+            "STT recovered with explicitly configured fallback provider '%s' "
+            "after primary provider '%s' failed.",
+            fallback_result["provider"],
+            primary_provider,
+        )
+        return fallback_result
+
+    fallback_error = _stt_result_error(fallback_result)
+    logger.warning(
+        "Fallback STT provider '%s' failed after primary provider '%s': %s",
+        fallback_provider,
+        primary_provider,
+        fallback_error,
+    )
+    return _combined_stt_failure(
+        primary_result,
+        primary_provider,
+        fallback_provider,
+        fallback_result=fallback_result,
+    )
+
+
+def _transcribe_with_provider_preprocessing(
+    file_path: str,
+    provider: str,
+    stt_config: Dict[str, Any],
+    *,
+    model: Optional[str],
+    source: Optional[str],
+) -> Dict[str, Any]:
+    """Apply provider-scoped guards and preprocessing, then dispatch once."""
     if not _is_local_stt_provider(provider, stt_config):
         error = _validate_audio_file_size(Path(file_path))
         if error:
@@ -2982,6 +3068,101 @@ def _transcribe_prepared_audio(
     finally:
         if trim_cleanup_dir:
             shutil.rmtree(trim_cleanup_dir, ignore_errors=True)
+
+
+def _configured_stt_fallback_name(stt_config: Dict[str, Any]) -> Optional[str]:
+    """Return the normalized explicit fallback name, if one was configured."""
+    raw_provider = stt_config.get("fallback_provider")
+    if not isinstance(raw_provider, str):
+        return None
+    provider = raw_provider.strip().lower()
+    return provider or None
+
+
+def _resolve_configured_stt_fallback(
+    stt_config: Dict[str, Any],
+    primary_provider: str,
+) -> tuple[Optional[str], Optional[str]]:
+    """Resolve the opt-in STT fallback or return a configuration error."""
+    raw_provider = stt_config.get("fallback_provider")
+    if raw_provider is None:
+        return None, None
+    if not isinstance(raw_provider, str):
+        return None, "stt.fallback_provider must be a provider name string"
+
+    requested_provider = raw_provider.strip().lower()
+    if not requested_provider or requested_provider == "none":
+        return None, None
+
+    configured_primary = stt_config.get("provider")
+    configured_primary = (
+        configured_primary.strip().lower()
+        if isinstance(configured_primary, str)
+        else None
+    )
+    resolved_primary = str(primary_provider or "").strip().lower()
+    if requested_provider in {configured_primary, resolved_primary}:
+        return None, (
+            f"stt.fallback_provider='{requested_provider}' is the same as the "
+            "primary provider"
+        )
+
+    fallback_config = dict(stt_config)
+    fallback_config["provider"] = requested_provider
+    resolved_fallback = _get_provider(fallback_config)
+    resolved_fallback = str(resolved_fallback or "").strip().lower()
+    if not resolved_fallback or resolved_fallback == "none":
+        return None, (
+            f"stt.fallback_provider='{requested_provider}' is configured but unavailable"
+        )
+    if resolved_fallback == resolved_primary:
+        return None, (
+            f"stt.fallback_provider='{requested_provider}' resolves to the same "
+            f"provider as the primary provider ('{resolved_primary}')"
+        )
+    return resolved_fallback, None
+
+
+def _stt_result_error(result: Dict[str, Any]) -> str:
+    error = result.get("error")
+    if isinstance(error, str) and error.strip():
+        return error.strip()
+    return "unknown transcription error"
+
+
+def _combined_stt_failure(
+    primary_result: Dict[str, Any],
+    primary_provider: str,
+    fallback_provider: str,
+    *,
+    fallback_result: Optional[Dict[str, Any]] = None,
+    fallback_config_error: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Return one diagnostic envelope retaining both attempted failure causes."""
+    primary_error = _stt_result_error(primary_result)
+    result = dict(fallback_result if fallback_result is not None else primary_result)
+    result.update({
+        "success": False,
+        "transcript": "",
+        "provider": fallback_provider if fallback_result is not None else primary_provider,
+        "primary_provider": primary_provider,
+        "primary_error": primary_error,
+        "fallback_provider": fallback_provider,
+    })
+    if fallback_result is not None:
+        fallback_error = _stt_result_error(fallback_result)
+        result["fallback_error"] = fallback_error
+        result["error"] = (
+            f"Primary STT provider '{primary_provider}' failed: {primary_error}. "
+            f"Fallback STT provider '{fallback_provider}' failed: {fallback_error}"
+        )
+    else:
+        result["fallback_error"] = fallback_config_error or "invalid fallback configuration"
+        result["error"] = (
+            f"Primary STT provider '{primary_provider}' failed: {primary_error}. "
+            f"Fallback STT configuration error: {result['fallback_error']}"
+        )
+    return result
 
 
 def _dispatch_stt_provider(
