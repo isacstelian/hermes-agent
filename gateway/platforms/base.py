@@ -4439,7 +4439,7 @@ class BasePlatformAdapter(ABC):
         images: List[Tuple[str, str]],
         metadata: Optional[Dict[str, Any]] = None,
         human_delay: float = 0.0,
-    ) -> None:
+    ) -> SendResult:
         """Send a batch of images.
 
         Accepts ``http(s)://``, ``file://`` URIs in the first tuple
@@ -4454,6 +4454,8 @@ class BasePlatformAdapter(ABC):
         """
         from urllib.parse import unquote as _unquote
 
+        failures: List[str] = []
+        message_ids: List[str] = []
         for image_url, alt_text in images:
             if human_delay > 0:
                 await asyncio.sleep(human_delay)
@@ -4485,10 +4487,23 @@ class BasePlatformAdapter(ABC):
                         caption=alt_text if alt_text else None,
                         metadata=metadata,
                     )
-                if not img_result.success:
+                if img_result is None:
+                    failures.append("platform returned no delivery result")
+                elif img_result.success:
+                    if img_result.message_id:
+                        message_ids.append(img_result.message_id)
+                else:
                     logger.error("[%s] Failed to send image: %s", self.name, img_result.error)
+                    failures.append(img_result.error or "platform upload failed")
             except Exception as img_err:
                 logger.error("[%s] Error sending image: %s", self.name, img_err, exc_info=True)
+                failures.append(str(img_err))
+        return SendResult(
+            success=not failures,
+            message_id=message_ids[-1] if message_ids else None,
+            continuation_message_ids=tuple(message_ids[:-1]),
+            error="; ".join(failures) if failures else None,
+        )
 
     async def send_image(
         self,
@@ -6883,9 +6898,8 @@ class BasePlatformAdapter(ABC):
                             human_delay=human_delay,
                         )
                         _record_delivery(image_result)
-                        if (
-                            image_result is not None
-                            and not getattr(image_result, "success", True)
+                        if image_result is None or not getattr(
+                            image_result, "success", False
                         ):
                             logger.warning(
                                 "[%s] Failed to send image batch: %s",
@@ -6946,9 +6960,8 @@ class BasePlatformAdapter(ABC):
                             human_delay=human_delay,
                         )
                         _record_delivery(image_result)
-                        if (
-                            image_result is not None
-                            and not getattr(image_result, "success", True)
+                        if image_result is None or not getattr(
+                            image_result, "success", False
                         ):
                             logger.warning(
                                 "[%s] Failed to send local image batch: %s",

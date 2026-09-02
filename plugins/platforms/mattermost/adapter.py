@@ -640,7 +640,7 @@ class MattermostAdapter(BasePlatformAdapter):
         images: List[Tuple[str, str]],
         metadata: Optional[Dict[str, Any]] = None,
         human_delay: float = 0.0,
-    ) -> None:
+    ) -> SendResult:
         """Send a batch of images as a single Mattermost post with multiple attachments.
 
         Mattermost supports up to 5 ``file_ids`` per post. Each image is
@@ -650,7 +650,7 @@ class MattermostAdapter(BasePlatformAdapter):
         base per-image loop on total failure.
         """
         if not images:
-            return
+            return SendResult(success=True)
 
         import mimetypes
         import aiohttp
@@ -659,12 +659,15 @@ class MattermostAdapter(BasePlatformAdapter):
         CHUNK = 5  # Mattermost post file_ids cap
         chunks = [images[i:i + CHUNK] for i in range(0, len(images), CHUNK)]
 
+        failures: List[str] = []
+        message_ids: List[str] = []
         for chunk_idx, chunk in enumerate(chunks):
             if human_delay > 0 and chunk_idx > 0:
                 await asyncio.sleep(human_delay)
 
             file_ids: List[str] = []
             caption_parts: List[str] = []
+            invalid_images = 0
             try:
                 for image_url, alt_text in chunk:
                     if alt_text:
@@ -675,6 +678,7 @@ class MattermostAdapter(BasePlatformAdapter):
                         p = Path(local_path)
                         if not p.exists():
                             logger.warning("Mattermost: skipping missing image %s", local_path)
+                            invalid_images += 1
                             continue
                         fname = p.name
                         ct = mimetypes.guess_type(fname)[0] or "image/png"
@@ -683,6 +687,7 @@ class MattermostAdapter(BasePlatformAdapter):
                         from tools.url_safety import is_safe_url
                         if not is_safe_url(image_url):
                             logger.warning("Mattermost: blocked unsafe image URL in batch")
+                            invalid_images += 1
                             continue
                         try:
                             async with self._session.get(
@@ -693,20 +698,32 @@ class MattermostAdapter(BasePlatformAdapter):
                                         "Mattermost: failed to download image (HTTP %d): %s",
                                         resp.status, image_url[:80],
                                     )
+                                    invalid_images += 1
                                     continue
                                 file_data = await resp.read()
                                 ct = resp.content_type or "image/png"
                         except Exception as dl_err:
                             logger.warning("Mattermost: download failed for %s: %s", image_url[:80], dl_err)
+                            invalid_images += 1
                             continue
                         fname = image_url.rsplit("/", 1)[-1].split("?")[0] or f"image_{len(file_ids)}.png"
 
                     fid = await self._upload_file(chat_id, file_data, fname, ct)
                     if fid:
                         file_ids.append(fid)
+                    else:
+                        invalid_images += 1
 
                 if not file_ids:
+                    failures.append(
+                        f"No valid images in chunk {chunk_idx + 1}/{len(chunks)}"
+                    )
                     continue
+                if invalid_images:
+                    failures.append(
+                        f"Skipped {invalid_images} invalid image(s) in chunk "
+                        f"{chunk_idx + 1}/{len(chunks)}"
+                    )
 
                 payload: Dict[str, Any] = _with_mentions_disabled({
                     "channel_id": chat_id,
@@ -723,13 +740,39 @@ class MattermostAdapter(BasePlatformAdapter):
                 data = await self._post_preserving_thread(chat_id, payload, metadata)
                 if not data or "id" not in data:
                     logger.warning("Mattermost: multi-image post failed, falling back")
-                    await super().send_multiple_images(chat_id, chunk, metadata, human_delay=human_delay)
+                    fallback = await super().send_multiple_images(
+                        chat_id, chunk, metadata, human_delay=human_delay
+                    )
+                    if fallback.message_id:
+                        message_ids.extend(
+                            str(mid) for mid in fallback.continuation_message_ids if mid
+                        )
+                        message_ids.append(fallback.message_id)
+                    if not fallback.success:
+                        failures.append(fallback.error or "Mattermost fallback failed")
+                else:
+                    message_ids.append(str(data["id"]))
             except Exception as e:
                 logger.warning(
                     "Mattermost: multi-image send failed (chunk %d/%d), falling back: %s",
                     chunk_idx + 1, len(chunks), e, exc_info=True,
                 )
-                await super().send_multiple_images(chat_id, chunk, metadata, human_delay=human_delay)
+                fallback = await super().send_multiple_images(
+                    chat_id, chunk, metadata, human_delay=human_delay
+                )
+                if fallback.message_id:
+                    message_ids.extend(
+                        str(mid) for mid in fallback.continuation_message_ids if mid
+                    )
+                    message_ids.append(fallback.message_id)
+                if not fallback.success:
+                    failures.append(fallback.error or "Mattermost fallback failed")
+        return SendResult(
+            success=not failures,
+            message_id=message_ids[-1] if message_ids else None,
+            continuation_message_ids=tuple(message_ids[:-1]),
+            error="; ".join(failures) if failures else None,
+        )
 
     # ------------------------------------------------------------------
     # WebSocket

@@ -4030,7 +4030,7 @@ class DiscordAdapter(BasePlatformAdapter):
         images: List[Tuple[str, str]],
         metadata: Optional[Dict[str, Any]] = None,
         human_delay: float = 0.0,
-    ) -> None:
+    ) -> SendResult:
         """Send a batch of images as a single Discord message with multiple attachments.
 
         Discord permits up to 10 file attachments per message. Batches are
@@ -4041,17 +4041,18 @@ class DiscordAdapter(BasePlatformAdapter):
         fall back to the base per-image loop.
         """
         if not self._client:
-            return
+            return SendResult(success=False, error="Not connected")
         if not images:
-            return
+            return SendResult(success=True)
 
         try:
             import discord as _discord_mod
             import io as _io
             from urllib.parse import unquote as _unquote
         except Exception:  # pragma: no cover
-            await super().send_multiple_images(chat_id, images, metadata, human_delay)
-            return
+            return await super().send_multiple_images(
+                chat_id, images, metadata, human_delay
+            )
 
         try:
             channel = self._client.get_channel(int(chat_id))
@@ -4059,15 +4060,18 @@ class DiscordAdapter(BasePlatformAdapter):
                 channel = await self._client.fetch_channel(int(chat_id))
             if not channel:
                 logger.warning("[%s] Channel %s not found for multi-image send", self.name, chat_id)
-                return
+                return SendResult(success=False, error=f"Channel {chat_id} not found")
         except Exception as e:
             logger.warning("[%s] Failed to resolve channel for multi-image send: %s", self.name, e)
-            await super().send_multiple_images(chat_id, images, metadata, human_delay)
-            return
+            return await super().send_multiple_images(
+                chat_id, images, metadata, human_delay
+            )
 
         CHUNK = 10
         chunks = [images[i:i + CHUNK] for i in range(0, len(images), CHUNK)]
 
+        failures: List[str] = []
+        message_ids: List[str] = []
         for chunk_idx, chunk in enumerate(chunks):
             if human_delay > 0 and chunk_idx > 0:
                 await asyncio.sleep(human_delay)
@@ -4123,7 +4127,15 @@ class DiscordAdapter(BasePlatformAdapter):
                             continue
 
                 if not files:
+                    failures.append(
+                        f"No valid images in chunk {chunk_idx + 1}/{len(chunks)}"
+                    )
                     continue
+                if len(files) != len(chunk):
+                    failures.append(
+                        f"Skipped {len(chunk) - len(files)} invalid image(s) in "
+                        f"chunk {chunk_idx + 1}/{len(chunks)}"
+                    )
 
                 # Use the first caption if any (Discord only has one message body for the group)
                 content = captions[0] if captions else None
@@ -4133,26 +4145,47 @@ class DiscordAdapter(BasePlatformAdapter):
                 )
 
                 if self._is_forum_parent(channel):
-                    await self._forum_post_file(
+                    result = await self._forum_post_file(
                         channel,
                         content=(content or "").strip(),
                         files=files,
                     )
                 else:
-                    await channel.send(content=content, files=files)
+                    message = await channel.send(content=content, files=files)
+                    result = SendResult(
+                        success=True,
+                        message_id=str(getattr(message, "id", "") or "") or None,
+                    )
+                if result.success:
+                    if result.message_id:
+                        message_ids.append(result.message_id)
+                else:
+                    failures.append(result.error or "Discord upload failed")
             except Exception as e:
                 logger.warning(
                     "[%s] Multi-image Discord send failed (chunk %d/%d), falling back to per-image: %s",
                     self.name, chunk_idx + 1, len(chunks), e,
                     exc_info=True,
                 )
-                await super().send_multiple_images(chat_id, chunk, metadata, human_delay=human_delay)
+                fallback = await super().send_multiple_images(
+                    chat_id, chunk, metadata, human_delay=human_delay
+                )
+                if fallback.message_id:
+                    message_ids.append(fallback.message_id)
+                if not fallback.success:
+                    failures.append(fallback.error or "Discord fallback failed")
             finally:
                 if aiohttp_session is not None:
                     try:
                         await aiohttp_session.close()
                     except Exception:
                         pass
+        return SendResult(
+            success=not failures,
+            message_id=message_ids[-1] if message_ids else None,
+            continuation_message_ids=tuple(message_ids[:-1]),
+            error="; ".join(failures) if failures else None,
+        )
 
     async def play_tts(
         self,

@@ -3723,7 +3723,7 @@ class SlackAdapter(BasePlatformAdapter):
         images: List[Tuple[str, str]],
         metadata: Optional[Dict[str, Any]] = None,
         human_delay: float = 0.0,
-    ) -> None:
+    ) -> SendResult:
         """Send a batch of images as a single Slack message with multiple file uploads.
 
         Uses ``files_upload_v2`` with its ``file_uploads`` parameter so all
@@ -3738,11 +3738,11 @@ class SlackAdapter(BasePlatformAdapter):
                 "[Slack] Suppressed multi-image upload in configured ignored channel %s",
                 chat_id,
             )
-            return
+            return SendResult(success=False, error="Upload suppressed for ignored channel")
         if not self._app:
-            return
+            return SendResult(success=False, error="Not connected")
         if not images:
-            return
+            return SendResult(success=True)
 
         chat_id = await self._ensure_dm_conversation(
             chat_id, team_id=self._metadata_team_id(metadata)
@@ -3755,14 +3755,18 @@ class SlackAdapter(BasePlatformAdapter):
                 is_safe_url as _is_safe_url,
             )
         except Exception:
-            await super().send_multiple_images(chat_id, images, metadata, human_delay)
-            return
+            return await super().send_multiple_images(
+                chat_id, images, metadata, human_delay
+            )
 
         thread_ts = self._resolve_thread_ts(None, metadata)
 
         CHUNK = 10
         chunks = [images[i : i + CHUNK] for i in range(0, len(images), CHUNK)]
 
+        failures: List[str] = []
+        message_ids: List[str] = []
+        last_response: Any = None
         for chunk_idx, chunk in enumerate(chunks):
             if human_delay > 0 and chunk_idx > 0:
                 await asyncio.sleep(human_delay)
@@ -3824,7 +3828,15 @@ class SlackAdapter(BasePlatformAdapter):
                                 continue
 
                 if not file_uploads:
+                    failures.append(
+                        f"No valid images in chunk {chunk_idx + 1}/{len(chunks)}"
+                    )
                     continue
+                if len(file_uploads) != len(chunk):
+                    failures.append(
+                        f"Skipped {len(chunk) - len(file_uploads)} invalid image(s) in "
+                        f"chunk {chunk_idx + 1}/{len(chunks)}"
+                    )
 
                 initial_comment = (
                     "\n".join(initial_comment_parts) if initial_comment_parts else ""
@@ -3843,8 +3855,12 @@ class SlackAdapter(BasePlatformAdapter):
                     initial_comment=initial_comment,
                     thread_ts=thread_ts,
                 )
+                last_response = result
                 self._record_uploaded_file_thread(chat_id, thread_ts, metadata)
-                _ = result
+                if isinstance(result, dict):
+                    message_id = result.get("ts")
+                    if message_id:
+                        message_ids.append(str(message_id))
             except Exception as e:
                 logger.warning(
                     "[Slack] Multi-image files_upload_v2 failed (chunk %d/%d), falling back to per-image: %s",
@@ -3853,9 +3869,23 @@ class SlackAdapter(BasePlatformAdapter):
                     e,
                     exc_info=True,
                 )
-                await super().send_multiple_images(
+                fallback = await super().send_multiple_images(
                     chat_id, chunk, metadata, human_delay=human_delay
                 )
+                if fallback.message_id:
+                    message_ids.extend(
+                        str(mid) for mid in fallback.continuation_message_ids if mid
+                    )
+                    message_ids.append(fallback.message_id)
+                if not fallback.success:
+                    failures.append(fallback.error or "Slack fallback failed")
+        return SendResult(
+            success=not failures,
+            message_id=message_ids[-1] if message_ids else None,
+            continuation_message_ids=tuple(message_ids[:-1]),
+            error="; ".join(failures) if failures else None,
+            raw_response=last_response,
+        )
 
     def _record_uploaded_file_thread(
         self,
