@@ -442,6 +442,7 @@ _HOOK_TIMEOUT_BOUNDED_HOOKS: Set[str] = {
     "pre_verify",
     "on_session_start",
     "on_session_end",
+    "gateway_message_delivered",
 }
 
 # Policy hooks: timeout / still-running must fail closed (block the tool).

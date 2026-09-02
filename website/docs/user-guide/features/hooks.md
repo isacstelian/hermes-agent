@@ -1293,7 +1293,7 @@ def register(ctx):
 | `thread_id` | `str \| None` | Configured topic/thread id, when present. |
 | `message_id` | `str` | Telegram-confirmed outbound message id. |
 
-The hook is observer-only and fail-open. Callback failures never change the delivery result. When no plugin subscribes, Hermes does not build the payload. The hook contains no message text and exposes no Telegram SDK or adapter object.
+The hook is observer-only and fail-open. Callbacks use the configured plugin-hook timeout, so an exception or stalled callback never changes the delivery result. When no plugin subscribes, Hermes does not build the payload. The hook contains no message text and exposes no Telegram SDK or adapter object.
 
 ---
 

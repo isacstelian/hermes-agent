@@ -1051,6 +1051,32 @@ class TestForceReloadSymmetry:
         assert elapsed < 1.0, f"caller blocked for {elapsed:.2f}s after timeout"
         hold.set()
 
+    def test_gateway_message_delivered_timeout_does_not_block_caller(
+        self, monkeypatch
+    ):
+        import time
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 0.05
+        )
+        hold = threading.Event()
+        started = threading.Event()
+
+        def blocker(**_kwargs):
+            started.set()
+            hold.wait(timeout=10.0)
+
+        mgr = PluginManager()
+        mgr._hooks["gateway_message_delivered"] = [blocker]
+
+        t0 = time.monotonic()
+        assert mgr.invoke_hook("gateway_message_delivered") == []
+        elapsed = time.monotonic() - t0
+
+        assert started.wait(timeout=1.0)
+        assert elapsed < 0.5
+        hold.set()
+
     def test_hook_callback_within_timeout_returns_value(self, monkeypatch):
         monkeypatch.setattr(
             "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 1.0
