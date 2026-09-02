@@ -367,6 +367,12 @@ VALID_HOOKS: Set[str] = {
     #       payload contracts; no inert VALID_HOOKS surface is registered
     #       ahead of implementation.
     "gateway_platform_event",
+    # Confirmed outbound-message observer. The v1 fire-sites cover Telegram
+    # cron delivery only (live adapter and standalone sender). Other gateway
+    # messages do not emit this hook yet. Return values are ignored.
+    # Kwargs: source="cron", execution_id, job_id, platform, chat_id,
+    #   thread_id: str | None, message_id.
+    "gateway_message_delivered",
     # Slash-command dispatch observer (#64204, observer-first per #64182
     # ground rule 3). Fired when a recognized slash command is about to be
     # dispatched, BEFORE the handler runs, on both the interactive CLI

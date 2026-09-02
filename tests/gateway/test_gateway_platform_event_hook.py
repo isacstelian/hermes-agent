@@ -1,8 +1,8 @@
 """Tests for the ``gateway_platform_event`` observer hook (#64176's observer half).
 
 Covers the normalized-envelope pattern that replaces raw-SDK handler args:
-* only ``gateway_platform_event`` is registered in ``VALID_HOOKS`` (no inert
-  hook surface without a concrete fire site)
+* implemented gateway hooks are registered in ``VALID_HOOKS`` while inert
+  names remain absent
 * the adapter forwards normalized events to a runner-owned callback; the runner
   performs the authoritative post-auth check before invoking plugins
 * ``TelegramAdapter._normalize_platform_event`` maps an inbound PTB update to a
@@ -111,12 +111,10 @@ def _auth_reaction_update(user_id, chat_type="private", chat_id=123, message_id=
 
 class TestHookRegistration:
     def test_gateway_platform_event_registered_reserved_absent(self):
-        """register_hook rejects names not in VALID_HOOKS, so the implemented
-        hook must be present. The reserved gateway_* names are deliberately
-        absent (no inert surface without a concrete fire site); lock that in."""
+        """Implemented hooks are registered; inert gateway names stay absent."""
         assert "gateway_platform_event" in VALID_HOOKS
         assert "gateway_session_titled" not in VALID_HOOKS
-        assert "gateway_message_delivered" not in VALID_HOOKS
+        assert "gateway_message_delivered" in VALID_HOOKS
         assert "gateway_thread_created" not in VALID_HOOKS
 
 

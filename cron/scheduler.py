@@ -37,7 +37,7 @@ except ImportError:
     except ImportError:
         msvcrt = None
 from pathlib import Path
-from typing import Any, List, Optional, Protocol
+from typing import Any, List, Optional, Protocol, cast
 
 # Add parent directory to path for imports BEFORE repo-level imports.
 # Without this, standalone invocations (e.g. after `hermes update` reloads
@@ -3010,6 +3010,40 @@ def _confirm_adapter_delivery(send_result) -> bool:
     return bool(getattr(send_result, "success"))
 
 
+def _emit_gateway_message_delivered(
+    job: dict,
+    *,
+    platform: str,
+    chat_id: Any,
+    thread_id: Any,
+    message_id: Any,
+) -> None:
+    """Emit the v1 Telegram cron-delivery observer, best-effort."""
+    if platform != "telegram" or message_id in (None, ""):
+        return
+    try:
+        from hermes_cli.lifecycle import has_hook, invoke_hook
+
+        if not has_hook("gateway_message_delivered"):
+            return
+        execution_id = job.get("execution_id")
+        job_id = job.get("id")
+        if not execution_id or not job_id or chat_id is None:
+            return
+        invoke_hook(
+            "gateway_message_delivered",
+            source="cron",
+            execution_id=str(execution_id),
+            job_id=str(job_id),
+            platform=platform,
+            chat_id=str(chat_id),
+            thread_id=str(thread_id) if thread_id is not None else None,
+            message_id=str(message_id),
+        )
+    except Exception:
+        logger.debug("gateway_message_delivered hook failed", exc_info=True)
+
+
 def _is_channel_dm_topic(
     runtime_adapter: Any,
     chat_id: Any,
@@ -3719,6 +3753,13 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 if adapter_ok:
                     logger.info("Job '%s': delivered to %s:%s via live adapter", job["id"], platform_name, chat_id)
                     delivered = True
+                    _emit_gateway_message_delivered(
+                        job,
+                        platform=platform_name,
+                        chat_id=chat_id,
+                        thread_id=thread_id,
+                        message_id=delivered_message_id,
+                    )
                     # Seed the thread session only now that delivery into it
                     # succeeded (deferred from thread-open above).
                     if opened_thread_id and not thread_seeded:
@@ -3909,6 +3950,19 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 msg = f"delivery warning: {_w} (target {platform_name}:{chat_id})"
                 logger.error("Job '%s': %s", job["id"], msg)
                 delivery_errors.append(msg)
+
+            if isinstance(result, dict):
+                standalone_result = cast(dict[str, Any], result)
+            else:
+                standalone_result = {}
+            if standalone_result.get("success") is True:
+                _emit_gateway_message_delivered(
+                    job,
+                    platform=platform_name,
+                    chat_id=chat_id,
+                    thread_id=thread_id,
+                    message_id=standalone_result.get("message_id"),
+                )
 
             logger.info("Job '%s': delivered to %s:%s", job["id"], platform_name, chat_id)
             _maybe_mirror_cron_delivery(
