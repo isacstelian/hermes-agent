@@ -4826,6 +4826,34 @@ class BasePlatformAdapter(ABC):
                 notify_err,
             )
 
+    async def _notify_image_batch_delivery_failure(
+        self,
+        chat_id: str,
+        count: int,
+        *,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Tell the user when a native image batch returned unsuccessful."""
+        noun = "image attachment" if count == 1 else "image attachments"
+        try:
+            notice = await self.send(
+                chat_id=chat_id,
+                content=f"⚠️ Couldn't deliver the {noun}.",
+                metadata=metadata,
+            )
+            if not notice.success:
+                logger.debug(
+                    "[%s] Could not send image-delivery-failure notice: %s",
+                    self.name,
+                    notice.error,
+                )
+        except Exception as notify_err:
+            logger.debug(
+                "[%s] Could not send image-delivery-failure notice: %s",
+                self.name,
+                notify_err,
+            )
+
     async def send_image_file(
         self,
         chat_id: str,
@@ -6833,14 +6861,35 @@ class BasePlatformAdapter(ABC):
                 if images:
                     logger.info("[%s] Extracted %d image(s) to send as attachments", self.name, len(images))
                     try:
-                        await self.send_multiple_images(
+                        image_result = await self.send_multiple_images(
                             chat_id=event.source.chat_id,
                             images=images,
                             metadata=_final_thread_metadata,
                             human_delay=human_delay,
                         )
+                        _record_delivery(image_result)
+                        if (
+                            image_result is not None
+                            and not getattr(image_result, "success", True)
+                        ):
+                            logger.warning(
+                                "[%s] Failed to send image batch: %s",
+                                self.name,
+                                getattr(image_result, "error", None)
+                                or "platform upload failed",
+                            )
+                            await self._notify_image_batch_delivery_failure(
+                                event.source.chat_id,
+                                len(images),
+                                metadata=_final_thread_metadata,
+                            )
                     except Exception as batch_err:
                         logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
+                        await self._notify_image_batch_delivery_failure(
+                            event.source.chat_id,
+                            len(images),
+                            metadata=_final_thread_metadata,
+                        )
 
 
                 # Send extracted media files — route by file type
@@ -6875,14 +6924,35 @@ class BasePlatformAdapter(ABC):
                 if _image_paths:
                     try:
                         _batch = [(f"file://{_quote(p)}", "") for p in _image_paths]
-                        await self.send_multiple_images(
+                        image_result = await self.send_multiple_images(
                             chat_id=event.source.chat_id,
                             images=_batch,
                             metadata=_final_thread_metadata,
                             human_delay=human_delay,
                         )
+                        _record_delivery(image_result)
+                        if (
+                            image_result is not None
+                            and not getattr(image_result, "success", True)
+                        ):
+                            logger.warning(
+                                "[%s] Failed to send local image batch: %s",
+                                self.name,
+                                getattr(image_result, "error", None)
+                                or "platform upload failed",
+                            )
+                            await self._notify_image_batch_delivery_failure(
+                                event.source.chat_id,
+                                len(_image_paths),
+                                metadata=_final_thread_metadata,
+                            )
                     except Exception as batch_err:
                         logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
+                        await self._notify_image_batch_delivery_failure(
+                            event.source.chat_id,
+                            len(_image_paths),
+                            metadata=_final_thread_metadata,
+                        )
 
                 if _non_image_media:
                     logger.info(

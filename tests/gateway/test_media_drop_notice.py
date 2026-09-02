@@ -124,6 +124,32 @@ async def test_successful_delivery_adds_no_notice(tmp_path):
     assert all("Couldn't deliver" not in s["content"] for s in adapter.sent), adapter.sent
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "response",
+    [
+        "![chart](https://example.com/chart.png)",
+        "MEDIA:{local_image}",
+    ],
+)
+async def test_failed_non_streaming_image_batch_gets_user_visible_notice(
+    response, tmp_path,
+):
+    adapter = _CapturingAdapter()
+    adapter._keep_typing = _hold_typing
+    adapter.send_multiple_images = AsyncMock(
+        return_value=SendResult(success=False, error="Telegram upload rejected")
+    )
+    local_image = tmp_path / "chart.png"
+    local_image.write_bytes(b"png")
+
+    await _deliver(adapter, response.format(local_image=local_image))
+
+    adapter.send_multiple_images.assert_awaited_once()
+    assert len(adapter.sent) == 1, adapter.sent
+    assert "Couldn't deliver the image attachment" in adapter.sent[0]["content"]
+
+
 def _fake_runner():
     return SimpleNamespace(
         _thread_metadata_for_source=lambda source, anchor=None: {},
