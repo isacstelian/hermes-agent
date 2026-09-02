@@ -1,5 +1,7 @@
 """Behavior tests for the explicitly configured STT fallback provider."""
 
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -79,6 +81,75 @@ def test_elevenlabs_quota_failure_uses_explicit_openai_fallback(
     assert all(call["source"] == "gateway" for call in hook_calls)
     assert trim.call_count == 2
     assert "quota exhausted: 0 credits remaining" in caplog.text
+
+
+def test_elevenlabs_fallback_transcodes_rejected_telegram_ogg(
+    audio_file, monkeypatch,
+):
+    config = {
+        "provider": "elevenlabs",
+        "fallback_provider": "openai",
+        "elevenlabs": {"model_id": "scribe_v2"},
+        "openai": {"model": "gpt-transcribe"},
+    }
+    converted = str(audio_file).removesuffix(".ogg") + ".m4a"
+    Path(converted).write_bytes(b"converted audio")
+
+    class FakeBadRequestError(Exception):
+        pass
+
+    fake_openai = SimpleNamespace(
+        OpenAI=MagicMock(),
+        APIError=type("APIError", (Exception,), {}),
+        APIConnectionError=type("APIConnectionError", (Exception,), {}),
+        APITimeoutError=type("APITimeoutError", (Exception,), {}),
+        BadRequestError=FakeBadRequestError,
+    )
+    client = MagicMock()
+    client.audio.transcriptions.create.side_effect = [
+        FakeBadRequestError("unsupported audio container"),
+        SimpleNamespace(text="mesaj recuperat"),
+    ]
+    fake_openai.OpenAI.return_value = client
+    monkeypatch.setitem(sys.modules, "openai", fake_openai)
+
+    with patch.object(transcription_tools, "_load_stt_config", return_value=config), \
+         patch.object(transcription_tools, "_HAS_OPENAI", True), \
+         patch.object(
+             transcription_tools,
+             "_transcribe_elevenlabs",
+             return_value={
+                 "success": False,
+                 "transcript": "",
+                 "error": "HTTP 401 quota exhausted",
+                 "provider": "elevenlabs",
+             },
+         ), \
+         patch.object(
+             transcription_tools,
+             "_transcode_audio_for_stt",
+             return_value=(converted, None),
+         ) as transcode, \
+         patch.object(
+             transcription_tools, "_trim_silence_for_cloud_stt", return_value=None
+         ):
+        result = transcription_tools.transcribe_audio(audio_file, source="gateway")
+
+    assert result == {
+        "success": True,
+        "transcript": "mesaj recuperat",
+        "provider": "openai",
+    }
+    transcode.assert_called_once()
+    assert transcode.call_args.args[0] == audio_file
+    assert [
+        call.kwargs["file"].name
+        for call in client.audio.transcriptions.create.call_args_list
+    ] == [audio_file, converted]
+    assert all(
+        call.kwargs["model"] == "gpt-transcribe"
+        for call in client.audio.transcriptions.create.call_args_list
+    )
 
 
 def test_cloud_fallback_is_not_used_without_explicit_opt_in(audio_file):
