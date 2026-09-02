@@ -150,19 +150,6 @@ async def test_failed_non_streaming_image_batch_gets_user_visible_notice(
     assert "Couldn't deliver the image attachment" in adapter.sent[0]["content"]
 
 
-@pytest.mark.asyncio
-async def test_missing_non_streaming_image_batch_result_gets_notice():
-    adapter = _CapturingAdapter()
-    adapter._keep_typing = _hold_typing
-    adapter.send_multiple_images = AsyncMock(return_value=None)
-
-    await _deliver(adapter, "![chart](https://example.com/chart.png)")
-
-    adapter.send_multiple_images.assert_awaited_once()
-    assert len(adapter.sent) == 1, adapter.sent
-    assert "Couldn't deliver the image attachment" in adapter.sent[0]["content"]
-
-
 def _fake_runner():
     return SimpleNamespace(
         _thread_metadata_for_source=lambda source, anchor=None: {},
@@ -215,19 +202,3 @@ async def test_post_stream_success_sends_no_notice(tmp_path):
 
     adapter.send_document.assert_awaited_once()
     adapter.send.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_missing_post_stream_image_batch_result_gets_notice(tmp_path):
-    adapter = _stream_adapter()
-    image = tmp_path / "chart.png"
-    image.write_bytes(b"png")
-    adapter.send_multiple_images = AsyncMock(return_value=None)
-
-    await GatewayRunner._deliver_media_from_response(
-        _fake_runner(), f"MEDIA:{image}", _event(), adapter, thread_metadata={}
-    )
-
-    adapter.send_multiple_images.assert_awaited_once()
-    adapter.send.assert_awaited_once()
-    assert "Couldn't deliver" in adapter.send.await_args.kwargs["content"]

@@ -2494,65 +2494,35 @@ class MatrixAdapter(BasePlatformAdapter):
         images: list[tuple[str, str]],
         metadata: Optional[Dict[str, Any]] = None,
         human_delay: float = 0.0,
-    ) -> SendResult:
+    ) -> None:
         """Send multiple Matrix images as one ordered logical batch."""
         if not images:
-            return SendResult(success=True)
+            return
         from urllib.parse import unquote as _unquote
 
         total = len(images)
-        failures: list[str] = []
-        message_ids: list[str] = []
         for idx, (image_url, alt_text) in enumerate(images, start=1):
             if human_delay > 0 and idx > 1:
                 await asyncio.sleep(human_delay)
             caption = alt_text or None
             if total > 1 and caption:
                 caption = f"{caption} ({idx}/{total})"
-            try:
-                if image_url.startswith("file://"):
-                    result = await self.send_image_file(
-                        chat_id=chat_id,
-                        image_path=_unquote(image_url[7:]),
-                        caption=caption,
-                        metadata=metadata,
-                    )
-                else:
-                    result = await self.send_image(
-                        chat_id=chat_id,
-                        image_url=image_url,
-                        caption=caption,
-                        metadata=metadata,
-                    )
-                if result is None:
-                    failures.append(f"Image {idx}/{total} returned no delivery result")
-                elif not result.success:
-                    failures.append(
-                        f"Image {idx}/{total} failed: {result.error or 'upload failed'}"
-                    )
-                    logger.warning(
-                        "Matrix: failed to send image %d/%d: %s",
-                        idx,
-                        total,
-                        result.error,
-                    )
-                elif result.message_id:
-                    message_ids.append(result.message_id)
-            except Exception as exc:
-                failures.append(f"Image {idx}/{total} failed: {exc}")
-                logger.warning(
-                    "Matrix: failed to send image %d/%d: %s",
-                    idx,
-                    total,
-                    exc,
-                    exc_info=True,
+            if image_url.startswith("file://"):
+                result = await self.send_image_file(
+                    chat_id=chat_id,
+                    image_path=_unquote(image_url[7:]),
+                    caption=caption,
+                    metadata=metadata,
                 )
-        return SendResult(
-            success=not failures,
-            message_id=message_ids[-1] if message_ids else None,
-            continuation_message_ids=tuple(message_ids[:-1]),
-            error="; ".join(failures) if failures else None,
-        )
+            else:
+                result = await self.send_image(
+                    chat_id=chat_id,
+                    image_url=image_url,
+                    caption=caption,
+                    metadata=metadata,
+                )
+            if not result.success:
+                logger.warning("Matrix: failed to send image %d/%d: %s", idx, total, result.error)
 
     async def send_document(
         self,

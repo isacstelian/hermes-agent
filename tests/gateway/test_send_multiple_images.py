@@ -80,27 +80,12 @@ class TestBaseDefaultLoop:
             ("file:///tmp/foo.png", "local"),
             ("https://x.com/c.gif", ""),
         ]
-        result = _run(a.send_multiple_images("chat1", images))
+        _run(a.send_multiple_images("chat1", images))
         # 2 URL images + 1 animation + 1 local file
         assert len(a.sent_images) == 2
         assert len(a.sent_animations) == 1
         assert len(a.sent_files) == 1
         assert a.sent_files[0][1] == "/tmp/foo.png"
-        assert result.success is True
-        assert result.message_id == "1"
-        assert result.continuation_message_ids == ("1", "2", "1")
-
-    def test_none_from_single_image_send_fails_the_batch(self):
-        a = _StubAdapter()
-        a.send_image = AsyncMock(return_value=None)
-
-        result = _run(
-            a.send_multiple_images("chat1", [("https://x.com/a.png", "alt")])
-        )
-
-        assert result.success is False
-        assert result.message_id is None
-        assert "no delivery result" in result.error
 
 
 # ---------------------------------------------------------------------------
@@ -353,14 +338,10 @@ class TestDiscordMultiImage:
         adapter._client.get_channel = MagicMock(return_value=mock_channel)
         adapter._is_forum_parent = MagicMock(return_value=False)
 
-        result = _run(
-            adapter.send_multiple_images("67890", [(public_url, "caption")])
-        )
+        _run(adapter.send_multiple_images("67890", [(public_url, "caption")]))
 
         assert requested_urls == [public_url, redirected_url]
         mock_channel.send.assert_awaited_once()
-        assert result.success is True
-        assert result.message_id == "1"
 
     def test_send_image_blocks_private_redirect_before_send(self, adapter, monkeypatch):
         import plugins.platforms.discord.adapter as discord_adapter
@@ -459,67 +440,12 @@ class TestSlackMultiImage:
             paths.append(p)
 
         images = [(f"file://{p}", "") for p in paths]
-        result = _run(adapter.send_multiple_images("C12345", images))
+        _run(adapter.send_multiple_images("C12345", images))
 
         client = adapter._get_client("C12345")
         client.files_upload_v2.assert_awaited_once()
         kwargs = client.files_upload_v2.await_args.kwargs
         assert len(kwargs["file_uploads"]) == 3
-        assert result.success is True
-
-    def test_missing_local_file_fails_partial_batch(self, adapter, tmp_path):
-        present = tmp_path / "present.png"
-        present.write_bytes(b"png")
-
-        result = _run(
-            adapter.send_multiple_images(
-                "C12345",
-                [
-                    (f"file://{present}", ""),
-                    (f"file://{tmp_path / 'missing.png'}", ""),
-                ],
-            )
-        )
-
-        assert result.success is False
-        assert "Skipped 1 invalid image" in result.error
-
-
-# ---------------------------------------------------------------------------
-# Matrix
-# ---------------------------------------------------------------------------
-
-
-from plugins.platforms.matrix.adapter import MatrixAdapter  # noqa: E402
-
-
-class TestMatrixMultiImage:
-    @pytest.fixture
-    def adapter(self):
-        a = object.__new__(MatrixAdapter)
-        a.send_image = AsyncMock(
-            side_effect=[
-                SendResult(success=True, message_id="event-1"),
-                SendResult(success=False, error="upload rejected"),
-            ]
-        )
-        a.send_image_file = AsyncMock()
-        return a
-
-    def test_partial_failure_returns_unsuccessful_result(self, adapter):
-        result = _run(
-            adapter.send_multiple_images(
-                "!room:example.com",
-                [
-                    ("https://x.com/one.png", "one"),
-                    ("https://x.com/two.png", "two"),
-                ],
-            )
-        )
-
-        assert result.success is False
-        assert result.message_id == "event-1"
-        assert "upload rejected" in result.error
 
 
 # ---------------------------------------------------------------------------
@@ -553,27 +479,13 @@ class TestMattermostMultiImage:
             paths.append(p)
 
         images = [(f"file://{p}", "") for p in paths]
-        result = _run(adapter.send_multiple_images("channel123", images))
+        _run(adapter.send_multiple_images("channel123", images))
 
         assert adapter._upload_file.await_count == 3
         adapter._api_post.assert_awaited_once()
         payload = adapter._api_post.await_args.args[1]
         assert payload["channel_id"] == "channel123"
         assert len(payload["file_ids"]) == 3
-        assert result.success is True
-        assert result.message_id == "post123"
-
-    def test_missing_local_file_fails_batch(self, adapter, tmp_path):
-        result = _run(
-            adapter.send_multiple_images(
-                "channel123",
-                [(f"file://{tmp_path / 'missing.png'}", "")],
-            )
-        )
-
-        assert result.success is False
-        assert "No valid images" in result.error
-        adapter._api_post.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -608,29 +520,10 @@ class TestEmailMultiImage:
         with patch.object(
             adapter, "_send_email_with_attachments", MagicMock(return_value="<msgid@x>")
         ) as mock_send:
-            result = _run(adapter.send_multiple_images("user@example.com", images))
+            _run(adapter.send_multiple_images("user@example.com", images))
 
         mock_send.assert_called_once()
         to_addr, body, file_paths = mock_send.call_args.args
         assert to_addr == "user@example.com"
         assert len(file_paths) == 3
         assert "alt 0" in body
-        assert result.success is True
-        assert result.message_id == "<msgid@x>"
-
-    def test_missing_local_file_fails_partial_batch(self, adapter, tmp_path):
-        present = tmp_path / "present.png"
-        present.write_bytes(b"png")
-        images = [
-            (f"file://{present}", "present"),
-            (f"file://{tmp_path / 'missing.png'}", "missing"),
-        ]
-
-        with patch.object(
-            adapter, "_send_email_with_attachments", MagicMock(return_value="<msgid@x>")
-        ):
-            result = _run(adapter.send_multiple_images("user@example.com", images))
-
-        assert result.success is False
-        assert result.message_id == "<msgid@x>"
-        assert "Skipped 1 missing image" in result.error

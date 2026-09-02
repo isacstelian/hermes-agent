@@ -1032,13 +1032,10 @@ class TestSignalSendMultipleImages:
         adapter._rpc = mock_rpc
         adapter._stop_typing_indicator = AsyncMock()
 
-        result = await adapter.send_multiple_images(
-            chat_id="+155****4567", images=[]
-        )
+        await adapter.send_multiple_images(chat_id="+155****4567", images=[])
 
         assert captured == []
         adapter._stop_typing_indicator.assert_not_awaited()
-        assert result.success is True
 
     @pytest.mark.asyncio
     async def test_all_bad_files_no_rpc(self, monkeypatch, tmp_path):
@@ -1048,15 +1045,13 @@ class TestSignalSendMultipleImages:
         adapter._rpc = mock_rpc
         adapter._stop_typing_indicator = AsyncMock()
 
-        result = await adapter.send_multiple_images(
+        await adapter.send_multiple_images(
             chat_id="+155****4567",
             images=[(f"file://{tmp_path}/missing_a.png", ""),
                     (f"file://{tmp_path}/missing_b.png", "")],
         )
 
         assert captured == []
-        assert result.success is False
-        assert "No valid images" in result.error
 
     @pytest.mark.asyncio
     async def test_single_batch_under_limit(self, monkeypatch, tmp_path):
@@ -1066,9 +1061,7 @@ class TestSignalSendMultipleImages:
         adapter._stop_typing_indicator = AsyncMock()
 
         images = _make_image_files(tmp_path, 5)
-        result = await adapter.send_multiple_images(
-            chat_id="+155****4567", images=images
-        )
+        await adapter.send_multiple_images(chat_id="+155****4567", images=images)
 
         assert len(captured) == 1
         params = captured[0]["params"]
@@ -1077,8 +1070,6 @@ class TestSignalSendMultipleImages:
         assert len(params["attachments"]) == 5
         # raise_on_rate_limit must be opted into so the retry loop sees 429s
         assert captured[0]["kwargs"].get("raise_on_rate_limit") is True
-        assert result.success is True
-        assert result.message_id == "1"
 
 
     @pytest.mark.asyncio

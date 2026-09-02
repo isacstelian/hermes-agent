@@ -21830,8 +21830,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         images=images,
                         metadata=_thread_meta,
                     )
-                    if _image_result is None or not getattr(
-                        _image_result, "success", False
+                    if (
+                        _image_result is not None
+                        and getattr(_image_result, "success", True) is False
                     ):
                         _detail = getattr(_image_result, "error", None) or "platform upload failed"
                         _media_drops.extend(
