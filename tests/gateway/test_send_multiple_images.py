@@ -20,7 +20,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from gateway.config import PlatformConfig
-from gateway.platforms.base import BasePlatformAdapter
+from gateway.platforms.base import BasePlatformAdapter, SendResult
 
 
 def _run(coro):
@@ -127,13 +127,21 @@ class TestTelegramMultiImage:
         images = [(f"https://x.com/{i}.png", f"alt{i}") for i in range(3)]
         # Make InputMediaPhoto a concrete class that records its args
         telegram.InputMediaPhoto = MagicMock(side_effect=lambda media, caption=None: {"media": media, "caption": caption})
+        adapter._bot.send_media_group.return_value = [
+            MagicMock(message_id=101),
+            MagicMock(message_id=102),
+            MagicMock(message_id=103),
+        ]
 
-        _run(adapter.send_multiple_images("12345", images))
+        result = _run(adapter.send_multiple_images("12345", images))
 
         adapter._bot.send_media_group.assert_awaited_once()
         call_kwargs = adapter._bot.send_media_group.call_args.kwargs
         assert call_kwargs["chat_id"] == 12345
         assert len(call_kwargs["media"]) == 3
+        assert result.success is True
+        assert result.message_id == "103"
+        assert result.continuation_message_ids == ("101", "102")
 
     def test_batch_over_10_chunks(self, adapter):
         """15 photos → two send_media_group calls (10 + 5)."""
@@ -141,11 +149,105 @@ class TestTelegramMultiImage:
         images = [(f"https://x.com/{i}.png", "") for i in range(15)]
         telegram.InputMediaPhoto = MagicMock(side_effect=lambda media, caption=None: {"media": media})
 
-        _run(adapter.send_multiple_images("12345", images))
+        adapter._bot.send_media_group.side_effect = [
+            [MagicMock(message_id=i) for i in range(1, 11)],
+            [MagicMock(message_id=i) for i in range(11, 16)],
+        ]
+
+        result = _run(adapter.send_multiple_images("12345", images))
 
         assert adapter._bot.send_media_group.await_count == 2
         sizes = [len(c.kwargs["media"]) for c in adapter._bot.send_media_group.await_args_list]
         assert sizes == [10, 5]
+        assert result.success is True
+        assert result.message_id == "15"
+        assert result.continuation_message_ids == tuple(str(i) for i in range(1, 15))
+
+    def test_not_connected_returns_failure(self, adapter):
+        adapter._bot = None
+
+        result = _run(
+            adapter.send_multiple_images(
+                "12345",
+                [("https://x.com/image.png", "")],
+            )
+        )
+
+        assert result == SendResult(success=False, error="Not connected")
+
+    def test_album_failure_reports_failed_individual_fallback(self, adapter):
+        import telegram
+
+        telegram.InputMediaPhoto = MagicMock(
+            side_effect=lambda media, caption=None: {"media": media, "caption": caption}
+        )
+        adapter._bot.send_media_group.side_effect = RuntimeError("album rejected")
+        adapter.send_image = AsyncMock(
+            side_effect=[
+                SendResult(success=True, message_id="201"),
+                SendResult(success=False, error="photo rejected"),
+            ]
+        )
+
+        result = _run(
+            adapter.send_multiple_images(
+                "12345",
+                [
+                    ("https://x.com/one.png", "one"),
+                    ("https://x.com/two.png", "two"),
+                ],
+            )
+        )
+
+        assert result.success is False
+        assert result.message_id == "201"
+        assert "photo rejected" in result.error
+        assert adapter.send_image.await_count == 2
+
+    def test_individual_fallback_without_message_id_is_failure(self, adapter):
+        import telegram
+
+        telegram.InputMediaPhoto = MagicMock(
+            side_effect=lambda media, caption=None: {"media": media, "caption": caption}
+        )
+        adapter._bot.send_media_group.side_effect = RuntimeError("album rejected")
+        adapter.send_image = AsyncMock(return_value=SendResult(success=True))
+
+        result = _run(
+            adapter.send_multiple_images(
+                "12345",
+                [("https://x.com/one.png", "one")],
+            )
+        )
+
+        assert result.success is False
+        assert result.message_id is None
+        assert "no message id" in result.error
+
+    def test_missing_local_image_makes_batch_fail(self, adapter, tmp_path):
+        import telegram
+
+        telegram.InputMediaPhoto = MagicMock(
+            side_effect=lambda media, caption=None: {"media": media, "caption": caption}
+        )
+        present = tmp_path / "present.png"
+        present.write_bytes(b"png")
+        missing = tmp_path / "missing.png"
+        adapter._bot.send_media_group.return_value = [MagicMock(message_id=301)]
+
+        result = _run(
+            adapter.send_multiple_images(
+                "12345",
+                [
+                    (f"file://{present}", "present"),
+                    (f"file://{missing}", "missing"),
+                ],
+            )
+        )
+
+        assert result.success is False
+        assert result.message_id == "301"
+        assert "missing.png" in result.error
 
 
 # ---------------------------------------------------------------------------
@@ -425,5 +527,3 @@ class TestEmailMultiImage:
         assert to_addr == "user@example.com"
         assert len(file_paths) == 3
         assert "alt 0" in body
-
-

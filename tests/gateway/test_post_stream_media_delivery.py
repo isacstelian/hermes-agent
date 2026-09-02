@@ -129,3 +129,25 @@ async def test_failed_document_upload_gets_user_visible_notice(tmp_path, monkeyp
     assert "Couldn't deliver" in adapter.send.await_args.kwargs["content"]
     assert "report.pdf" in adapter.send.await_args.kwargs["content"]
 
+
+@pytest.mark.asyncio
+async def test_failed_image_batch_gets_user_visible_notice(tmp_path, monkeypatch):
+    media_file = _allowed_media_path(tmp_path, monkeypatch, "chart.png")
+    adapter = _adapter()
+    adapter.send_multiple_images.return_value = SendResult(
+        success=False,
+        error="Telegram image upload failed",
+    )
+
+    await GatewayRunner._deliver_media_from_response(
+        _fake_runner({}),
+        f"MEDIA:{media_file}",
+        _event(),
+        adapter,
+    )
+
+    adapter.send.assert_awaited_once()
+    content = adapter.send.await_args.kwargs["content"]
+    assert "Couldn't deliver" in content
+    assert "chart.png" in content
+    assert "Telegram image upload failed" in content
