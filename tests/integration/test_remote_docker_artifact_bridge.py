@@ -11,6 +11,7 @@ import pytest
 
 from tools.environments import docker as docker_env
 from tools.environments.artifact_bridge import ArtifactBridge
+from gateway.media_fetch import stage_inbound_media
 
 
 pytestmark = pytest.mark.skipif(
@@ -87,6 +88,23 @@ def test_real_ssh_daemon_round_trips_docx_and_large_pdf(tmp_path, monkeypatch):
             for name, metadata in expected_skills.items()
         }
         assert env.fetch_file_metadata_many(auto_staged) == auto_staged
+
+        audio = profile_home / "cache" / "audio" / "voice.ogg"
+        audio.parent.mkdir(parents=True)
+        audio.write_bytes(b"OggSreal telegram voice bytes")
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+        monkeypatch.setattr(
+            "tools.terminal_tool.ensure_task_env", lambda _task_id: env
+        )
+
+        assert stage_inbound_media([str(audio)], "board-session") == []
+        expected_audio = (
+            audio.stat().st_size,
+            hashlib.sha256(audio.read_bytes()).hexdigest(),
+        )
+        assert env.fetch_file_metadata(
+            "/root/.hermes/cache/audio/voice.ogg"
+        ) == expected_audio
 
         inbound = tmp_path / "Raport board.docx"
         inbound.write_bytes(b"PK\x03\x04real telegram word bytes")
