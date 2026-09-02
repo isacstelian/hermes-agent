@@ -15,10 +15,12 @@ semantics are preserved, while other BaseExceptions stay contained.
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType
+from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
 from gateway.session import SessionSource, build_session_key
 
 
@@ -122,3 +124,20 @@ async def test_plain_exception_still_notifies_without_propagating():
 
     assert adapter.sent, "platform send must be called on a plain Exception"
     assert "error" in adapter.sent[0].lower()
+
+
+@pytest.mark.asyncio
+async def test_failed_error_notification_result_is_logged(caplog):
+    adapter = _make_adapter(_raising_handler(RuntimeError("boom")))
+    event = _event()
+
+    async def failed_send(*args, **kwargs):
+        return SendResult(success=False, error="terminal Telegram send failure")
+
+    adapter.send = failed_send
+
+    with caplog.at_level(logging.ERROR, logger="gateway.platforms.base"):
+        await adapter._process_message_background(event, build_session_key(event.source))
+
+    assert "Failed to send error notification to user" in caplog.text
+    assert "terminal Telegram send failure" in caplog.text

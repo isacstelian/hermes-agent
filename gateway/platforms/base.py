@@ -7054,7 +7054,7 @@ class BasePlatformAdapter(ABC):
                 error_type = type(e).__name__
                 error_detail = str(e)[:300] if str(e) else "no details available"
                 _thread_metadata = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
-                await self.send(
+                notify_result = await self.send(
                     chat_id=event.source.chat_id,
                     content=(
                         f"Sorry, I encountered an error ({error_type}).\n"
@@ -7063,6 +7063,12 @@ class BasePlatformAdapter(ABC):
                     ),
                     metadata=_thread_metadata,
                 )
+                if not notify_result.success:
+                    logger.error(
+                        "[%s] Failed to send error notification to user: %s",
+                        self.name,
+                        notify_result.error or "platform send returned unsuccessful result",
+                    )
             except Exception as notify_err:
                 logger.error(
                     "[%s] Failed to send error notification to user: %s",
