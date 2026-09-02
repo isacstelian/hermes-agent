@@ -38,6 +38,11 @@ from tools.environments.local import (
 
 logger = logging.getLogger(__name__)
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows
+    fcntl = None
+
 
 # Common Docker Desktop install paths checked when 'docker' is not in PATH.
 # macOS Intel: /usr/local/bin, macOS Apple Silicon (Homebrew): /opt/homebrew/bin,
@@ -2947,29 +2952,40 @@ class DockerEnvironment(BaseEnvironment):
 
         legacy_containers = [item for item in owned_containers if item[3]]
         if legacy_containers:
-            if len(legacy_containers) != 1 or len(owned_containers) != 1:
-                raise RuntimeError(
-                    "found multiple matching Hermes Docker containers with ambiguous "
-                    "ownership; refusing automatic migration"
+            with self._legacy_migration_lock(task_label, profile_label) as lock_held:
+                if not lock_held:
+                    raise RuntimeError(
+                        "legacy Docker container migration requires a cross-process "
+                        "filesystem lock on this platform"
+                    )
+                migrated = self._find_reusable_container(
+                    task_label, profile_label, egress_label, mounts_label
                 )
-            container_id, actual_mounts, actual_egress, _ = legacy_containers[0]
-            egress_matches = (
-                actual_egress in {"", "off"}
-                if egress_label == "off"
-                else actual_egress == egress_label
-            )
-            if (
-                actual_mounts != mounts_label
-                or not egress_matches
-                or not self._legacy_container_has_expected_mounts(container_id)
-            ):
-                raise RuntimeError(
-                    "found a legacy Hermes Docker container whose exact task/profile "
-                    f"identity cannot be verified ({container_id[:12]}). Remove or "
-                    "reset that container before retrying; Hermes will not reuse, "
-                    "replace, or race an identity-unknown container."
+                if migrated is not None:
+                    return migrated[0]
+                if len(legacy_containers) != 1 or len(owned_containers) != 1:
+                    raise RuntimeError(
+                        "found multiple matching Hermes Docker containers with "
+                        "ambiguous ownership; refusing automatic migration"
+                    )
+                container_id, actual_mounts, actual_egress, _ = legacy_containers[0]
+                egress_matches = (
+                    actual_egress in {"", "off"}
+                    if egress_label == "off"
+                    else actual_egress == egress_label
                 )
-            return self._migrate_legacy_container(container_id)
+                if (
+                    actual_mounts != mounts_label
+                    or not egress_matches
+                    or not self._legacy_container_has_expected_mounts(container_id)
+                ):
+                    raise RuntimeError(
+                        "found a legacy Hermes Docker container whose exact task/profile "
+                        f"identity cannot be verified ({container_id[:12]}). Remove or "
+                        "reset that container before retrying; Hermes will not reuse, "
+                        "replace, or race an identity-unknown container."
+                    )
+                return self._migrate_legacy_container(container_id)
 
         for container_id, actual_mounts, actual_egress, _ in owned_containers:
             egress_matches = (
@@ -2998,6 +3014,28 @@ class DockerEnvironment(BaseEnvironment):
                 "Removed stale Docker container %s after identity/config change",
                 container_id[:12],
             )
+
+    @contextmanager
+    def _legacy_migration_lock(self, task_label: str, profile_label: str):
+        """Serialize legacy migration across Hermes processes on this host."""
+        if fcntl is None:
+            yield False
+            return
+        from tools.environments.base import get_sandbox_dir
+
+        lock_dir = get_sandbox_dir() / "docker" / ".locks"
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        lock_key = hashlib.sha256(
+            f"{task_label}\0{profile_label}".encode("utf-8")
+        ).hexdigest()
+        with open(
+            lock_dir / f"{lock_key}.lock", "a+", encoding="utf-8"
+        ) as lock_file:
+            fcntl.flock(lock_file, fcntl.LOCK_EX)
+            try:
+                yield True
+            finally:
+                fcntl.flock(lock_file, fcntl.LOCK_UN)
 
     def _legacy_container_has_expected_mounts(self, container_id: str) -> bool:
         """Verify legacy ownership from the sandbox-managed persistent mounts."""
@@ -3173,7 +3211,7 @@ class DockerEnvironment(BaseEnvironment):
             )
             return replacement.stdout.strip()
         except (RuntimeError, subprocess.TimeoutExpired, OSError) as exc:
-            if stop_attempted:
+            if stop_attempted or replacement_attempted:
                 safe_to_remove_image = rollback()
             if isinstance(exc, RuntimeError):
                 raise

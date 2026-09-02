@@ -1123,6 +1123,89 @@ def test_failed_legacy_replacement_restarts_original(monkeypatch):
     assert ["/usr/bin/docker", "rm", "legacy-cid"] not in commands
 
 
+def test_failed_replacement_is_removed_when_legacy_was_already_stopped(monkeypatch):
+    env, calls, mounts = _make_remote_persistent_legacy_env(monkeypatch)
+
+    def _run(cmd, **kwargs):
+        calls.append((list(cmd), kwargs))
+        if cmd[1:3] == ["ps", "-a"]:
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=_legacy_container_row(env), stderr=""
+            )
+        if cmd[1] == "inspect":
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=json.dumps(mounts), stderr=""
+            )
+        if cmd[1:3] == ["image", "inspect"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="null\n", stderr="")
+        if cmd[1] == "commit":
+            return subprocess.CompletedProcess(cmd, 0, stdout="image-id\n", stderr="")
+        if cmd[1] == "stop":
+            return subprocess.CompletedProcess(
+                cmd, 1, stdout="", stderr="Container is not running"
+            )
+        if cmd[1] == "run":
+            return subprocess.CompletedProcess(
+                cmd, 125, stdout="", stderr="replacement failed"
+            )
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(docker_env.subprocess, "run", _run)
+
+    with pytest.raises(RuntimeError, match="could not start replacement"):
+        env._remove_stale_config_containers(
+            env._labels["hermes-task-id"],
+            env._labels["hermes-profile"],
+            env._labels[docker_env._EGRESS_LABEL_KEY],
+            env._labels[docker_env._MOUNTS_LABEL_KEY],
+        )
+
+    commands = [cmd for cmd, _ in calls]
+    failed_run = next(cmd for cmd in commands if cmd[1] == "run")
+    replacement_name = failed_run[failed_run.index("--name") + 1]
+    assert ["/usr/bin/docker", "rm", "-f", replacement_name] in commands
+    assert ["/usr/bin/docker", "start", "legacy-cid"] not in commands
+
+
+def test_legacy_migration_rechecks_for_replacement_inside_lock(monkeypatch):
+    env, calls, _mounts = _make_remote_persistent_legacy_env(monkeypatch)
+
+    def _run(cmd, **kwargs):
+        calls.append((list(cmd), kwargs))
+        if cmd[1:3] == ["ps", "-a"]:
+            replacement_row = (
+                "replacement-cid\t"
+                f"{env._labels[docker_env._MOUNTS_LABEL_KEY]}\t"
+                f"{env._labels[docker_env._EGRESS_LABEL_KEY]}\t"
+                f"{env._labels[docker_env._TASK_KEY_LABEL_KEY]}\t"
+                f"{env._labels[docker_env._PROFILE_KEY_LABEL_KEY]}\n"
+            )
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout=_legacy_container_row(env) + replacement_row,
+                stderr="",
+            )
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(docker_env.subprocess, "run", _run)
+    monkeypatch.setattr(
+        env,
+        "_find_reusable_container",
+        lambda *_args: ("replacement-cid", True),
+    )
+
+    result = env._remove_stale_config_containers(
+        env._labels["hermes-task-id"],
+        env._labels["hermes-profile"],
+        env._labels[docker_env._EGRESS_LABEL_KEY],
+        env._labels[docker_env._MOUNTS_LABEL_KEY],
+    )
+
+    assert result == "replacement-cid"
+    assert not any(cmd[1] in {"commit", "stop", "run"} for cmd, _ in calls)
+
+
 def test_persistent_legacy_container_with_wrong_mount_is_refused(monkeypatch):
     env, calls, _mounts = _make_remote_persistent_legacy_env(monkeypatch)
 
