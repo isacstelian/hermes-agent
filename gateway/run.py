@@ -18003,7 +18003,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return prepared
             from gateway.media_fetch import stage_inbound_media
 
-            task_id = self._agent_task_id_for_source(source)
+            task_id = self._agent_task_id_for_source(
+                source, session_key=session_key
+            )
             failures = await asyncio.to_thread(
                 stage_inbound_media, list(event.media_urls), task_id
             )
@@ -21689,16 +21691,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except OSError:
                     pass
 
-    def _agent_task_id_for_source(self, source: SessionSource) -> Optional[str]:
+    def _agent_task_id_for_source(
+        self,
+        source: SessionSource,
+        session_key: Optional[str] = None,
+    ) -> Optional[str]:
         """Return the task id the agent ran under for *source*'s session.
 
         Mirrors ``BasePlatformAdapter.agent_task_id_for_session``: the terminal
         sandbox is keyed by session_id, not by the gateway session_key.
         """
-        try:
-            session_key = build_session_key(source)
-        except Exception:  # noqa: BLE001 — never break delivery
-            return None
+        if not session_key:
+            try:
+                session_key = self._session_key_for_source(source)
+            except Exception:  # noqa: BLE001 — never break delivery
+                return None
         store = getattr(self, "session_store", None)
         peek = getattr(store, "peek_session_id", None) if store is not None else None
         if callable(peek):

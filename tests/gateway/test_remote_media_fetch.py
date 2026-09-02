@@ -341,7 +341,9 @@ class TestInboundMediaStaging:
         runner = object.__new__(GatewayRunner)
         runner.config = SimpleNamespace(multiplex_profiles=False)
         runner._prepare_inbound_message_text = AsyncMock(return_value="read attachment")
-        runner._agent_task_id_for_source = lambda source: "agent-session"
+        runner._agent_task_id_for_source = (
+            lambda source, session_key=None: "agent-session"
+        )
         staged = []
         monkeypatch.setattr(
             "gateway.media_fetch.stage_inbound_media",
@@ -360,6 +362,60 @@ class TestInboundMediaStaging:
 
         assert prepared == "read attachment"
         assert staged == [([event.media_urls[0]], "agent-session")]
+
+    @pytest.mark.asyncio
+    async def test_gateway_staging_uses_exact_multiplexed_session_key(
+        self, monkeypatch
+    ):
+        from gateway.run import GatewayRunner
+
+        runner = object.__new__(GatewayRunner)
+        runner.config = SimpleNamespace(
+            multiplex_profiles=True,
+            group_sessions_per_user=False,
+            thread_sessions_per_user=False,
+        )
+        runner._prepare_inbound_message_text = AsyncMock(return_value="read attachment")
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="123",
+            chat_type="group",
+            user_id="u1",
+            profile="coder",
+        )
+        session_key = build_session_key(
+            source,
+            group_sessions_per_user=False,
+            thread_sessions_per_user=False,
+            profile="coder",
+        )
+        queried = []
+        runner.session_store = SimpleNamespace(
+            peek_session_id=lambda key: queried.append(key) or (
+                "session-coder" if key == session_key else None
+            )
+        )
+        staged = []
+        monkeypatch.setattr(
+            "gateway.media_fetch.stage_inbound_media",
+            lambda paths, task_id: staged.append((paths, task_id)) or [],
+        )
+        event = MessageEvent(
+            text="read it",
+            source=source,
+            media_urls=["/root/.hermes/cache/documents/Audit.pdf"],
+        )
+
+        prepared = await runner._prepare_profile_scoped_inbound_message_text(
+            event=event,
+            source=source,
+            history=[],
+            session_key=session_key,
+        )
+
+        assert prepared == "read attachment"
+        assert queried == [session_key]
+        assert staged == [([event.media_urls[0]], "session-coder")]
 
 
 
