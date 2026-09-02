@@ -1063,6 +1063,31 @@ def test_bounded_exec_tar_pull_accepts_single_large_file(monkeypatch, tmp_path):
     assert destination.read_bytes() == payload
 
 
+def test_archive_push_reopens_after_buffered_validation(monkeypatch, tmp_path):
+    archive_path = tmp_path / "small.tar"
+    with tarfile.open(archive_path, mode="w") as archive:
+        member = tarfile.TarInfo("skill.txt")
+        payload = b"small skill"
+        member.size = len(payload)
+        archive.addfile(member, BytesIO(payload))
+
+    consumed = []
+
+    def _run(command, **kwargs):
+        stdin = kwargs["stdin"]
+        consumed.append(os.read(stdin.fileno(), archive_path.stat().st_size))
+        return subprocess.CompletedProcess(command, 0, stdout=b"", stderr=b"")
+
+    env = docker_env.DockerEnvironment.__new__(docker_env.DockerEnvironment)
+    env._container_id = "container-id"
+    env._docker_exe = "/usr/bin/docker"
+    monkeypatch.setattr(docker_env.subprocess, "run", _run)
+
+    env.put_archive(str(archive_path), "/root/.hermes/skills")
+
+    assert consumed and consumed[0].startswith(b"skill.txt")
+
+
 # ── Cross-process container reuse (issue #20561) ──────────────────
 
 

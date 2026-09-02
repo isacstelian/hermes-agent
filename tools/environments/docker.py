@@ -2454,7 +2454,10 @@ class DockerEnvironment(BaseEnvironment):
                             raise FileFetchError(
                                 "archive push contains an unsafe member"
                             )
-                payload.seek(0)
+            # Reopen after validation. tarfile may leave the buffered reader's
+            # raw descriptor ahead of its logical position, and subprocess
+            # consumes the raw descriptor passed as stdin.
+            with archive.open("rb", buffering=0) as payload:
                 result = subprocess.run(
                     [
                         self._docker_exe,
