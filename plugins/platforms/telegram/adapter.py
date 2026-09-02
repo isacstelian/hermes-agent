@@ -1211,17 +1211,68 @@ class TelegramAdapter(BasePlatformAdapter):
         if not normalized_user_id:
             return False
 
+        normalized_chat_type = str(chat_type or "dm").strip().lower() or "dm"
+        if normalized_chat_type == "private":
+            normalized_chat_type = "dm"
+        elif normalized_chat_type == "supergroup":
+            normalized_chat_type = "forum" if thread_id is not None else "group"
+
+        # A primary Telegram adapter may route each chat to a different profile.
+        # In multiplex mode its message handler is a closure, so __self__ cannot
+        # reach the runner or the routed profile's pairing store. Rebuild the
+        # callback source through the adapter's normal routing path and use the
+        # runner's full authorization chain. Secondary adapters keep using their
+        # profile-bound registered callback below.
+        gateway_runner = getattr(self, "gateway_runner", None)
+        owner_profile = getattr(self, "_owner_profile", None)
+        routed_auth_fn = getattr(gateway_runner, "_is_user_authorized_for_source", None)
+        if gateway_runner is not None and not owner_profile and callable(routed_auth_fn):
+            try:
+                source = self.build_source(
+                    chat_id=str(chat_id or normalized_user_id),
+                    chat_type=normalized_chat_type,
+                    user_id=normalized_user_id,
+                    user_name=str(user_name).strip() if user_name else None,
+                    thread_id=str(thread_id) if thread_id is not None else None,
+                )
+                if getattr(source, "profile_route_rejected", False) is True:
+                    return False
+                return routed_auth_fn(source) is True
+            except Exception:
+                logger.warning(
+                    "[Telegram] Routed callback auth failed for user %s; denying",
+                    normalized_user_id,
+                    exc_info=True,
+                )
+                return False
+
+        # GatewayRunner registers this callback for every adapter. It remains
+        # available when multiplex wraps the message handler in a closure, and
+        # secondary adapters bind it to their owning profile. Credentialed
+        # callback actions fail closed on exceptions or non-boolean results.
+        registered_auth_fn = getattr(self, "_authorization_check", None)
+        if registered_auth_fn is not None:
+            try:
+                return registered_auth_fn(
+                    normalized_user_id,
+                    normalized_chat_type,
+                    str(chat_id or normalized_user_id),
+                ) is True
+            except Exception:
+                logger.warning(
+                    "[Telegram] Registered callback auth failed for user %s; denying",
+                    normalized_user_id,
+                    exc_info=True,
+                )
+                return False
+
+        # Legacy/custom setups may have a bound runner handler but no registered
+        # adapter authorization callback.
         runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
         auth_fn = getattr(runner, "_is_user_authorized", None)
         if callable(auth_fn):
             try:
                 from gateway.session import SessionSource
-
-                normalized_chat_type = str(chat_type or "dm").strip().lower() or "dm"
-                if normalized_chat_type == "private":
-                    normalized_chat_type = "dm"
-                elif normalized_chat_type == "supergroup":
-                    normalized_chat_type = "forum" if thread_id is not None else "group"
 
                 source = SessionSource(
                     platform=Platform.TELEGRAM,
@@ -1231,13 +1282,14 @@ class TelegramAdapter(BasePlatformAdapter):
                     user_name=str(user_name).strip() if user_name else None,
                     thread_id=str(thread_id) if thread_id is not None else None,
                 )
-                return bool(auth_fn(source))
+                return auth_fn(source) is True
             except Exception:
-                logger.debug(
-                    "[Telegram] Falling back to env-only callback auth for user %s",
+                logger.warning(
+                    "[Telegram] Bound-runner callback auth failed for user %s; denying",
                     normalized_user_id,
                     exc_info=True,
                 )
+                return False
 
         allowed_csv = _scoped_gate_env("TELEGRAM_ALLOWED_USERS").strip()
         if not allowed_csv:
