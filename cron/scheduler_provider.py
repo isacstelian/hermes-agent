@@ -558,6 +558,7 @@ class InProcessCronScheduler(CronScheduler):
         interval=60,
         can_dispatch=None,
         profile_homes=None,
+        profile_adapters=None,
     ):
         import logging
         from cron.scheduler import tick as cron_tick
@@ -585,6 +586,7 @@ class InProcessCronScheduler(CronScheduler):
                 loop=loop,
                 interval=interval,
                 can_dispatch=can_dispatch,
+                profile_adapters=profile_adapters,
             )
             return
 
@@ -656,6 +658,7 @@ class InProcessCronScheduler(CronScheduler):
         loop=None,
         interval=60,
         can_dispatch=None,
+        profile_adapters=None,
     ):
         """Tick every served profile's cron store when multiplex_profiles is on.
 
@@ -681,6 +684,17 @@ class InProcessCronScheduler(CronScheduler):
             len(profile_homes),
             [p[0] if isinstance(p, tuple) else p for p in profile_homes],
         )
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+
+            primary_profile_name = get_active_profile_name() or "default"
+        except Exception:
+            first_profile = profile_homes[0] if profile_homes else None
+            primary_profile_name = (
+                first_profile[0]
+                if isinstance(first_profile, tuple) and first_profile[0]
+                else "default"
+            )
 
         # Recovery + initial heartbeat for every profile.
         # A profile may have been deleted since this snapshot was taken;
@@ -711,13 +725,18 @@ class InProcessCronScheduler(CronScheduler):
                     logger.debug("Cron dispatch paused while gateway drains existing work")
                 else:
                     for entry in _existing_profile_homes(profile_homes):
+                        profile_name = entry[0] if isinstance(entry, tuple) else None
                         home = entry[1] if isinstance(entry, tuple) else entry
+                        if not profile_name or profile_name == primary_profile_name:
+                            tick_adapters = adapters
+                        else:
+                            tick_adapters = (profile_adapters or {}).get(profile_name) or {}
                         home_token = set_hermes_home_override(str(home))
                         try:
                             with use_cron_store(home):
                                 cron_tick(
                                     verbose=False,
-                                    adapters=adapters,
+                                    adapters=tick_adapters,
                                     loop=loop,
                                     sync=False,
                                     can_dispatch=can_dispatch,

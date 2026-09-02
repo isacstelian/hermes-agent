@@ -464,7 +464,7 @@ Payload fields below are the exact event-specific fields supplied by each call s
 | `subagent_stop` | Observer | Child exit; return ignored. | `parent_session_id`, `parent_turn_id`, `child_session_id`, `child_role`, `child_summary`, `child_status`, `tool_call_history`, `duration_ms` | Summary and redacted tool-history metadata may reveal project structure. |
 | `pre_gateway_dispatch` | Directive/control | Incoming non-internal message before auth/pairing/dispatch; first valid `skip`, `rewrite`, or `allow` controls flow. | `event`, `gateway`, `session_store` | Extremely privileged in-process objects expose inbound user/routing data and host handles. |
 | `gateway_platform_event` | Observer | After the gateway's profile-scoped authorization succeeds, when a supported platform-native event is normalized at the gateway boundary (Telegram: reactions, message edits; Discord: message edits/deletes, thread created/renamed); return ignored. | `platform`, `event_type`, `payload` (event-type-specific dict — see the per-event contracts below) | Normalized plain-dict envelope only; raw SDK objects, adapter handles, and bot clients are never exposed. |
-| `gateway_message_delivered` | Observer | After a Telegram cron delivery returns a confirmed message id, on either the live-adapter or standalone path; return ignored. v1 does not cover non-cron gateway messages or non-Telegram platforms. | `source` (`"cron"`), `execution_id`, `job_id`, `platform` (`"telegram"`), `chat_id`, `thread_id`, `message_id` | Routing and execution identifiers only; no message content or adapter handles. |
+| `gateway_message_delivered` | Observer | After the live Telegram adapter confirms a successful generated cron text message id; return ignored. v1 does not cover standalone sender deliveries, failure/config/drift notices, non-cron gateway messages, or non-Telegram platforms. | `source` (`"cron"`), `execution_id`, `job_id`, `platform` (`"telegram"`), `chat_id`, `thread_id`, `message_id` | Routing and execution identifiers only; no message content or adapter handles. |
 | `pre_command` | Observer | Recognized slash command about to be dispatched, before the handler runs, on CLI and gateway cold-path dispatch; return ignored in v1 (directive-shaped dicts are logged at debug). Gateway running-agent intercept commands (`/stop`, `/approve` during an active run) are deliberately excluded — control-plane escape hatches must stay outside plugin reach. | `surface` (`"cli"` \| `"gateway"`), `command` (canonical name), `alias_used`, `args_raw`, `session_key`, `platform` | `args_raw` may contain user content or secrets typed after the command. |
 | `pre_approval_request` | Observer | Before prompted or smart approval; return ignored. | `command`, `description`, `pattern_key`, `pattern_keys`, `session_key`, `surface`, `turn_id`, `tool_call_id` | Command may contain secrets; smart observer preparation force-redacts, but surfaces do not all have identical redaction. |
 | `post_approval_response` | Observer | After a decision, timeout, or gateway notification failure; return ignored. | `command`, `description`, `pattern_key`, `pattern_keys`, `session_key`, `surface`, `turn_id`, `tool_call_id`, `choice`; smart path may add `decided_by` | Same command sensitivity plus decision metadata. |
@@ -1271,7 +1271,7 @@ This hook is observer-only: it does **not** add raw-event access or adapter acce
 
 ### `gateway_message_delivered`
 
-Fires after Hermes receives a confirmed Telegram message id for an outbound cron delivery. v1 covers both cron delivery paths: the gateway's live Telegram adapter and the standalone Telegram sender. It does not fire for failed, unconfirmed, non-Telegram, or non-cron gateway delivery.
+Fires after Hermes receives a confirmed Telegram message id from the live adapter for successful generated cron text. It does not fire for standalone sender delivery, failure/config/drift notices, failed sends, unconfirmed sends, non-Telegram delivery, or non-cron gateway delivery.
 
 ```python
 def on_cron_delivery(source, execution_id, job_id, platform, chat_id,
@@ -1290,7 +1290,7 @@ def register(ctx):
 | `job_id` | `str` | Cron job id. |
 | `platform` | `str` | Always `"telegram"` in v1. |
 | `chat_id` | `str` | Telegram destination chat id. |
-| `thread_id` | `str \| None` | Configured topic/thread id, when present. |
+| `thread_id` | `str \| None` | Actual topic/thread id used for delivery, when present. |
 | `message_id` | `str` | Telegram-confirmed outbound message id. |
 
 The hook is observer-only and fail-open. Callbacks use the configured plugin-hook timeout, so an exception or stalled callback never changes the delivery result. When no plugin subscribes, Hermes does not build the payload. The hook contains no message text and exposes no Telegram SDK or adapter object.

@@ -640,6 +640,93 @@ def test_multiplex_ticker_ticks_each_profile_once(tmp_path, monkeypatch):
         f"Expected >= {len(profile_homes)} tick calls, got {len(tick_count)}"
 
 
+def _collect_multiplex_tick_adapters(
+    profile_homes,
+    *,
+    primary_adapters,
+    profile_adapters=None,
+    active_profile="default",
+):
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    seen_adapters = []
+    stop = threading.Event()
+
+    def _tracking_tick(*args, **kwargs):
+        seen_adapters.append(kwargs.get("adapters"))
+        if len(seen_adapters) >= len(profile_homes):
+            stop.set()
+        return 0
+
+    provider = InProcessCronScheduler()
+    with patch("cron.scheduler.tick", side_effect=_tracking_tick), \
+         patch("hermes_cli.profiles.get_active_profile_name", return_value=active_profile), \
+         patch("cron.jobs.record_ticker_heartbeat", lambda **kw: None):
+        thread = threading.Thread(
+            target=provider.start,
+            args=(stop,),
+            kwargs={
+                "interval": 0,
+                "profile_homes": profile_homes,
+                "adapters": primary_adapters,
+                "profile_adapters": profile_adapters,
+            },
+            daemon=True,
+        )
+        thread.start()
+        thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    return seen_adapters[:len(profile_homes)]
+
+
+def test_multiplex_ticker_isolates_secondary_profile_adapters(tmp_path):
+    """Secondary profile cron ticks must not reuse primary adapters."""
+    default_home = tmp_path / "default"
+    secondary_home = tmp_path / "home-ops"
+    for home in (default_home, secondary_home):
+        (home / "cron").mkdir(parents=True)
+
+    primary_adapters = {"telegram": object()}
+    secondary_adapters = {"telegram": object()}
+    profile_homes = [("default", default_home), ("home-ops", secondary_home)]
+
+    for secondary_map, expected_secondary in (
+        ({"home-ops": secondary_adapters}, secondary_adapters),
+        ({"home-ops": {}}, {}),
+        ({}, {}),
+    ):
+        seen = _collect_multiplex_tick_adapters(
+            profile_homes,
+            primary_adapters=primary_adapters,
+            profile_adapters=secondary_map,
+        )
+
+        assert seen == [primary_adapters, expected_secondary]
+        assert seen[1] is not primary_adapters
+
+
+def test_multiplex_ticker_keeps_active_named_profile_primary_adapters(tmp_path):
+    """A named active profile owns the primary adapters, not the default profile."""
+    default_home = tmp_path / "default"
+    active_home = tmp_path / "profiles" / "home-ops"
+    for home in (default_home, active_home):
+        (home / "cron").mkdir(parents=True)
+
+    primary_adapters = {"telegram": object()}
+    default_adapters = {"telegram": object()}
+    profile_homes = [("default", default_home), ("home-ops", active_home)]
+
+    seen = _collect_multiplex_tick_adapters(
+        profile_homes,
+        primary_adapters=primary_adapters,
+        profile_adapters={"default": default_adapters},
+        active_profile="home-ops",
+    )
+
+    assert seen == [default_adapters, primary_adapters]
+
+
 def test_multiplex_ticker_skips_deleted_profile_from_startup_snapshot(tmp_path):
     """A stale profile_homes entry must not recreate a deleted profile."""
     import cron.jobs as jobs

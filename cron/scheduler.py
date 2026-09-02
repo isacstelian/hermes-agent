@@ -37,7 +37,7 @@ except ImportError:
     except ImportError:
         msvcrt = None
 from pathlib import Path
-from typing import Any, List, Optional, Protocol, cast
+from typing import Any, List, Optional, Protocol
 
 # Add parent directory to path for imports BEFORE repo-level imports.
 # Without this, standalone invocations (e.g. after `hermes update` reloads
@@ -3111,6 +3111,9 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 
     Returns None on success, or an error string on failure.
     """
+    emit_gateway_message_delivered = bool(
+        job.get("_gateway_message_delivered_hook")
+    )
     targets = _resolve_delivery_targets(job)
     if not targets:
         deliver_value = _normalize_deliver_value(job.get("deliver", "local"))
@@ -3569,6 +3572,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 adapter_ok = True
                 timed_out = False
                 delivered_message_id = None
+                delivered_thread_id = thread_id
                 if text_to_send:
                     from agent.async_utils import safe_schedule_threadsafe
 
@@ -3701,6 +3705,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                                 and send_raw_response.get("thread_fallback")
                             ):
                                 requested_thread_id = send_raw_response.get("requested_thread_id") or thread_id
+                                delivered_thread_id = None
                                 msg = (
                                     f"configured thread_id {requested_thread_id} for "
                                     f"{platform_name}:{chat_id} was not found; delivered without thread_id"
@@ -3753,13 +3758,14 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 if adapter_ok:
                     logger.info("Job '%s': delivered to %s:%s via live adapter", job["id"], platform_name, chat_id)
                     delivered = True
-                    _emit_gateway_message_delivered(
-                        job,
-                        platform=platform_name,
-                        chat_id=chat_id,
-                        thread_id=thread_id,
-                        message_id=delivered_message_id,
-                    )
+                    if emit_gateway_message_delivered and text_to_send:
+                        _emit_gateway_message_delivered(
+                            job,
+                            platform=platform_name,
+                            chat_id=chat_id,
+                            thread_id=delivered_thread_id,
+                            message_id=delivered_message_id,
+                        )
                     # Seed the thread session only now that delivery into it
                     # succeeded (deferred from thread-open above).
                     if opened_thread_id and not thread_seeded:
@@ -3950,19 +3956,6 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 msg = f"delivery warning: {_w} (target {platform_name}:{chat_id})"
                 logger.error("Job '%s': %s", job["id"], msg)
                 delivery_errors.append(msg)
-
-            if isinstance(result, dict):
-                standalone_result = cast(dict[str, Any], result)
-            else:
-                standalone_result = {}
-            if standalone_result.get("success") is True:
-                _emit_gateway_message_delivered(
-                    job,
-                    platform=platform_name,
-                    chat_id=chat_id,
-                    thread_id=thread_id,
-                    message_id=standalone_result.get("message_id"),
-                )
 
             logger.info("Job '%s': delivered to %s:%s", job["id"], platform_name, chat_id)
             _maybe_mirror_cron_delivery(
@@ -7457,6 +7450,14 @@ def _run_one_job_body(
                         if not owns_delivery:
                             raise _FireClaimLostDuringSideEffect
                         delivery_attempted = True
+                        if success:
+                            from gateway.platforms.base import BasePlatformAdapter
+
+                            _, generated_text = BasePlatformAdapter.extract_media(
+                                deliver_content
+                            )
+                            if (generated_text or "").strip():
+                                delivery_job["_gateway_message_delivered_hook"] = True
                         delivery_error = _deliver_result(
                             delivery_job,
                             deliver_content,

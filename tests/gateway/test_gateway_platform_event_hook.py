@@ -735,6 +735,56 @@ class TestRegisterHandlers:
             ((rebuilt_app,), {}),
         ]
 
+    def test_transient_init_rebuild_rewires_plugin_handlers(self, monkeypatch):
+        """A rebuilt PTB Application must keep plugin-native handlers too."""
+        a = TelegramAdapter(PlatformConfig(enabled=True, token="test-token"))
+        first_app = MagicMock()
+        first_app.bot = MagicMock()
+        first_app.initialize = MagicMock(side_effect=OSError("transient"))
+        rebuilt_app = MagicMock()
+        rebuilt_app.bot = MagicMock()
+        rebuilt_app.initialize = MagicMock(side_effect=RuntimeError("stop after rebuild"))
+
+        builder = MagicMock()
+        builder.token.return_value = builder
+        builder.request.return_value = builder
+        builder.get_updates_request.return_value = builder
+        builder.build.side_effect = [first_app, rebuilt_app]
+
+        def routine_feedback_factory(native, _adapter):
+            native.add_handler(SimpleNamespace(pattern="rf:"))
+
+        mgr = MagicMock()
+        mgr.get_platform_handler_factories.return_value = [
+            (routine_feedback_factory, "routine_feedback")
+        ]
+
+        monkeypatch.setattr(
+            "plugins.platforms.telegram.adapter.Application",
+            SimpleNamespace(builder=MagicMock(return_value=builder)),
+        )
+        monkeypatch.setattr(
+            "plugins.platforms.telegram.adapter.HTTPXRequest", lambda **kwargs: MagicMock(),
+        )
+        monkeypatch.setattr(
+            "plugins.platforms.telegram.adapter.discover_fallback_ips",
+            lambda: _async_value([]),
+        )
+        monkeypatch.setattr("asyncio.sleep", MagicMock(return_value=_async_value(None)))
+        monkeypatch.setattr(
+            "gateway.status.acquire_scoped_lock",
+            lambda scope, identity, metadata=None: (True, None),
+        )
+
+        with patch("hermes_cli.plugins.get_plugin_manager", return_value=mgr):
+            result = asyncio.run(a.connect())
+
+        assert result is False
+        rebuilt_handlers = [
+            call.args[0] for call in rebuilt_app.add_handler.call_args_list
+        ]
+        assert any(getattr(handler, "pattern", None) == "rf:" for handler in rebuilt_handlers)
+
 
 async def _async_value(value):
     return value
