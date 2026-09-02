@@ -1058,6 +1058,7 @@ class DockerEnvironment(BaseEnvironment):
         self._container_name: str = ""
         self._image_uses_s6_init: bool = False
         self._all_run_args: list[str] = []
+        self._managed_persistent_mounts: dict[str, tuple[str, str]] = {}
         logger.info("DockerEnvironment volumes: %s", volumes)
         # Ensure volumes is a list (config.yaml could be malformed)
         if volumes is not None and not isinstance(volumes, list):
@@ -1150,14 +1151,21 @@ class DockerEnvironment(BaseEnvironment):
                 volume_key = hashlib.sha256(
                     f"{task_id}\0{active_profile}".encode("utf-8")
                 ).hexdigest()[:16]
+                home_volume = f"hermes-home-{volume_key}"
                 writable_args.extend([
-                    "--mount", f"type=volume,source=hermes-home-{volume_key},target=/root",
+                    "--mount", f"type=volume,source={home_volume},target=/root",
                 ])
+                self._managed_persistent_mounts["/root"] = ("volume", home_volume)
                 if not workspace_explicitly_mounted:
+                    workspace_volume = f"hermes-workspace-{volume_key}"
                     writable_args.extend([
                         "--mount",
-                        f"type=volume,source=hermes-workspace-{volume_key},target=/workspace",
+                        f"type=volume,source={workspace_volume},target=/workspace",
                     ])
+                    self._managed_persistent_mounts["/workspace"] = (
+                        "volume",
+                        workspace_volume,
+                    )
             else:
                 sandbox = get_sandbox_dir() / "docker" / task_id
                 self._home_dir = str(sandbox / "home")
@@ -1165,12 +1173,20 @@ class DockerEnvironment(BaseEnvironment):
                 writable_args.extend([
                     "-v", f"{self._home_dir}:/root",
                 ])
+                self._managed_persistent_mounts["/root"] = (
+                    "bind",
+                    self._home_dir,
+                )
                 if not bind_host_cwd and not workspace_explicitly_mounted:
                     self._workspace_dir = str(sandbox / "workspace")
                     os.makedirs(self._workspace_dir, exist_ok=True)
                     writable_args.extend([
                         "-v", f"{self._workspace_dir}:/workspace",
                     ])
+                    self._managed_persistent_mounts["/workspace"] = (
+                        "bind",
+                        self._workspace_dir,
+                    )
         else:
             if not bind_host_cwd and not workspace_explicitly_mounted:
                 writable_args.extend([
@@ -1625,11 +1641,15 @@ class DockerEnvironment(BaseEnvironment):
         # would silently bypass the credential firewall.
         reused = False
         if persist_across_processes:
-            self._remove_stale_config_containers(
+            migrated = self._remove_stale_config_containers(
                 task_label, profile_name, egress_label, mount_fingerprint
             )
-            existing = self._find_reusable_container(
-                task_label, profile_name, egress_label, mount_fingerprint,
+            existing = (
+                (migrated, "running")
+                if migrated
+                else self._find_reusable_container(
+                    task_label, profile_name, egress_label, mount_fingerprint,
+                )
             )
             if existing is not None:
                 container_id, state = existing
@@ -2844,7 +2864,7 @@ class DockerEnvironment(BaseEnvironment):
         profile_label: str,
         egress_label: str,
         mounts_label: str,
-    ) -> None:
+    ) -> Optional[str]:
         """Remove same-owner containers with immutable config mismatches."""
         fmt = (
             '{{.ID}}\t{{.Label "'
@@ -2892,10 +2912,13 @@ class DockerEnvironment(BaseEnvironment):
             )
             return
 
+        owned_containers: list[tuple[str, str, str, bool]] = []
         for line in result.stdout.splitlines():
             parts = line.split("\t")
             if len(parts) != 5:
-                continue
+                raise RuntimeError(
+                    "could not verify a matching Docker container's identity"
+                )
             (
                 container_id,
                 actual_mounts,
@@ -2907,25 +2930,48 @@ class DockerEnvironment(BaseEnvironment):
             task_key_missing = actual_task_key in missing_labels
             profile_key_missing = actual_profile_key in missing_labels
             if task_key_missing != profile_key_missing:
-                logger.warning(
-                    "Ignoring Docker container %s with incomplete identity labels",
-                    container_id[:12],
-                )
-                continue
-            legacy_identity = task_key_missing and profile_key_missing
-            if legacy_identity:
                 raise RuntimeError(
-                    "found a legacy Hermes Docker container whose exact task/profile "
-                    f"identity cannot be verified ({container_id[:12]}). Remove or "
-                    "reset that container before retrying; Hermes will not reuse, "
-                    "replace, or race an identity-unknown container."
+                    "found a Hermes Docker container with incomplete identity labels "
+                    f"({container_id[:12]}); refusing to replace or race it"
                 )
+            legacy_identity = task_key_missing and profile_key_missing
             if not legacy_identity and (
                 actual_task_key != task_key or actual_profile_key != profile_key
             ):
                 # Sanitized legacy labels can collide. Never remove a container
                 # whose exact identity labels belong to another task/profile.
                 continue
+            owned_containers.append(
+                (container_id, actual_mounts, actual_egress, legacy_identity)
+            )
+
+        legacy_containers = [item for item in owned_containers if item[3]]
+        if legacy_containers:
+            if len(legacy_containers) != 1 or len(owned_containers) != 1:
+                raise RuntimeError(
+                    "found multiple matching Hermes Docker containers with ambiguous "
+                    "ownership; refusing automatic migration"
+                )
+            container_id, actual_mounts, actual_egress, _ = legacy_containers[0]
+            egress_matches = (
+                actual_egress in {"", "off"}
+                if egress_label == "off"
+                else actual_egress == egress_label
+            )
+            if (
+                actual_mounts != mounts_label
+                or not egress_matches
+                or not self._legacy_container_has_expected_mounts(container_id)
+            ):
+                raise RuntimeError(
+                    "found a legacy Hermes Docker container whose exact task/profile "
+                    f"identity cannot be verified ({container_id[:12]}). Remove or "
+                    "reset that container before retrying; Hermes will not reuse, "
+                    "replace, or race an identity-unknown container."
+                )
+            return self._migrate_legacy_container(container_id)
+
+        for container_id, actual_mounts, actual_egress, _ in owned_containers:
             egress_matches = (
                 actual_egress in {"", "off"}
                 if egress_label == "off"
@@ -2952,6 +2998,204 @@ class DockerEnvironment(BaseEnvironment):
                 "Removed stale Docker container %s after identity/config change",
                 container_id[:12],
             )
+
+    def _legacy_container_has_expected_mounts(self, container_id: str) -> bool:
+        """Verify legacy ownership from the sandbox-managed persistent mounts."""
+        expected = self._managed_persistent_mounts
+        if not self._persistent or "/root" not in expected:
+            return False
+        try:
+            result = subprocess.run(
+                [
+                    self._docker_exe,
+                    "inspect",
+                    "--format",
+                    "{{json .Mounts}}",
+                    container_id,
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=10,
+                check=False,
+                stdin=subprocess.DEVNULL,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            return False
+        if result.returncode != 0:
+            return False
+        try:
+            mounts = json.loads(result.stdout)
+        except (json.JSONDecodeError, TypeError):
+            return False
+        if not isinstance(mounts, list):
+            return False
+        actual = {
+            mount.get("Destination"): mount
+            for mount in mounts
+            if isinstance(mount, dict)
+            and isinstance(mount.get("Destination"), str)
+        }
+        if len(actual) != len(mounts):
+            return False
+
+        for destination, (mount_type, source) in expected.items():
+            mount = actual.get(destination)
+            if mount is None or mount.get("Type") != mount_type:
+                return False
+            actual_source = (
+                mount.get("Name")
+                if mount_type == "volume"
+                else os.path.normpath(str(mount.get("Source", "")))
+            )
+            expected_source = (
+                source if mount_type == "volume" else os.path.normpath(source)
+            )
+            if actual_source != expected_source:
+                return False
+        return True
+
+    def _migrate_legacy_container(self, container_id: str) -> str:
+        """Recreate a verified legacy container with exact identity labels."""
+        temporary_image = f"hermes-legacy-migration:{uuid.uuid4().hex}"
+        replacement_name = f"hermes-{uuid.uuid4().hex[:8]}"
+        stop_attempted = False
+        replacement_attempted = False
+        safe_to_remove_image = True
+
+        def run(*args: str, timeout: int = 30) -> subprocess.CompletedProcess:
+            return subprocess.run(
+                [self._docker_exe, *args],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout,
+                check=False,
+                stdin=subprocess.DEVNULL,
+            )
+
+        def rollback() -> bool:
+            try:
+                if replacement_attempted:
+                    removed_replacement = run("rm", "-f", replacement_name)
+                    if (
+                        removed_replacement.returncode != 0
+                        and not self._is_container_gone(
+                            removed_replacement.stderr or ""
+                        )
+                    ):
+                        logger.error(
+                            "Could not remove failed Docker replacement %s: %s",
+                            replacement_name,
+                            removed_replacement.stderr.strip(),
+                        )
+                        return False
+                if stop_attempted:
+                    restarted = run("start", container_id)
+                    if restarted.returncode != 0:
+                        logger.error(
+                            "Could not restart legacy Docker container %s after failed "
+                            "migration: %s",
+                            container_id[:12],
+                            restarted.stderr.strip(),
+                        )
+                        return False
+            except (subprocess.TimeoutExpired, OSError) as exc:
+                logger.error(
+                    "Could not roll back legacy Docker migration for %s: %s",
+                    container_id[:12],
+                    exc,
+                )
+                return False
+            return True
+
+        try:
+            committed = run("commit", container_id, temporary_image, timeout=120)
+            if committed.returncode != 0:
+                raise RuntimeError(
+                    "could not preserve legacy Docker container "
+                    f"{container_id[:12]}: {committed.stderr.strip()}"
+                )
+
+            stopped = run("stop", container_id)
+            if stopped.returncode != 0:
+                if "is not running" not in (stopped.stderr or "").lower():
+                    raise RuntimeError(
+                        "could not stop legacy Docker container "
+                        f"{container_id[:12]}: {stopped.stderr.strip()}"
+                    )
+            else:
+                stop_attempted = True
+            label_args = []
+            for key, value in self._labels.items():
+                label_args.extend(["--label", f"{key}={value}"])
+            init_args = (
+                []
+                if _image_uses_init_entrypoint(self._docker_exe, temporary_image)
+                else ["--init"]
+            )
+            replacement_attempted = True
+            replacement = run(
+                "run",
+                "-d",
+                *init_args,
+                "--name",
+                replacement_name,
+                *label_args,
+                "-w",
+                self.cwd,
+                *self._all_run_args,
+                temporary_image,
+                "sleep",
+                "infinity",
+                timeout=120,
+            )
+            if replacement.returncode != 0 or not replacement.stdout.strip():
+                raise RuntimeError(
+                    "could not start replacement for legacy Docker container "
+                    f"{container_id[:12]}: {replacement.stderr.strip()}"
+                )
+
+            removed = run("rm", container_id)
+            if removed.returncode != 0 and not self._is_container_gone(
+                removed.stderr or ""
+            ):
+                raise RuntimeError(
+                    "could not remove migrated legacy Docker container "
+                    f"{container_id[:12]}: {removed.stderr.strip()}"
+                )
+            logger.info(
+                "Migrated legacy Docker container %s to replacement %s",
+                container_id[:12],
+                replacement.stdout.strip()[:12],
+            )
+            return replacement.stdout.strip()
+        except (RuntimeError, subprocess.TimeoutExpired, OSError) as exc:
+            if stop_attempted:
+                safe_to_remove_image = rollback()
+            if isinstance(exc, RuntimeError):
+                raise
+            raise RuntimeError(
+                f"could not migrate legacy Docker container {container_id[:12]}: {exc}"
+            ) from exc
+        finally:
+            if safe_to_remove_image:
+                try:
+                    removed_image = run("image", "rm", "-f", temporary_image)
+                    if removed_image.returncode != 0:
+                        logger.warning(
+                            "Could not remove temporary Docker migration image %s: %s",
+                            temporary_image,
+                            removed_image.stderr.strip(),
+                        )
+                except (subprocess.TimeoutExpired, OSError) as exc:
+                    logger.warning(
+                        "Could not remove temporary Docker migration image %s: %s",
+                        temporary_image,
+                        exc,
+                    )
 
     def _find_reusable_container(
         self,
