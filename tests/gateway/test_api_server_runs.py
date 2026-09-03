@@ -404,6 +404,47 @@ class TestStartRun:
         assert mock_create.call_count == 1
 
     @pytest.mark.asyncio
+    async def test_idempotent_retry_bypasses_concurrency_limit(self, auth_adapter):
+        auth_adapter._max_concurrent_runs = 1
+        app = _create_runs_app(auth_adapter)
+        headers = {
+            "Authorization": "Bearer sk-secret",
+            "Idempotency-Key": "crisp-event-123",
+            "X-Hermes-Session-Id": "crisp-session",
+        }
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(auth_adapter, "_create_agent") as mock_create:
+                mock_agent, agent_ready, _ = _make_slow_agent()
+                mock_create.return_value = mock_agent
+
+                first = await cli.post(
+                    "/v1/runs",
+                    json={"input": "hello", "session_id": "crisp-session"},
+                    headers=headers,
+                )
+                first_payload = await first.json()
+                assert first.status == 202
+                assert agent_ready.wait(timeout=3.0)
+
+                retry = await cli.post(
+                    "/v1/runs",
+                    json={"input": "hello", "session_id": "crisp-session"},
+                    headers=headers,
+                )
+                retry_payload = await retry.json()
+
+                assert retry.status == 202
+                assert retry_payload == first_payload
+                assert mock_create.call_count == 1
+
+                mock_agent.interrupt("finish test")
+                for _ in range(40):
+                    if not auth_adapter._active_run_tasks:
+                        break
+                    await asyncio.sleep(0.05)
+
+    @pytest.mark.asyncio
     async def test_start_rejects_idempotency_key_reuse_for_different_input(
         self, adapter
     ):
