@@ -11,8 +11,7 @@ Covers:
 import asyncio
 import threading
 import time
-from contextlib import nullcontext
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 from aiohttp import web
@@ -123,6 +122,19 @@ def auth_adapter():
 
 class TestStartRun:
     @pytest.mark.asyncio
+    async def test_session_history_resolves_compacted_descendant(self, adapter):
+        db = MagicMock()
+        db.resolve_resume_session_id.return_value = "child-session"
+        db.get_messages_as_conversation.return_value = [{"role": "user", "content": "prior"}]
+        adapter._ensure_session_db_async = AsyncMock(return_value=db)
+
+        history = await adapter._conversation_history_for_session("parent-session")
+
+        assert history == [{"role": "user", "content": "prior"}]
+        db.resolve_resume_session_id.assert_called_once_with("parent-session")
+        db.get_messages_as_conversation.assert_called_once_with("child-session")
+
+    @pytest.mark.asyncio
     async def test_start_returns_202(self, adapter):
         app = _create_runs_app(adapter)
         async with TestClient(TestServer(app)) as cli:
@@ -139,6 +151,7 @@ class TestStartRun:
                 data = await resp.json()
                 assert data["status"] == "started"
                 assert data["run_id"].startswith("run_")
+                assert "X-Hermes-Session-Id" not in resp.headers
 
                 status_resp = await cli.get(f"/v1/runs/{data['run_id']}")
                 assert status_resp.status == 200
@@ -148,195 +161,537 @@ class TestStartRun:
                 assert status["object"] == "hermes.run"
 
     @pytest.mark.asyncio
-    async def test_idempotency_key_reuses_run_for_concurrent_retries(self, adapter):
+    async def test_start_normalizes_text_parts_without_changing_history(self, adapter):
         app = _create_runs_app(adapter)
+        captured = {}
         async with TestClient(TestServer(app)) as cli:
             with patch.object(adapter, "_create_agent") as mock_create:
-                mock_agent, agent_ready, _ = _make_slow_agent()
+                mock_agent = MagicMock()
+
+                def _capture_run(user_message=None, conversation_history=None, task_id=None):
+                    captured.update(
+                        user_message=user_message,
+                        conversation_history=conversation_history,
+                    )
+                    return {"final_response": "done"}
+
+                mock_agent.run_conversation.side_effect = _capture_run
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
                 mock_create.return_value = mock_agent
 
-                first, retry = await asyncio.gather(
-                    cli.post(
-                        "/v1/runs",
-                        json={"input": "hello"},
-                        headers={"Idempotency-Key": "same-run"},
-                    ),
-                    cli.post(
-                        "/v1/runs",
-                        json={"input": "hello"},
-                        headers={"Idempotency-Key": "same-run"},
-                    ),
+                resp = await cli.post(
+                    "/v1/runs",
+                    json={
+                        "input": [
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "text", "text": "hello"},
+                                    {"type": "text", "text": "there"},
+                                ],
+                            }
+                        ],
+                        "conversation_history": [
+                            {"role": "user", "content": "prior question"},
+                            {"role": "assistant", "content": "prior answer"},
+                        ],
+                    },
                 )
-                first_data = await first.json()
-                retry_data = await retry.json()
-
-                assert first.status == retry.status == 202
-                assert retry_data["run_id"] == first_data["run_id"]
-                assert agent_ready.wait(timeout=3.0)
-                assert mock_create.call_count == 1
-
-                mock_agent.interrupt("finish test")
+                assert resp.status == 202
                 for _ in range(40):
-                    if not adapter._active_run_tasks:
+                    if captured:
                         break
                     await asyncio.sleep(0.05)
+
+        assert captured["user_message"] == "hello\nthere"
+        assert captured["conversation_history"] == [
+            {"role": "user", "content": "prior question"},
+            {"role": "assistant", "content": "prior answer"},
+        ]
 
     @pytest.mark.asyncio
-    async def test_idempotent_retry_bypasses_concurrency_limit(self, adapter):
-        adapter._max_concurrent_runs = 1
-        app = _create_runs_app(adapter)
-        async with TestClient(TestServer(app)) as cli:
-            with patch.object(adapter, "_create_agent") as mock_create:
-                mock_agent, agent_ready, _ = _make_slow_agent()
-                mock_create.return_value = mock_agent
-
-                first = await cli.post(
-                    "/v1/runs",
-                    json={"input": "hello"},
-                    headers={"Idempotency-Key": "same-active-run"},
-                )
-                first_data = await first.json()
-                assert first.status == 202
-                assert agent_ready.wait(timeout=3.0)
-
-                retry = await cli.post(
-                    "/v1/runs",
-                    json={"input": "hello"},
-                    headers={"Idempotency-Key": "same-active-run"},
-                )
-                retry_data = await retry.json()
-                assert retry.status == 202
-                assert retry_data["run_id"] == first_data["run_id"]
-
-                new_run = await cli.post(
-                    "/v1/runs",
-                    json={"input": "different"},
-                    headers={"Idempotency-Key": "different-active-run"},
-                )
-                assert new_run.status == 429
-                assert mock_create.call_count == 1
-
-                mock_agent.interrupt("finish test")
-                for _ in range(40):
-                    if not adapter._active_run_tasks:
-                        break
-                    await asyncio.sleep(0.05)
-
-    def test_terminal_idempotency_outlives_caller_recovery_window(
-        self, adapter, monkeypatch
+    async def test_start_reloads_session_history_for_repeated_header_session(
+        self, auth_adapter
     ):
-        now = 1_000.0
-        monkeypatch.setattr(time, "time", lambda: now)
-        adapter._set_run_status("run_recovered", "completed")
-        adapter._remember_idempotent_run(
-            "recovery-key", "request-fingerprint", "run_recovered"
-        )
+        app = _create_runs_app(auth_adapter)
+        captured_histories = []
+        stored_history = [
+            {"role": "user", "content": "prior question"},
+            {"role": "assistant", "content": "prior answer"},
+        ]
 
-        now += 301
+        async with TestClient(TestServer(app)) as cli:
+            with (
+                patch.object(
+                    auth_adapter,
+                    "_conversation_history_for_session",
+                    new_callable=AsyncMock,
+                ) as mock_history,
+                patch.object(auth_adapter, "_create_agent") as mock_create,
+            ):
+                mock_history.side_effect = [[], stored_history]
+                mock_agent = MagicMock()
 
-        assert adapter._get_idempotent_run_id(
-            "recovery-key", "request-fingerprint"
-        ) == "run_recovered"
+                def _capture_run(user_message=None, conversation_history=None, task_id=None):
+                    captured_histories.append(list(conversation_history))
+                    return {"final_response": "done"}
+
+                mock_agent.run_conversation.side_effect = _capture_run
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                first_resp = await cli.post(
+                    "/v1/runs",
+                    json={"input": "first", "session_id": "crisp-session"},
+                    headers={
+                        "Authorization": "Bearer sk-secret",
+                        "X-Hermes-Session-Id": "crisp-session",
+                    },
+                )
+                second_resp = await cli.post(
+                    "/v1/runs",
+                    json={"input": "second", "session_id": "crisp-session"},
+                    headers={
+                        "Authorization": "Bearer sk-secret",
+                        "X-Hermes-Session-Id": "crisp-session",
+                    },
+                )
+
+                assert first_resp.status == 202
+                assert second_resp.status == 202
+
+                for _ in range(40):
+                    if len(captured_histories) == 2:
+                        break
+                    await asyncio.sleep(0.05)
+
+        assert mock_history.await_args_list == [
+            call("crisp-session", fail_closed=True),
+            call("crisp-session", fail_closed=True),
+        ]
+        assert captured_histories == [[], stored_history]
 
     @pytest.mark.asyncio
-    async def test_idempotency_key_does_not_reuse_run_for_different_input(
+    async def test_start_fails_closed_when_session_history_cannot_be_read(
+        self, auth_adapter
+    ):
+        app = _create_runs_app(auth_adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            with (
+                patch.object(
+                    auth_adapter,
+                    "_conversation_history_for_session",
+                    new_callable=AsyncMock,
+                    side_effect=OSError("database unavailable"),
+                ) as mock_history,
+                patch.object(auth_adapter, "_create_agent") as mock_create,
+            ):
+                resp = await cli.post(
+                    "/v1/runs",
+                    json={"input": "second", "session_id": "crisp-session"},
+                    headers={
+                        "Authorization": "Bearer sk-secret",
+                        "X-Hermes-Session-Id": "crisp-session",
+                    },
+                )
+                payload = await resp.json()
+
+        assert resp.status == 503
+        assert payload["error"]["code"] == "session_history_unavailable"
+        mock_history.assert_awaited_once_with(
+            "crisp-session",
+            fail_closed=True,
+        )
+        mock_create.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_body_session_id_remains_correlation_only(self, adapter):
+        app = _create_runs_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            with (
+                patch.object(
+                    adapter,
+                    "_conversation_history_for_session",
+                    new_callable=AsyncMock,
+                    side_effect=OSError("database unavailable"),
+                ) as mock_history,
+                patch.object(adapter, "_create_agent") as mock_create,
+            ):
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {"final_response": "done"}
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post(
+                    "/v1/runs",
+                    json={"input": "hello", "session_id": "legacy-session"},
+                )
+                payload = await resp.json()
+
+        assert resp.status == 202
+        assert payload["session_id"] == "legacy-session"
+        mock_history.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_start_reuses_run_for_the_same_idempotency_key(self, auth_adapter):
+        app = _create_runs_app(auth_adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(auth_adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {"final_response": "done"}
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+                headers = {
+                    "Authorization": "Bearer sk-secret",
+                    "Idempotency-Key": "crisp-event-123",
+                    "X-Hermes-Session-Id": "crisp-session",
+                }
+                async def delayed_history(*_args, **_kwargs):
+                    await asyncio.sleep(0.05)
+                    return []
+
+                with patch.object(
+                    auth_adapter,
+                    "_conversation_history_for_session",
+                    side_effect=delayed_history,
+                ):
+                    first, second = await asyncio.gather(
+                        cli.post(
+                            "/v1/runs",
+                            json={"input": "hello", "session_id": "crisp-session"},
+                            headers=headers,
+                        ),
+                        cli.post(
+                            "/v1/runs",
+                            json={"input": "hello", "session_id": "crisp-session"},
+                            headers=headers,
+                        ),
+                    )
+                first_payload = await first.json()
+                second_payload = await second.json()
+                with patch.object(
+                    auth_adapter,
+                    "_conversation_history_for_session",
+                    side_effect=RuntimeError("session db unavailable"),
+                ):
+                    replay = await cli.post(
+                        "/v1/runs",
+                        json={"input": "hello", "session_id": "crisp-session"},
+                        headers=headers,
+                    )
+                replay_payload = await replay.json()
+                for _ in range(40):
+                    if mock_create.call_count == 1:
+                        break
+                    await asyncio.sleep(0.05)
+
+        assert first.status == 202
+        assert second.status == 202
+        assert replay.status == 202
+        assert second_payload == first_payload
+        assert replay_payload == first_payload
+        assert mock_create.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_start_rejects_idempotency_key_reuse_for_different_input(
         self, adapter
     ):
         app = _create_runs_app(adapter)
+
         async with TestClient(TestServer(app)) as cli:
             with patch.object(adapter, "_create_agent") as mock_create:
-                agents = []
-                for _ in range(2):
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {"final_response": "done"}
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+                headers = {"Idempotency-Key": "crisp-event-123"}
+                first = await cli.post(
+                    "/v1/runs",
+                    json={"input": "hello", "session_id": "crisp-session"},
+                    headers=headers,
+                )
+                conflict = await cli.post(
+                    "/v1/runs",
+                    json={"input": "different", "session_id": "crisp-session"},
+                    headers=headers,
+                )
+                payload = await conflict.json()
+
+        assert first.status == 202
+        assert conflict.status == 409
+        assert payload["error"]["code"] == "idempotency_conflict"
+
+    @pytest.mark.asyncio
+    async def test_idempotency_keys_are_scoped_by_profile(self, adapter):
+        app = _create_runs_app(adapter)
+        app.middlewares.insert(0, adapter._make_profile_prefix_middleware())
+        app.router.add_post("/p/{profile}/v1/runs", adapter._handle_runs)
+
+        with patch.object(
+            adapter,
+            "_resolve_request_profile",
+            side_effect=lambda request: request.match_info.get("profile"),
+        ):
+            async with TestClient(TestServer(app)) as cli:
+                with patch.object(adapter, "_create_agent") as mock_create:
                     mock_agent = MagicMock()
-                    mock_agent.run_conversation.return_value = {
-                        "final_response": "done"
-                    }
+                    mock_agent.run_conversation.return_value = {"final_response": "done"}
                     mock_agent.session_prompt_tokens = 0
                     mock_agent.session_completion_tokens = 0
                     mock_agent.session_total_tokens = 0
-                    agents.append(mock_agent)
-                mock_create.side_effect = agents
+                    mock_create.return_value = mock_agent
+                    headers = {"Idempotency-Key": "shared-key"}
+                    first = await cli.post(
+                        "/p/customer-support/v1/runs",
+                        json={"input": "hello"},
+                        headers=headers,
+                    )
+                    second = await cli.post(
+                        "/p/customer-support-specialist/v1/runs",
+                        json={"input": "hello"},
+                        headers=headers,
+                    )
+                    first_payload = await first.json()
+                    second_payload = await second.json()
 
-                first = await cli.post(
-                    "/v1/runs",
-                    json={"input": "first"},
-                    headers={"Idempotency-Key": "reused-key"},
-                )
-                second = await cli.post(
-                    "/v1/runs",
-                    json={"input": "second"},
-                    headers={"Idempotency-Key": "reused-key"},
-                )
-                first_data = await first.json()
-                second_data = await second.json()
-
-                assert first.status == second.status == 202
-                assert first_data["run_id"] != second_data["run_id"]
-
-                for _ in range(40):
-                    if not adapter._active_run_tasks:
-                        break
-                    await asyncio.sleep(0.05)
-
-                assert mock_create.call_count == 2
+        assert first.status == 202
+        assert second.status == 202
+        assert first_payload["run_id"] != second_payload["run_id"]
 
     @pytest.mark.asyncio
-    async def test_idempotency_key_is_scoped_by_profile(self, adapter, tmp_path):
-        async def profiled_runs(request):
-            from hermes_constants import (
-                reset_hermes_home_override,
-                set_hermes_home_override,
-            )
+    async def test_start_forwards_inline_image_and_remains_stoppable(self, auth_adapter):
+        app = _create_runs_app(auth_adapter)
+        image_data_url = "data:image/png;base64,iVBORw0KGgo="
+        image_input = [
+            {"type": "text", "text": "Ce arata captura?"},
+            {
+                "type": "image_url",
+                "image_url": {"url": image_data_url, "detail": "high"},
+            },
+        ]
+        captured = {}
 
-            token = _api_request_profile.set(request.match_info["profile"])
-            home_token = set_hermes_home_override(
-                tmp_path / request.match_info["profile"]
-            )
-            try:
-                return await adapter._handle_runs(request)
-            finally:
-                reset_hermes_home_override(home_token)
-                _api_request_profile.reset(token)
-
-        app = web.Application()
-        app.router.add_post("/p/{profile}/v1/runs", profiled_runs)
         async with TestClient(TestServer(app)) as cli:
-            with patch.object(adapter, "_create_agent") as mock_create, patch.object(
-                adapter, "_profile_scope", side_effect=lambda _profile: nullcontext()
-            ):
-                agents = []
-                for _ in range(2):
-                    mock_agent, _, _ = _make_slow_agent()
-                    agents.append(mock_agent)
-                mock_create.side_effect = agents
+            with patch.object(auth_adapter, "_create_agent") as mock_create:
+                mock_agent, agent_ready, _ = _make_slow_agent()
 
-                employee = await cli.post(
-                    "/p/employee/v1/runs",
-                    json={"input": "hello"},
-                    headers={"Idempotency-Key": "shared-key"},
+                def _capture_run(user_message=None, conversation_history=None, task_id=None):
+                    captured.update(
+                        user_message=user_message,
+                        conversation_history=conversation_history,
+                        task_id=task_id,
+                    )
+                    return _original_slow_run(
+                        user_message=user_message,
+                        conversation_history=conversation_history,
+                        task_id=task_id,
+                    )
+
+                _original_slow_run = mock_agent.run_conversation.side_effect
+                mock_agent.run_conversation.side_effect = _capture_run
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post(
+                    "/v1/runs",
+                    headers={
+                        "Authorization": "Bearer sk-secret",
+                        "X-Hermes-Session-Id": " crisp-session ",
+                    },
+                    json={
+                        "input": [{"role": "user", "content": image_input}],
+                        "session_id": "crisp-session",
+                    },
                 )
-                customer = await cli.post(
-                    "/p/customer/v1/runs",
-                    json={"input": "hello"},
-                    headers={"Idempotency-Key": "shared-key"},
+                data = await resp.json()
+
+                assert resp.status == 202
+                assert data["session_id"] == "crisp-session"
+                assert resp.headers["X-Hermes-Session-Id"] == "crisp-session"
+                run_id = data["run_id"]
+                assert agent_ready.wait(timeout=3.0)
+
+                request_headers = {
+                    "Authorization": "Bearer sk-secret",
+                    "X-Hermes-Session-Id": "crisp-session",
+                }
+                status_resp = await cli.get(
+                    f"/v1/runs/{run_id}", headers=request_headers
                 )
-                employee_data = await employee.json()
-                customer_data = await customer.json()
+                status = await status_resp.json()
+                assert status["session_id"] == "crisp-session"
 
-                assert employee.status == customer.status == 202
-                assert employee_data["run_id"] != customer_data["run_id"]
-                for _ in range(40):
-                    if mock_create.call_count == 2:
-                        break
-                    await asyncio.sleep(0.05)
-                assert mock_create.call_count == 2
+                stop_resp = await cli.post(
+                    f"/v1/runs/{run_id}/stop", headers=request_headers
+                )
+                assert stop_resp.status == 200
 
-                for mock_agent in agents:
-                    mock_agent.interrupt("finish test")
-                for _ in range(40):
-                    if not adapter._active_run_tasks:
-                        break
-                    await asyncio.sleep(0.05)
+        assert captured == {
+            "user_message": image_input,
+            "conversation_history": [],
+            "task_id": "crisp-session",
+        }
+        mock_agent.interrupt.assert_called_once_with("Stop requested via API")
+
+    @pytest.mark.asyncio
+    async def test_start_rejects_non_image_data_url(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                resp = await cli.post(
+                    "/v1/runs",
+                    json={
+                        "input": [
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "text", "text": "read this"},
+                                    {
+                                        "type": "image_url",
+                                        "image_url": {
+                                            "url": "data:text/plain;base64,aGVsbG8="
+                                        },
+                                    },
+                                ],
+                            }
+                        ]
+                    },
+                )
+                payload = await resp.json()
+
+        assert resp.status == 400
+        assert payload["error"]["code"] == "unsupported_content_type"
+        assert payload["error"]["param"] == "input[0].content"
+        assert adapter._run_streams == {}
+        assert adapter._run_statuses == {}
+        mock_create.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("invalid_item", [42, {"role": "user"}])
+    async def test_start_rejects_invalid_input_array_items(self, adapter, invalid_item):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                resp = await cli.post(
+                    "/v1/runs",
+                    json={
+                        "input": [
+                            {"role": "user", "content": "valid first message"},
+                            invalid_item,
+                        ]
+                    },
+                )
+                payload = await resp.json()
+
+        assert resp.status == 400
+        assert payload["error"]["code"] == "invalid_input_item"
+        assert payload["error"]["param"] == "input[1]"
+        assert adapter._run_streams == {}
+        assert adapter._run_statuses == {}
+        mock_create.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_start_rejects_session_header_body_mismatch(self, auth_adapter):
+        app = _create_runs_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(auth_adapter, "_create_agent") as mock_create:
+                resp = await cli.post(
+                    "/v1/runs",
+                    headers={
+                        "Authorization": "Bearer sk-secret",
+                        "X-Hermes-Session-Id": "header-session",
+                    },
+                    json={"input": "hello", "session_id": "body-session"},
+                )
+                payload = await resp.json()
+
+        assert resp.status == 400
+        assert payload["error"]["code"] == "session_id_mismatch"
+        assert auth_adapter._run_streams == {}
+        assert auth_adapter._run_statuses == {}
+        mock_create.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_start_rejects_unsafe_session_header(self, auth_adapter):
+        app = _create_runs_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(auth_adapter, "_create_agent") as mock_create:
+                resp = await cli.post(
+                    "/v1/runs",
+                    headers={
+                        "Authorization": "Bearer sk-secret",
+                        "X-Hermes-Session-Id": "../../other-session",
+                    },
+                    json={"input": "hello"},
+                )
+
+        assert resp.status == 400
+        assert auth_adapter._run_streams == {}
+        assert auth_adapter._run_statuses == {}
+        mock_create.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_start_rejects_unsafe_body_session_id(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                resp = await cli.post(
+                    "/v1/runs",
+                    json={"input": "hello", "session_id": "../../other-session"},
+                )
+                payload = await resp.json()
+
+        assert resp.status == 400
+        assert payload["error"]["code"] == "invalid_session_id"
+        assert adapter._run_streams == {}
+        assert adapter._run_statuses == {}
+        mock_create.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_start_rejects_non_string_body_session_id(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                resp = await cli.post(
+                    "/v1/runs",
+                    json={"input": "hello", "session_id": 123},
+                )
+                payload = await resp.json()
+
+        assert resp.status == 400
+        assert payload["error"]["code"] == "invalid_session_id"
+        assert payload["error"]["param"] == "session_id"
+        assert adapter._run_streams == {}
+        assert adapter._run_statuses == {}
+        mock_create.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_start_session_header_requires_api_key_configuration(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                resp = await cli.post(
+                    "/v1/runs",
+                    headers={"X-Hermes-Session-Id": "crisp-session"},
+                    json={"input": "hello"},
+                )
+
+        assert resp.status == 403
+        assert adapter._run_streams == {}
+        assert adapter._run_statuses == {}
+        mock_create.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_start_binds_chat_id_for_delegation_wake_target(self, adapter):
@@ -567,7 +922,9 @@ class TestRunStatus:
                     "/v1/runs",
                     json={"input": "hello", "session_id": "space-session"},
                 )
+                assert resp.headers["X-Hermes-Session-Id"] == "space-session"
                 data = await resp.json()
+                assert data["session_id"] == "space-session"
                 run_id = data["run_id"]
 
                 for _ in range(20):

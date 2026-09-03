@@ -1285,12 +1285,10 @@ class APIServerAdapter(BasePlatformAdapter):
         self._stopping_run_ids: set[str] = set()
         # Pollable run status for dashboards and external control-plane UIs.
         self._run_statuses: Dict[str, Dict[str, Any]] = {}
-        # Idempotent run starts are local to this runtime adapter and further
-        # scoped by multiplex profile and request fingerprint. Values stay
-        # bounded and expire after the dedicated recovery window below.
-        self._run_idempotency: Dict[
-            tuple[str, str, str], tuple[str, float]
-        ] = {}
+        # Original 202 response per Idempotency-Key. The run status owns the
+        # lifetime, so retries after a lost HTTP response cannot start a second
+        # agent run while the gateway process is still serving the first one.
+        self._run_idempotency: Dict[str, Dict[str, Any]] = {}
         # Active approval session key for each run_id.  The approval core
         # resolves requests by session key, while API clients address the
         # in-flight run by run_id.
@@ -1860,14 +1858,15 @@ class APIServerAdapter(BasePlatformAdapter):
     def _parse_session_id_header(
         self, request: "web.Request"
     ) -> tuple[Optional[str], Optional["web.Response"]]:
-        """Validate an authenticated transcript-continuation header."""
+        """Extract and validate the ``X-Hermes-Session-Id`` header."""
         raw = request.headers.get("X-Hermes-Session-Id", "").strip()
         if not raw:
             return None, None
+
         if not self._api_key:
             logger.warning(
                 "Session continuation via X-Hermes-Session-Id rejected: "
-                "no API key configured. Set API_SERVER_KEY to enable "
+                "no API key configured.  Set API_SERVER_KEY to enable "
                 "session continuity."
             )
             return None, web.json_response(
@@ -1877,48 +1876,21 @@ class APIServerAdapter(BasePlatformAdapter):
                 ),
                 status=403,
             )
+
         from gateway.session import _is_path_unsafe
 
-        if re.search(r"[\r\n\x00]", raw) or _is_path_unsafe(raw):
+        if re.search(r'[\r\n\x00]', raw) or _is_path_unsafe(raw):
             return None, web.json_response(
-                _openai_error("Invalid session ID"), status=400
+                {"error": {"message": "Invalid session ID", "type": "invalid_request_error"}},
+                status=400,
             )
         if len(raw) > self._MAX_SESSION_HEADER_LEN:
             return None, web.json_response(
-                _openai_error("Session ID too long"), status=400
-            )
-        return raw, None
-
-    def _parse_mcp_run_metadata_header(
-        self, request: "web.Request"
-    ) -> tuple[Optional[Dict[str, Any]], Optional["web.Response"]]:
-        """Decode private metadata for this run without exposing it to the model."""
-        from agent.mcp_run_context import (
-            MCP_RUN_METADATA_HEADER,
-            decode_mcp_run_metadata_header,
-        )
-
-        raw = request.headers.get(MCP_RUN_METADATA_HEADER, "").strip()
-        if not raw:
-            return None, None
-        if not self._api_key:
-            logger.warning(
-                "%s rejected: no API key configured", MCP_RUN_METADATA_HEADER
-            )
-            return None, web.json_response(
-                _openai_error(
-                    f"{MCP_RUN_METADATA_HEADER} requires API key authentication. "
-                    "Configure API_SERVER_KEY to enable this feature."
-                ),
-                status=403,
-            )
-        try:
-            return decode_mcp_run_metadata_header(raw), None
-        except ValueError as exc:
-            return None, web.json_response(
-                _openai_error(str(exc), code="invalid_mcp_metadata"),
+                {"error": {"message": "Session ID too long", "type": "invalid_request_error"}},
                 status=400,
             )
+
+        return raw, None
 
     def _parse_session_key_header(
         self, request: "web.Request"
@@ -3119,14 +3091,26 @@ class APIServerAdapter(BasePlatformAdapter):
             return None, web.json_response(_openai_error(f"Session not found: {session_id}", code="session_not_found"), status=404)
         return session, None
 
-    async def _conversation_history_for_session(self, session_id: str) -> List[Dict[str, Any]]:
+    async def _conversation_history_for_session(
+        self,
+        session_id: str,
+        *,
+        fail_closed: bool = False,
+    ) -> List[Dict[str, Any]]:
         db = await self._ensure_session_db_async()
         if db is None:
+            if fail_closed:
+                raise RuntimeError("session_db_unavailable")
             return []
         try:
-            return await asyncio.to_thread(db.get_messages_as_conversation, session_id)
+            resolved_id = session_id
+            if hasattr(db, "resolve_resume_session_id"):
+                resolved_id = await asyncio.to_thread(db.resolve_resume_session_id, session_id)
+            return await asyncio.to_thread(db.get_messages_as_conversation, resolved_id)
         except Exception as exc:
             logger.warning("Failed to load session history for %s: %s", session_id, exc)
+            if fail_closed:
+                raise
             return []
 
     async def _handle_list_sessions(self, request: "web.Request") -> "web.Response":
@@ -6232,8 +6216,42 @@ class APIServerAdapter(BasePlatformAdapter):
         if not raw_input:
             return web.json_response(_openai_error("Missing 'input' field"), status=400)
 
-        user_message = raw_input if isinstance(raw_input, str) else (raw_input[-1].get("content", "") if isinstance(raw_input, list) else "")
-        if not user_message:
+        input_messages: List[Dict[str, Any]] = []
+        if isinstance(raw_input, str):
+            input_messages = [{"role": "user", "content": raw_input}]
+        elif isinstance(raw_input, list):
+            for idx, item in enumerate(raw_input):
+                if isinstance(item, str):
+                    input_messages.append({"role": "user", "content": item})
+                elif isinstance(item, dict):
+                    if "content" not in item:
+                        return web.json_response(
+                            _openai_error(
+                                "Input message objects must include a 'content' field",
+                                code="invalid_input_item",
+                                param=f"input[{idx}]",
+                            ),
+                            status=400,
+                        )
+                    try:
+                        content = _normalize_multimodal_content(item.get("content", ""))
+                    except ValueError as exc:
+                        return _multimodal_validation_error(exc, param=f"input[{idx}].content")
+                    input_messages.append({"role": item.get("role", "user"), "content": content})
+                else:
+                    return web.json_response(
+                        _openai_error(
+                            "Input array items must be strings or message objects",
+                            code="invalid_input_item",
+                            param=f"input[{idx}]",
+                        ),
+                        status=400,
+                    )
+        else:
+            return web.json_response(_openai_error("'input' must be a string or array"), status=400)
+
+        user_message: Any = input_messages[-1].get("content", "") if input_messages else ""
+        if not _content_has_visible_payload(user_message):
             return web.json_response(_openai_error("No user message found in input"), status=400)
 
         instructions = body.get("instructions")
@@ -6241,8 +6259,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         # Accept explicit conversation_history from the request body.
         # Precedence: explicit conversation_history > previous_response_id.
-        conversation_history: List[Dict[str, str]] = []
-        explicit_history_provided = "conversation_history" in body
+        conversation_history: List[Dict[str, Any]] = []
         raw_history = body.get("conversation_history")
         if explicit_history_provided:
             if not isinstance(raw_history, list):
@@ -6256,7 +6273,11 @@ class APIServerAdapter(BasePlatformAdapter):
                         _openai_error(f"conversation_history[{i}] must have 'role' and 'content' fields"),
                         status=400,
                     )
-                conversation_history.append({"role": str(entry["role"]), "content": str(entry["content"])})
+                try:
+                    entry_content = _normalize_multimodal_content(entry["content"])
+                except ValueError as exc:
+                    return _multimodal_validation_error(exc, param=f"conversation_history[{i}].content")
+                conversation_history.append({"role": str(entry["role"]), "content": entry_content})
             if previous_response_id:
                 logger.debug("Both conversation_history and previous_response_id provided; using conversation_history")
 
@@ -6272,64 +6293,50 @@ class APIServerAdapter(BasePlatformAdapter):
         # When input is a multi-message array, extract all but the last
         # message as conversation history (the last becomes user_message).
         # Only fires when no explicit history was provided.
-        if (
-            not explicit_history_provided
-            and not conversation_history
-            and isinstance(raw_input, list)
-            and len(raw_input) > 1
-        ):
-            for msg in raw_input[:-1]:
-                if isinstance(msg, dict) and msg.get("role") and msg.get("content"):
-                    content = msg["content"]
-                    if isinstance(content, list):
-                        # Flatten multi-part content blocks to text
-                        content = " ".join(
-                            part.get("text", "") for part in content
-                            if isinstance(part, dict) and part.get("type") == "text"
-                        )
-                    conversation_history.append({"role": msg["role"], "content": str(content)})
+        if not conversation_history and len(input_messages) > 1:
+            for msg in input_messages[:-1]:
+                if msg.get("role") and _content_has_visible_payload(msg.get("content")):
+                    conversation_history.append(msg)
 
-        body_session_id = body.get("session_id")
-        if (
-            provided_session_id
-            and body_session_id
-            and str(body_session_id) != provided_session_id
-        ):
+        provided_session_id, session_id_err = self._parse_session_id_header(request)
+        if session_id_err is not None:
+            return session_id_err
+        raw_body_session_id = body.get("session_id")
+        if raw_body_session_id is not None and not isinstance(raw_body_session_id, str):
             return web.json_response(
                 _openai_error(
-                    "X-Hermes-Session-Id conflicts with body session_id"
+                    "Body session_id must be a string",
+                    code="invalid_session_id",
+                    param="session_id",
                 ),
                 status=400,
             )
-        session_id = provided_session_id or body_session_id or stored_session_id
-        if (
-            not explicit_history_provided
-            and not conversation_history
-            and not previous_response_id
-            and isinstance(session_id, str)
-            and session_id
-            and self._api_key
-        ):
-            try:
-                db = await self._ensure_session_db_async()
-                if db is not None:
-                    resolve_session = getattr(db, "resolve_resume_session_id", None)
-                    if callable(resolve_session):
-                        resolved_session_id = await asyncio.to_thread(
-                            resolve_session, session_id
-                        )
-                        if isinstance(resolved_session_id, str) and resolved_session_id:
-                            session_id = resolved_session_id
-                    conversation_history = await asyncio.to_thread(
-                        db.get_messages_as_conversation, session_id
-                    )
-            except Exception as exc:
-                logger.warning(
-                    "Failed to load run session history for %s: %s",
-                    session_id,
-                    exc,
+        body_session_id = raw_body_session_id.strip() if raw_body_session_id else None
+        if body_session_id:
+            from gateway.session import _is_path_unsafe
+
+            if (
+                re.search(r'[\r\n\x00]', body_session_id)
+                or _is_path_unsafe(body_session_id)
+                or len(body_session_id) > self._MAX_SESSION_HEADER_LEN
+            ):
+                return web.json_response(
+                    _openai_error("Invalid session ID", code="invalid_session_id"),
+                    status=400,
                 )
-                conversation_history = []
+        if provided_session_id and body_session_id:
+            if body_session_id != provided_session_id:
+                return web.json_response(
+                    _openai_error(
+                        "X-Hermes-Session-Id does not match body session_id",
+                        code="session_id_mismatch",
+                        param="session_id",
+                    ),
+                    status=400,
+                )
+
+        session_id = provided_session_id or body_session_id or stored_session_id
+        continuation_session_id = provided_session_id
         route = self._resolve_route(body.get("model"))
         agent_overrides = _request_agent_overrides(body, virtual_model=self._model_name)
         selection_error = self._request_route_conflict_error(
@@ -6342,15 +6349,73 @@ class APIServerAdapter(BasePlatformAdapter):
         if selection_error:
             return web.json_response(_openai_error(selection_error), status=400)
 
-        # Re-check after all awaits and request validation. Concurrent retries
-        # can both miss the fast path, but only the first may allocate a run.
+        idempotency_key = request.headers.get("Idempotency-Key")
+        idempotency_fingerprint = None
+        idempotency_storage_key = None
         if idempotency_key:
-            existing_run_id = self._get_idempotent_run_id(
-                idempotency_key, idempotency_fingerprint
+            if len(idempotency_key) > 256:
+                return web.json_response(
+                    _openai_error(
+                        "Idempotency-Key is too long",
+                        code="invalid_idempotency_key",
+                        param="Idempotency-Key",
+                    ),
+                    status=400,
+                )
+            effective_profile = _api_request_profile.get() or ""
+            idempotency_storage_key = f"{effective_profile}:{idempotency_key}" if effective_profile else idempotency_key
+            fingerprint_body = dict(body)
+            fingerprint_body["_resolved_session_id"] = session_id
+            fingerprint_body["_gateway_session_key"] = gateway_session_key
+            fingerprint_body["_request_profile"] = effective_profile
+            idempotency_fingerprint = _make_request_fingerprint(
+                fingerprint_body,
+                keys=sorted(fingerprint_body),
             )
-            if existing_run_id is not None:
-                return _started_response(existing_run_id)
 
+        def _cached_idempotency_response():
+            if not idempotency_storage_key:
+                return None
+            existing = self._run_idempotency.get(idempotency_storage_key)
+            if not existing:
+                return None
+            if existing["fingerprint"] != idempotency_fingerprint:
+                return web.json_response(
+                    _openai_error(
+                        "Idempotency-Key was already used with different input",
+                        code="idempotency_conflict",
+                        param="Idempotency-Key",
+                    ),
+                    status=409,
+                )
+            return web.json_response(
+                dict(existing["response"]),
+                status=202,
+                headers=dict(existing["headers"]),
+            )
+
+        cached_response = _cached_idempotency_response()
+        if cached_response is not None:
+            return cached_response
+
+        response_session_id = session_id
+        if not conversation_history and continuation_session_id:
+            try:
+                conversation_history = await self._conversation_history_for_session(
+                    continuation_session_id,
+                    fail_closed=True,
+                )
+            except Exception:
+                return web.json_response(
+                    _openai_error(
+                        "Session history unavailable",
+                        code="session_history_unavailable",
+                    ),
+                    status=503,
+                )
+        cached_response = _cached_idempotency_response()
+        if cached_response is not None:
+            return cached_response
         run_id = f"run_{uuid.uuid4().hex}"
         session_id = session_id or run_id
         # Approval queues gate host-side tool execution and must be isolated
@@ -6682,11 +6747,27 @@ class APIServerAdapter(BasePlatformAdapter):
         if hasattr(task, "add_done_callback"):
             task.add_done_callback(self._background_tasks.discard)
 
-        if idempotency_key:
-            self._remember_idempotent_run(
-                idempotency_key, idempotency_fingerprint, run_id
-            )
-        return _started_response(run_id)
+        response_headers = {}
+        if response_session_id:
+            response_headers["X-Hermes-Session-Id"] = response_session_id
+        if gateway_session_key:
+            response_headers["X-Hermes-Session-Key"] = gateway_session_key
+        response_payload = {
+            "run_id": run_id,
+            "session_id": session_id,
+            "status": "started",
+        }
+        if idempotency_storage_key and idempotency_fingerprint:
+            self._run_idempotency[idempotency_storage_key] = {
+                "fingerprint": idempotency_fingerprint,
+                "response": response_payload,
+                "headers": response_headers,
+            }
+        return web.json_response(
+            response_payload,
+            status=202,
+            headers=response_headers,
+        )
 
     async def _handle_get_run(self, request: "web.Request") -> "web.Response":
         """GET /v1/runs/{run_id} — return pollable run status for external UIs."""
@@ -6914,6 +6995,10 @@ class APIServerAdapter(BasePlatformAdapter):
         ]
         for run_id in stale_statuses:
             self._run_statuses.pop(run_id, None)
+        live_run_ids = set(self._run_statuses)
+        for key, entry in list(self._run_idempotency.items()):
+            if entry.get("response", {}).get("run_id") not in live_run_ids:
+                self._run_idempotency.pop(key, None)
 
     # ------------------------------------------------------------------
     # BasePlatformAdapter interface

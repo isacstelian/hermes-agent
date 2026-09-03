@@ -382,27 +382,22 @@ Create a new agent run. Returns a `run_id` that can be used to subscribe to prog
 ```json
 {
   "run_id": "run_abc123",
+  "session_id": "space-session",
   "status": "started"
 }
 ```
 
-Runs accept a simple `input` string and optional `session_id`, `instructions`,
-`conversation_history`, or `previous_response_id`. Authenticated callers can
-also pass `X-Hermes-Session-Id`. When the same session ID is reused without
-explicit history or `previous_response_id`, Hermes loads that transcript from
-the session database before starting the new run. Hermes follows any
-compression-created child session and publishes the current session ID in the
-completed run status. The header and body value must match when both are
-present.
+Runs accept a simple `input` string or an OpenAI-style message array. Message
+content can contain `text` and inline `image_url` parts, including
+`data:image/...` URLs. Uploaded files and non-image data URLs are rejected.
 
-An explicit `conversation_history` takes precedence even when it is an empty
-array. Hermes persists the resulting transcript as the active history for that
-session. This lets an API client replace stale stored context without it
-reappearing on the next turn.
-
-`Idempotency-Key` deduplicates exact matching start requests for 10 minutes.
-Changes to the request body, session headers, or private MCP metadata produce a
-different run even when a caller accidentally reuses the same key.
+Pass `X-Hermes-Session-Id` to continue an existing transcript. Session
+continuation requires API key authentication. The optional body `session_id`
+remains a correlation ID for existing callers and does not load stored history
+on its own. When both are present they must match. Hermes returns the resolved
+ID in the 202 JSON body, the `X-Hermes-Session-Id` response header, and
+subsequent run status. `instructions`, `conversation_history`, and
+`previous_response_id` remain optional.
 
 ### GET /v1/runs/\{run_id\}
 
