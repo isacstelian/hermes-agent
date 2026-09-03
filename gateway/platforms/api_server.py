@@ -1892,6 +1892,37 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return raw, None
 
+    def _parse_mcp_run_metadata_header(
+        self, request: "web.Request"
+    ) -> tuple[Optional[Dict[str, Any]], Optional["web.Response"]]:
+        """Decode private metadata for this run without exposing it to the model."""
+        from agent.mcp_run_context import (
+            MCP_RUN_METADATA_HEADER,
+            decode_mcp_run_metadata_header,
+        )
+
+        raw = request.headers.get(MCP_RUN_METADATA_HEADER, "").strip()
+        if not raw:
+            return None, None
+        if not self._api_key:
+            logger.warning(
+                "%s rejected: no API key configured", MCP_RUN_METADATA_HEADER
+            )
+            return None, web.json_response(
+                _openai_error(
+                    f"{MCP_RUN_METADATA_HEADER} requires API key authentication. "
+                    "Configure API_SERVER_KEY to enable this feature."
+                ),
+                status=403,
+            )
+        try:
+            return decode_mcp_run_metadata_header(raw), None
+        except ValueError as exc:
+            return None, web.json_response(
+                _openai_error(str(exc), code="invalid_mcp_metadata"),
+                status=400,
+            )
+
     def _parse_session_key_header(
         self, request: "web.Request"
     ) -> tuple[Optional[str], Optional["web.Response"]]:
@@ -5997,53 +6028,6 @@ class APIServerAdapter(BasePlatformAdapter):
 
     _RUN_STREAM_TTL = 300  # seconds before orphaned runs are swept
     _RUN_STATUS_TTL = 3600  # seconds to retain terminal run status for polling
-    # Keep terminal retries deduplicated beyond the caller's 300s recovery
-    # window. Active runs remain retained regardless of age.
-    _RUN_IDEMPOTENCY_TTL = 600
-    _RUN_IDEMPOTENCY_MAX_ITEMS = 1000
-
-    @staticmethod
-    def _run_idempotency_scope() -> str:
-        """Identify the concrete profile home served by this request."""
-        try:
-            from hermes_constants import get_hermes_home
-
-            return str(get_hermes_home().resolve())
-        except (OSError, RuntimeError):
-            return _api_request_profile.get() or "default"
-
-    def _get_idempotent_run_id(self, key: str, fingerprint: str) -> Optional[str]:
-        """Return a prior run for this runtime/profile retry scope."""
-        now = time.time()
-        stale = [
-            cache_key
-            for cache_key, (run_id, created_at) in self._run_idempotency.items()
-            if now - created_at > self._RUN_IDEMPOTENCY_TTL
-            and self._run_statuses.get(run_id, {}).get("status")
-            not in {"queued", "running", "waiting_for_approval", "stopping"}
-        ]
-        for cache_key in stale:
-            self._run_idempotency.pop(cache_key, None)
-
-        cache_key = (self._run_idempotency_scope(), key, fingerprint)
-        item = self._run_idempotency.get(cache_key)
-        if item is None:
-            return None
-        run_id, _ = item
-        if run_id not in self._run_statuses:
-            self._run_idempotency.pop(cache_key, None)
-            return None
-        return run_id
-
-    def _remember_idempotent_run(
-        self, key: str, fingerprint: str, run_id: str
-    ) -> None:
-        cache_key = (self._run_idempotency_scope(), key, fingerprint)
-        self._run_idempotency.pop(cache_key, None)
-        self._run_idempotency[cache_key] = (run_id, time.time())
-        while len(self._run_idempotency) > self._RUN_IDEMPOTENCY_MAX_ITEMS:
-            self._run_idempotency.pop(next(iter(self._run_idempotency)))
-
     def _set_run_status(self, run_id: str, status: str, **fields: Any) -> Dict[str, Any]:
         """Update pollable run status without exposing private agent objects."""
         now = time.time()
@@ -6184,33 +6168,6 @@ class APIServerAdapter(BasePlatformAdapter):
         from agent.mcp_run_context import read_mcp_run_metadata
 
         request_mcp_metadata = read_mcp_run_metadata()
-        idempotency_key = request.headers.get("Idempotency-Key")
-        idempotency_fingerprint = ""
-        if idempotency_key:
-            idempotency_fingerprint = hashlib.sha256(
-                json.dumps(
-                    {
-                        "body": body,
-                        "session_id_header": provided_session_id,
-                        "session_key_header": gateway_session_key,
-                        "mcp_metadata": request_mcp_metadata,
-                    },
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                    sort_keys=True,
-                ).encode("utf-8")
-            ).hexdigest()
-            existing_run_id = self._get_idempotent_run_id(
-                idempotency_key, idempotency_fingerprint
-            )
-            if existing_run_id is not None:
-                return _started_response(existing_run_id)
-
-        # Exact retries reuse their existing run even while that run occupies
-        # the last concurrency slot. New work still observes the shared cap.
-        limited = self._concurrency_limited_response()
-        if limited is not None:
-            return limited
 
         raw_input = body.get("input")
         if not raw_input:
@@ -6260,6 +6217,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # Accept explicit conversation_history from the request body.
         # Precedence: explicit conversation_history > previous_response_id.
         conversation_history: List[Dict[str, Any]] = []
+        explicit_history_provided = "conversation_history" in body
         raw_history = body.get("conversation_history")
         if explicit_history_provided:
             if not isinstance(raw_history, list):
@@ -6363,7 +6321,16 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=400,
                 )
             effective_profile = _api_request_profile.get() or ""
-            idempotency_storage_key = f"{effective_profile}:{idempotency_key}" if effective_profile else idempotency_key
+            idempotency_scope = _make_request_fingerprint(
+                {
+                    "profile": effective_profile,
+                    "session_id": session_id,
+                    "session_key": gateway_session_key,
+                },
+                keys=["profile", "session_id", "session_key"],
+                mcp_metadata=request_mcp_metadata,
+            )
+            idempotency_storage_key = f"{effective_profile}:{idempotency_key}:{idempotency_scope}"
             fingerprint_body = dict(body)
             fingerprint_body["_resolved_session_id"] = session_id
             fingerprint_body["_gateway_session_key"] = gateway_session_key
@@ -6371,6 +6338,7 @@ class APIServerAdapter(BasePlatformAdapter):
             idempotency_fingerprint = _make_request_fingerprint(
                 fingerprint_body,
                 keys=sorted(fingerprint_body),
+                mcp_metadata=request_mcp_metadata,
             )
 
         def _cached_idempotency_response():
@@ -6416,6 +6384,9 @@ class APIServerAdapter(BasePlatformAdapter):
         cached_response = _cached_idempotency_response()
         if cached_response is not None:
             return cached_response
+        limited = self._concurrency_limited_response()
+        if limited is not None:
+            return limited
         run_id = f"run_{uuid.uuid4().hex}"
         session_id = session_id or run_id
         # Approval queues gate host-side tool execution and must be isolated

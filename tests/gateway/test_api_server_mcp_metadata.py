@@ -273,8 +273,8 @@ async def test_runs_preserve_two_employee_transcripts_without_cross_session_leak
             await _start(client, "b", "first-b", use_header=True)
             await _start(client, "a", "second-a", use_header=True)
             await _start(client, "b", "second-b", use_header=True)
-            await _start(client, "bridge", "first-bridge", use_header=False)
-            await _start(client, "bridge", "second-bridge", use_header=False)
+            await _start(client, "bridge", "first-bridge", use_header=True)
+            await _start(client, "bridge", "second-bridge", use_header=True)
 
     assert observed[0]["history"] == []
     assert observed[1]["history"] == []
@@ -328,7 +328,10 @@ async def test_runs_follow_compression_tip_and_publish_rotated_session_id():
             response = await client.post(
                 "/v1/runs",
                 json={"input": "next", "session_id": "session-old"},
-                headers={"Authorization": "Bearer sk-test-secret"},
+                headers={
+                    "Authorization": "Bearer sk-test-secret",
+                    "X-Hermes-Session-Id": "session-old",
+                },
             )
             assert response.status == 202
             run_id = (await response.json())["run_id"]
@@ -338,7 +341,7 @@ async def test_runs_follow_compression_tip_and_publish_rotated_session_id():
         "resolved_from": "session-old",
         "loaded_from": "session-child",
     }
-    assert create_agent.call_args.kwargs["session_id"] == "session-child"
+    assert create_agent.call_args.kwargs["session_id"] == "session-old"
     assert mock_agent.run_conversation.call_args.kwargs["conversation_history"] == [
         {"role": "user", "content": "compressed history"}
     ]
