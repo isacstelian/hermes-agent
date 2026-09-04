@@ -58,6 +58,88 @@ def test_metadata_nesting_limit_is_explicit_and_stable():
         decode_mcp_run_metadata_header(_encode_metadata(too_deep))
 
 
+@pytest.mark.parametrize(
+    "invalid_json",
+    [
+        b'{"value":NaN}',
+        b'{"value":Infinity}',
+        b'{"value":-Infinity}',
+    ],
+)
+def test_metadata_rejects_non_finite_json_constants(invalid_json):
+    encoded = base64.urlsafe_b64encode(invalid_json).rstrip(b"=").decode()
+
+    with pytest.raises(ValueError, match="not valid JSON"):
+        decode_mcp_run_metadata_header(encoded)
+
+
+def test_metadata_rejects_numeric_overflow():
+    encoded = base64.urlsafe_b64encode(b'{"value":1e9999}').rstrip(b"=").decode()
+
+    with pytest.raises(ValueError, match="finite numbers"):
+        decode_mcp_run_metadata_header(encoded)
+
+
+@pytest.mark.asyncio
+async def test_api_rejects_metadata_numeric_overflow():
+    adapter = _adapter()
+    encoded = base64.urlsafe_b64encode(b'{"value":1e9999}').rstrip(b"=").decode()
+
+    with patch.object(adapter, "_create_agent") as create_agent:
+        async with TestClient(TestServer(_app(adapter))) as client:
+            response = await client.post(
+                "/v1/runs",
+                json={"input": "programul meu"},
+                headers={
+                    "Authorization": "Bearer sk-test-secret",
+                    "X-Hermes-MCP-Metadata": encoded,
+                },
+            )
+
+    assert response.status == 400
+    create_agent.assert_not_called()
+
+
+def test_metadata_rejects_standard_base64_alphabet():
+    encoded = base64.b64encode('{"x":"\u083e"}'.encode("utf-8")).rstrip(b"=").decode()
+    assert "+" in encoded
+
+    with pytest.raises(ValueError, match="not valid base64url"):
+        decode_mcp_run_metadata_header(encoded)
+
+
+@pytest.mark.parametrize("wrapper", [" {encoded} ", "\t{encoded}", "{encoded}="])
+def test_metadata_rejects_whitespace_and_padding(wrapper):
+    encoded = _encode_metadata({"magic.employee": {"binding": "signed-binding"}})
+
+    with pytest.raises(ValueError, match="not valid base64url"):
+        decode_mcp_run_metadata_header(wrapper.format(encoded=encoded))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "header_template",
+    [" {encoded} ", "{encoded}="],
+)
+async def test_api_rejects_metadata_header_whitespace_and_padding(header_template):
+    adapter = _adapter()
+    encoded = _encode_metadata({"magic.employee": {"binding": "signed-binding"}})
+
+    with patch.object(adapter, "_create_agent") as create_agent:
+        async with TestClient(TestServer(_app(adapter))) as client:
+            response = await client.post(
+                "/v1/runs",
+                json={"input": "programul meu"},
+                headers={
+                    "Authorization": "Bearer sk-test-secret",
+                    "X-Hermes-MCP-Metadata": header_template.format(encoded=encoded),
+                },
+            )
+
+    assert response.status == 400
+    create_agent.assert_not_called()
+
+
 async def _wait_for_run(adapter: APIServerAdapter, run_id: str) -> None:
     for _ in range(100):
         status = adapter._run_statuses.get(run_id, {})

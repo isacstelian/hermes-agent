@@ -10,6 +10,7 @@ import base64
 import binascii
 import copy
 import json
+import math
 from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Any, Iterator, Mapping, Optional
@@ -18,10 +19,17 @@ from typing import Any, Iterator, Mapping, Optional
 MCP_RUN_METADATA_HEADER = "X-Hermes-MCP-Metadata"
 MAX_MCP_RUN_METADATA_BYTES = 8 * 1024
 MAX_MCP_RUN_METADATA_DEPTH = 64
+_BASE64URL_ALPHABET = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+)
 
 _mcp_run_metadata: ContextVar[Optional[dict[str, Any]]] = ContextVar(
     "mcp_run_metadata", default=None
 )
+
+
+def _reject_non_finite_json_constant(_constant: str) -> None:
+    raise ValueError("JSON constants must be finite")
 
 
 def _copy_validated_metadata(value: dict[str, Any]) -> dict[str, Any]:
@@ -37,6 +45,8 @@ def _copy_validated_metadata(value: dict[str, Any]) -> dict[str, Any]:
             if depth > MAX_MCP_RUN_METADATA_DEPTH:
                 raise ValueError("MCP metadata header is too deeply nested")
             pending.extend((child, depth + 1) for child in item)
+        elif isinstance(item, float) and not math.isfinite(item):
+            raise ValueError("MCP metadata header must contain finite numbers")
     try:
         return copy.deepcopy(value)
     except RecursionError as exc:
@@ -49,6 +59,8 @@ def decode_mcp_run_metadata_header(raw: str) -> dict[str, Any]:
         raise ValueError("MCP metadata header is empty")
     if len(raw) > ((MAX_MCP_RUN_METADATA_BYTES + 2) // 3) * 4:
         raise ValueError("MCP metadata header is too large")
+    if len(raw) % 4 == 1 or not all(char in _BASE64URL_ALPHABET for char in raw):
+        raise ValueError("MCP metadata header is not valid base64url")
 
     padded = raw + "=" * (-len(raw) % 4)
     try:
@@ -61,8 +73,11 @@ def decode_mcp_run_metadata_header(raw: str) -> dict[str, Any]:
     if len(payload) > MAX_MCP_RUN_METADATA_BYTES:
         raise ValueError("MCP metadata header is too large")
     try:
-        value = json.loads(payload.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
+        value = json.loads(
+            payload.decode("utf-8"),
+            parse_constant=_reject_non_finite_json_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError) as exc:
         raise ValueError("MCP metadata header is not valid JSON") from exc
     if not isinstance(value, dict):
         raise ValueError("MCP metadata header must encode a JSON object")

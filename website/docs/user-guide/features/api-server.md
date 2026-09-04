@@ -363,9 +363,10 @@ model, disk space, gateway/platform state, active API runs, pending process
 completions, and active delegations. The response exposes status and counts,
 not config values, credentials, paths, commands, queue payloads, or raw errors.
 It also returns the active `profile` and the SHA-256 digest of that profile's
-exact `capabilities.json` bytes as `capability_manifest_sha256`. The digest is
-`null` when the profile has no manifest, so a control plane can fail closed on
-a missing or unexpected capability set.
+canonical JSON `capabilities.json` content as `capability_manifest_sha256`.
+Whitespace and key order do not change the digest. The digest is `null` when
+the profile has no valid JSON manifest, so a control plane can fail closed on a
+missing or unexpected capability set.
 
 The public `/health` route remains a cheap liveness probe and does not run
 readiness checks. A degraded readiness result still uses HTTP 200; inspect the

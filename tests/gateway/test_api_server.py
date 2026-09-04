@@ -1091,7 +1091,10 @@ class TestHealthDetailedEndpoint:
     async def test_health_detailed_attests_profile_and_capability_manifest(
         self, adapter, tmp_path
     ):
-        capability_bytes = b'{"profile":"magic-employee-support"}\n'
+        capability_bytes = (
+            b'{\n  "tools": ["magic_get_my_income_summary"],\n'
+            b'  "profile": "magic-employee-support"\n}\n'
+        )
         (tmp_path / "capabilities.json").write_bytes(capability_bytes)
         app = _create_app(adapter)
         with patch(
@@ -1110,8 +1113,31 @@ class TestHealthDetailedEndpoint:
 
         assert data["profile"] == "magic-employee-support"
         assert data["capability_manifest_sha256"] == hashlib.sha256(
-            capability_bytes
+            b'{"profile":"magic-employee-support","tools":["magic_get_my_income_summary"]}'
         ).hexdigest()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("value", ["NaN", "1e9999"])
+    async def test_health_detailed_rejects_non_finite_capability_manifest(
+        self, adapter, tmp_path, value
+    ):
+        (tmp_path / "capabilities.json").write_text(
+            f'{{"profile":"magic-employee-support","level":{value}}}',
+            encoding="utf-8",
+        )
+        app = _create_app(adapter)
+        with patch(
+            "gateway.status.read_runtime_status",
+            return_value={"gateway_state": "running"},
+        ), patch(
+            "hermes_constants.get_hermes_home", return_value=tmp_path
+        ):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get("/health/detailed")
+                assert resp.status == 200
+                data = await resp.json()
+
+        assert data["capability_manifest_sha256"] is None
 
     @pytest.mark.asyncio
     async def test_health_detailed_no_runtime_status(self, adapter):

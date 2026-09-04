@@ -121,7 +121,7 @@ def _hermes_version() -> str:
 
 
 def _profile_capability_attestation() -> tuple[str, Optional[str]]:
-    """Return the active profile and the exact capabilities.json digest."""
+    """Return the active profile and canonical capabilities.json digest."""
     try:
         from hermes_cli.profiles import get_active_profile_name
 
@@ -133,10 +133,26 @@ def _profile_capability_attestation() -> tuple[str, Optional[str]]:
         from hermes_constants import get_hermes_home
 
         capability_path = get_hermes_home() / "capabilities.json"
-        digest = hashlib.sha256(capability_path.read_bytes()).hexdigest()
-    except (OSError, TypeError):
+        with capability_path.open(encoding="utf-8") as capability_file:
+            capability_manifest = json.load(
+                capability_file,
+                parse_constant=_reject_non_finite_json_constant,
+            )
+        canonical_manifest = json.dumps(
+            capability_manifest,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        digest = hashlib.sha256(canonical_manifest.encode("utf-8")).hexdigest()
+    except (OSError, TypeError, UnicodeDecodeError, ValueError):
         digest = None
     return profile, digest
+
+
+def _reject_non_finite_json_constant(_constant: str) -> None:
+    raise ValueError("JSON constants must be finite")
 
 
 # Default settings
@@ -1901,7 +1917,7 @@ class APIServerAdapter(BasePlatformAdapter):
             decode_mcp_run_metadata_header,
         )
 
-        raw = request.headers.get(MCP_RUN_METADATA_HEADER, "").strip()
+        raw = request.headers.get(MCP_RUN_METADATA_HEADER, "")
         if not raw:
             return None, None
         if not self._api_key:
