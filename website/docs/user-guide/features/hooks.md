@@ -1261,9 +1261,47 @@ Every payload is additive and event-specific; there is no monolithic gateway pay
 
 The bot's own progressive message edits (streaming) never fire `message_edited` on Discord — bot-authored events are dropped at the fire-site.
 
-This hook is observer-only: it does **not** add raw-event access or adapter access. **Raw SDK payload access is deliberately not shipped** — adapter SDK objects change shape without notice and would become un-evolvable API surface; where genuinely needed it requires its own explicit capability (`gateway.raw_events`) with a "no stability guarantee" label and its own design (tracked in #64228). For *acting* on a platform (adding a reaction, renaming a thread), use the capability-gated `ctx.platform_actions` facade documented in the [plugins guide](plugins.md#platform-actions) — it is gated off by default behind the `gateway.platform_actions` capability. `PluginContext.dispatch_tool()` can only call tools registered in the tool registry; `send_message` is intentionally not registered there (its transport is reserved for explicit CLI, cron, kanban, and MCP delivery paths). A future outbound-delivery contract must first provide stable delivered content/handles across all adapters; this slice does not pre-register an inert `gateway_message_delivered` hook.
+This hook is observer-only: it does **not** add raw-event access or adapter access. **Raw SDK payload access is deliberately not shipped** — adapter SDK objects change shape without notice and would become un-evolvable API surface; where genuinely needed it requires its own explicit capability (`gateway.raw_events`) with a "no stability guarantee" label and its own design (tracked in #64228). For *acting* on a platform (adding a reaction, renaming a thread), use the capability-gated `ctx.platform_actions` facade documented in the [plugins guide](plugins.md#platform-actions) — it is gated off by default behind the `gateway.platform_actions` capability. `PluginContext.dispatch_tool()` can only call tools registered in the tool registry; `send_message` is intentionally not registered there (its transport is reserved for explicit CLI, cron, kanban, and MCP delivery paths).
 
 ---
+
+### `gateway_message_delivered`
+
+Fires after a successful native Telegram cron text delivery. The observer receives stable identifiers only, never message content:
+
+```python
+def delivered(**event):
+    # execution_id, job_id, platform, chat_id, thread_id, message_id
+    pass
+
+def register(ctx):
+    ctx.register_hook("gateway_message_delivered", delivered)
+```
+
+It is observer-only and does not fire for failed, local, media-only, or unconfirmed deliveries.
+
+### `gateway_message_before_send`
+
+Fires immediately before a Telegram delivery. A Python plugin may return a neutral inline keyboard only when `routine_feedback_eligible` is true:
+
+```python
+def before_send(routine_feedback_eligible, **kwargs):
+    if not routine_feedback_eligible:
+        return None
+    return {"telegram_inline_keyboard": [[
+            {"text": "👍", "callback_data": "rf:up:<execution_id>"},
+    ]]}
+
+def register(ctx):
+    ctx.register_hook("gateway_message_before_send", before_send)
+```
+
+Invalid keyboard metadata is ignored. Shell hooks are refused because their response parser has no safe structured directive channel.
+
+### `telegram_callback_query`
+
+Fires for an otherwise-unmatched Telegram callback after Hermes native handlers and callback authorization. Return {"handled": True} plus optional `answer_text`, `edit_text`, `clear_keyboard`, or `telegram_inline_keyboard` fields. Shell hooks are refused for this event for the same reason.
+
 
 ### `pre_approval_request`
 

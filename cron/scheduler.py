@@ -2210,6 +2210,40 @@ def _confirm_adapter_delivery(send_result) -> bool:
     return bool(getattr(send_result, "success"))
 
 
+def _emit_gateway_message_delivered(
+    job: dict,
+    *,
+    platform: str,
+    chat_id: Any,
+    thread_id: Any,
+    message_id: Any,
+) -> None:
+    '''Emit the confirmed Telegram cron-delivery observer, best-effort.'''
+    platform = str(platform).lower()
+    if platform != "telegram" or message_id in (None, ""):
+        return
+    try:
+        from hermes_cli.plugins import has_hook, invoke_hook
+        if not has_hook("gateway_message_delivered"):
+            return
+        execution_id = job.get("execution_id")
+        job_id = job.get("id")
+        if not execution_id or not job_id or chat_id is None:
+            return
+        invoke_hook(
+            "gateway_message_delivered",
+            source="cron",
+            execution_id=str(execution_id),
+            job_id=str(job_id),
+            platform=platform,
+            chat_id=str(chat_id),
+            thread_id=str(thread_id) if thread_id is not None else None,
+            message_id=str(message_id),
+        )
+    except Exception:
+        logger.debug("gateway_message_delivered hook failed", exc_info=True)
+
+
 def _is_channel_dm_topic(
     runtime_adapter: Any,
     chat_id: Any,
@@ -2277,6 +2311,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 
     Returns None on success, or an error string on failure.
     """
+    emit_gateway_message_delivered = bool(job.get("_gateway_message_delivered_hook"))
     targets = _resolve_delivery_targets(job)
     if not targets:
         deliver_value = _normalize_deliver_value(job.get("deliver", "local"))
@@ -2583,6 +2618,8 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 route_metadata = {
                     "direct_messages_topic_id": str(thread_id),
                     "job_id": job["id"],
+                    "source": "cron",
+                    "execution_id": job.get("execution_id"),
                 }
                 # Media metadata mirrors the text routing so attachments land in
                 # the same DM topic instead of the General lane (#22773).
@@ -2597,10 +2634,17 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 # anchor, so the metadata key bypasses that check and lets the
                 # adapter route via a plain message_thread_id.
                 route_thread_id = str(thread_id) if thread_id is not None else None
-                route_metadata = {"job_id": job["id"]}
+                route_metadata = {
+                    "job_id": job["id"],
+                    "source": "cron",
+                    "execution_id": job.get("execution_id"),
+                }
                 if route_thread_id:
                     route_metadata["thread_id"] = route_thread_id
                 media_metadata = {"thread_id": thread_id} if thread_id else None
+
+            if emit_gateway_message_delivered:
+                route_metadata["routine_feedback_eligible"] = True
 
             try:
                 # Send cleaned text (MEDIA tags stripped) — not the raw content.
@@ -2613,6 +2657,8 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 text_to_send = cleaned_delivery_content.strip()
                 adapter_ok = True
                 timed_out = False
+                delivered_message_id = None
+                delivered_thread_id = thread_id
                 if text_to_send:
                     from agent.async_utils import safe_schedule_threadsafe
 
@@ -2710,9 +2756,11 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                             if isinstance(send_result, dict):
                                 send_success = bool(send_result.get("success", False))
                                 send_raw_response = send_result.get("raw_response")
+                                delivered_message_id = send_result.get("message_id")
                             else:
                                 send_success = _confirm_adapter_delivery(send_result)
                                 send_raw_response = getattr(send_result, "raw_response", None)
+                                delivered_message_id = getattr(send_result, "message_id", None)
 
                             if not send_success:
                                 if isinstance(send_result, dict):
@@ -2749,6 +2797,13 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                                 )
                                 logger.warning("Job '%s': %s", job["id"], msg)
                                 delivery_errors.append(msg)
+                                delivered_thread_id = None
+                            elif isinstance(send_raw_response, dict):
+                                actual_thread_id = send_raw_response.get(
+                                    "requested_thread_id"
+                                )
+                                if actual_thread_id is not None:
+                                    delivered_thread_id = str(actual_thread_id)
 
                 # Send extracted media files as native attachments via the live
                 # adapter, using the same DM-topic-aware routing as the text send
@@ -2789,6 +2844,14 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 if adapter_ok:
                     logger.info("Job '%s': delivered to %s:%s via live adapter", job["id"], platform_name, chat_id)
                     delivered = True
+                    if emit_gateway_message_delivered and text_to_send:
+                        _emit_gateway_message_delivered(
+                            job,
+                            platform=platform_name,
+                            chat_id=chat_id,
+                            thread_id=delivered_thread_id,
+                            message_id=delivered_message_id,
+                        )
                     # Seed the thread session only now that delivery into it
                     # succeeded (deferred from thread-open above).
                     if opened_thread_id and not thread_seeded:
@@ -5827,6 +5890,8 @@ def _run_one_job_body(
     execution_id = job.get("execution_id")
     if not execution_id:
         execution_id = create_execution(job["id"], source="direct")["id"]
+    delivery_job = dict(job, execution_id=execution_id)
+    delivery_job.pop("_gateway_message_delivered_hook", None)
     delivery_attempted = False
     delivery_error = None
     try:
@@ -6051,8 +6116,14 @@ def _run_one_job_body(
                         if not owns_delivery:
                             raise _FireClaimLostDuringSideEffect
                         delivery_attempted = True
+                        if success:
+                            from gateway.platforms.base import BasePlatformAdapter
+
+                            _, generated_text = BasePlatformAdapter.extract_media(deliver_content)
+                            if (generated_text or "").strip():
+                                delivery_job["_gateway_message_delivered_hook"] = True
                         delivery_error = _deliver_result(
-                            job,
+                            delivery_job,
                             deliver_content,
                             adapters=adapters,
                             loop=loop,

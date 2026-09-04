@@ -310,6 +310,15 @@ class TestParseHooksBlock:
         assert specs == []
         assert any("Python-plugin-only" in r.message for r in caplog.records)
 
+    def test_telegram_directive_events_refused(self, caplog):
+        specs = shell_hooks._parse_hooks_block({
+            "gateway_message_before_send": [{"command": "/tmp/hook.sh"}],
+            "telegram_callback_query": [{"command": "/tmp/hook.sh"}],
+        })
+        assert specs == []
+        messages = [record.getMessage() for record in caplog.records]
+        assert sum("Python-plugin-only" in message for message in messages) == 2
+
     def test_timeout_clamped_to_max(self):
         specs = shell_hooks._parse_hooks_block({
             "post_tool_call": [
