@@ -1289,7 +1289,7 @@ def before_send(routine_feedback_eligible, **kwargs):
     if not routine_feedback_eligible:
         return None
     return {"telegram_inline_keyboard": [[
-            {"text": "👍", "callback_data": "rf:up:<execution_id>"},
+            {"text": "👍", "callback_data": "rf:up:EXECUTION_ID"},
     ]]}
 
 def register(ctx):
@@ -1300,7 +1300,7 @@ Invalid keyboard metadata is ignored. Shell hooks are refused because their resp
 
 ### `telegram_callback_query`
 
-Fires for an otherwise-unmatched Telegram callback after Hermes native handlers and callback authorization. Return {"handled": True} plus optional `answer_text`, `edit_text`, `clear_keyboard`, or `telegram_inline_keyboard` fields. Shell hooks are refused for this event for the same reason.
+Fires for an otherwise-unmatched Telegram callback after Hermes native handlers and callback authorization. Return a handled directive with optional `answer_text`, `edit_text`, `clear_keyboard`, or `telegram_inline_keyboard` fields. Shell hooks are refused for this event for the same reason.
 
 
 ### `pre_approval_request`
