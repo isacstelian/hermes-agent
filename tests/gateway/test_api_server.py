@@ -1117,11 +1117,13 @@ class TestHealthDetailedEndpoint:
         ).hexdigest()
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("value", ["NaN", "1e9999"])
     async def test_health_detailed_rejects_non_finite_capability_manifest(
-        self, adapter, tmp_path
+        self, adapter, tmp_path, value
     ):
         (tmp_path / "capabilities.json").write_text(
-            '{"profile":"magic-employee-support","level":NaN}', encoding="utf-8"
+            f'{{"profile":"magic-employee-support","level":{value}}}',
+            encoding="utf-8",
         )
         app = _create_app(adapter)
         with patch(

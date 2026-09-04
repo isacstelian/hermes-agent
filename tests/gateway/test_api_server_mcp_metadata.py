@@ -60,13 +60,44 @@ def test_metadata_nesting_limit_is_explicit_and_stable():
 
 @pytest.mark.parametrize(
     "invalid_json",
-    [b'{"value":NaN}', b'{"value":Infinity}', b'{"value":-Infinity}'],
+    [
+        b'{"value":NaN}',
+        b'{"value":Infinity}',
+        b'{"value":-Infinity}',
+    ],
 )
 def test_metadata_rejects_non_finite_json_constants(invalid_json):
     encoded = base64.urlsafe_b64encode(invalid_json).rstrip(b"=").decode()
 
     with pytest.raises(ValueError, match="not valid JSON"):
         decode_mcp_run_metadata_header(encoded)
+
+
+def test_metadata_rejects_numeric_overflow():
+    encoded = base64.urlsafe_b64encode(b'{"value":1e9999}').rstrip(b"=").decode()
+
+    with pytest.raises(ValueError, match="finite numbers"):
+        decode_mcp_run_metadata_header(encoded)
+
+
+@pytest.mark.asyncio
+async def test_api_rejects_metadata_numeric_overflow():
+    adapter = _adapter()
+    encoded = base64.urlsafe_b64encode(b'{"value":1e9999}').rstrip(b"=").decode()
+
+    with patch.object(adapter, "_create_agent") as create_agent:
+        async with TestClient(TestServer(_app(adapter))) as client:
+            response = await client.post(
+                "/v1/runs",
+                json={"input": "programul meu"},
+                headers={
+                    "Authorization": "Bearer sk-test-secret",
+                    "X-Hermes-MCP-Metadata": encoded,
+                },
+            )
+
+    assert response.status == 400
+    create_agent.assert_not_called()
 
 
 def test_metadata_rejects_standard_base64_alphabet():

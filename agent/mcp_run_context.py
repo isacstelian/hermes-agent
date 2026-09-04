@@ -10,6 +10,7 @@ import base64
 import binascii
 import copy
 import json
+import math
 from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Any, Iterator, Mapping, Optional
@@ -44,6 +45,8 @@ def _copy_validated_metadata(value: dict[str, Any]) -> dict[str, Any]:
             if depth > MAX_MCP_RUN_METADATA_DEPTH:
                 raise ValueError("MCP metadata header is too deeply nested")
             pending.extend((child, depth + 1) for child in item)
+        elif isinstance(item, float) and not math.isfinite(item):
+            raise ValueError("MCP metadata header must contain finite numbers")
     try:
         return copy.deepcopy(value)
     except RecursionError as exc:
