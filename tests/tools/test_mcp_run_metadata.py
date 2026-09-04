@@ -107,6 +107,24 @@ def test_server_without_opt_in_receives_no_run_metadata():
     )
 
 
+def test_string_opt_in_does_not_forward_run_metadata():
+    session = SimpleNamespace(
+        call_tool=AsyncMock(return_value=_ToolResult("ok")),
+    )
+    server = _server(session, forward="true")
+
+    with patch.dict(mcp_tool._servers, {"regular": server}, clear=False), patch(
+        "tools.mcp_tool._run_on_mcp_loop", side_effect=_run_direct
+    ), mcp_run_metadata({"private": "must-not-leak"}):
+        handler = mcp_tool._make_tool_handler("regular", "lookup", 30)
+        handler({"query": "public"})
+
+    session.call_tool.assert_awaited_once_with(
+        "lookup",
+        arguments={"query": "public"},
+    )
+
+
 def test_mcp_loop_propagates_metadata_without_leaking_after_scope():
     mcp_tool._ensure_mcp_loop()
     try:

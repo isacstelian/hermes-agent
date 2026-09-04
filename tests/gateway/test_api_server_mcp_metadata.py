@@ -58,6 +58,22 @@ def test_metadata_nesting_limit_is_explicit_and_stable():
         decode_mcp_run_metadata_header(_encode_metadata(too_deep))
 
 
+@pytest.mark.parametrize("invalid_json", [b'{"value":NaN}', b'{"value":Infinity}'])
+def test_metadata_rejects_non_finite_json_constants(invalid_json):
+    encoded = base64.urlsafe_b64encode(invalid_json).rstrip(b"=").decode()
+
+    with pytest.raises(ValueError, match="not valid JSON"):
+        decode_mcp_run_metadata_header(encoded)
+
+
+def test_metadata_rejects_standard_base64_alphabet():
+    encoded = base64.b64encode('{"x":"\u083e"}'.encode("utf-8")).rstrip(b"=").decode()
+    assert "+" in encoded
+
+    with pytest.raises(ValueError, match="not valid base64url"):
+        decode_mcp_run_metadata_header(encoded)
+
+
 async def _wait_for_run(adapter: APIServerAdapter, run_id: str) -> None:
     for _ in range(100):
         status = adapter._run_statuses.get(run_id, {})

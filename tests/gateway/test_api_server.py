@@ -1091,7 +1091,7 @@ class TestHealthDetailedEndpoint:
     async def test_health_detailed_attests_profile_and_capability_manifest(
         self, adapter, tmp_path
     ):
-        capability_bytes = b'{"profile":"magic-employee-support"}\n'
+        capability_bytes = b'{\n  "profile": "magic-employee-support"\n}\n'
         (tmp_path / "capabilities.json").write_bytes(capability_bytes)
         app = _create_app(adapter)
         with patch(
@@ -1110,7 +1110,7 @@ class TestHealthDetailedEndpoint:
 
         assert data["profile"] == "magic-employee-support"
         assert data["capability_manifest_sha256"] == hashlib.sha256(
-            capability_bytes
+            b'{"profile":"magic-employee-support"}'
         ).hexdigest()
 
     @pytest.mark.asyncio
