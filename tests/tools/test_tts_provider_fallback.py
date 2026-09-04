@@ -96,7 +96,7 @@ def test_primary_runtime_failure_retries_complete_text_with_fallback(tmp_path, m
     assert not list(tmp_path.glob(".*.fallback.*"))
 
 
-def test_fallback_uses_shared_lower_provider_input_cap(tmp_path, monkeypatch, caplog):
+def test_primary_keeps_its_input_cap_and_fallback_uses_its_own_cap(tmp_path, monkeypatch, caplog):
     primary_texts: list[str] = []
     fallback_texts: list[str] = []
 
@@ -118,11 +118,39 @@ def test_fallback_uses_shared_lower_provider_input_cap(tmp_path, monkeypatch, ca
     text = "A" * 5000  # valid for ElevenLabs' default cap, over OpenAI's 4096
     result = json.loads(tts_tool.text_to_speech_tool(text, str(tmp_path / "out.mp3")))
 
-    expected = text[:4096]
+    expected_primary = text[:5000]
+    expected_fallback = text[:4096]
     assert result["success"] is True
-    assert primary_texts == [expected]
-    assert fallback_texts == [expected]
-    assert any("shared script to 4096" in record.message for record in caplog.records)
+    assert primary_texts == [expected_primary]
+    assert fallback_texts == [expected_fallback]
+    assert result["text_truncated"] is True
+    assert result["original_text_length"] == 5000
+    assert result["synthesized_text_length"] == 4096
+    assert "fallback-ul openai" in result["warning"]
+    assert any("fallback text too long" in record.message for record in caplog.records)
+
+
+def test_primary_success_does_not_use_fallback_cap_or_emit_truncation_warning(tmp_path, monkeypatch):
+    captured: list[str] = []
+
+    def primary(text: str, output_path: str, _config: dict) -> str:
+        captured.append(text)
+        Path(output_path).write_bytes(b"primary-audio")
+        return output_path
+
+    monkeypatch.setattr(tts_tool, "_load_tts_config", _fallback_config)
+    monkeypatch.setattr(tts_tool, "_import_elevenlabs", lambda: object())
+    monkeypatch.setattr(tts_tool, "_generate_elevenlabs", primary)
+    monkeypatch.setattr(tts_tool, "_import_openai_client", lambda: object())
+
+    text = "A" * 5000
+    result = json.loads(tts_tool.text_to_speech_tool(text, str(tmp_path / "out.mp3")))
+
+    assert result["success"] is True
+    assert result["provider"] == "elevenlabs"
+    assert captured == [text]
+    assert "warning" not in result
+    assert "text_truncated" not in result
 
 
 @pytest.mark.parametrize("fallback", ["ELEVENLABS", "not-a-provider"])

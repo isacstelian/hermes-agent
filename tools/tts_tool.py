@@ -2534,28 +2534,20 @@ def text_to_speech_tool(
     # OpenAI handler.
     command_provider_config = _resolve_command_provider_config(provider, tts_config)
 
-    # A fallback must receive the same complete script as the primary. Cap the
-    # script to the smaller provider limit before either attempt, rather than
-    # letting a long-primary/short-fallback pair fail only after the primary
-    # has already consumed or produced partial audio.
+    # Keep the primary provider's full supported input. If it fails, the
+    # fallback may have a smaller cap and will be shortened only for that
+    # second attempt.
+    original_text_length = len(text)
+    truncation_warnings: list[str] = []
     max_len = _resolve_max_text_length(provider, tts_config)
-    if fallback_provider is not None:
-        max_len = min(
-            max_len,
-            _resolve_max_text_length(fallback_provider, tts_config),
-        )
     if len(text) > max_len:
-        if fallback_provider is None:
-            logger.warning(
-                "TTS text too long for provider %s (%d chars), truncating to %d",
-                provider, len(text), max_len,
-            )
-        else:
-            logger.warning(
-                "TTS text too long for primary %s/fallback %s (%d chars), "
-                "truncating shared script to %d",
-                provider, fallback_provider, len(text), max_len,
-            )
+        logger.warning(
+            "TTS text too long for provider %s (%d chars), truncating to %d",
+            provider, len(text), max_len,
+        )
+        truncation_warnings.append(
+            f"Textul a fost scurtat pentru {provider}, de la {len(text)} la {max_len} caractere."
+        )
         text = text[:max_len]
 
     # Detect platform from gateway env var to choose the best output format.
@@ -2613,6 +2605,8 @@ def text_to_speech_tool(
     file_str = str(file_path)
     fallback_used = False
     primary_error: Optional[str] = None
+    fallback_text = text
+    fallback_truncation_warning: Optional[str] = None
 
     try:
         if fallback_provider is not None:
@@ -2630,6 +2624,17 @@ def text_to_speech_tool(
                 if fallback_command_config is not None
                 else primary_destination
             )
+            fallback_max_len = _resolve_max_text_length(fallback_provider, tts_config)
+            if len(fallback_text) > fallback_max_len:
+                logger.warning(
+                    "TTS fallback text too long for provider %s (%d chars), truncating to %d",
+                    fallback_provider, len(fallback_text), fallback_max_len,
+                )
+                fallback_truncation_warning = (
+                    f"Textul a fost scurtat pentru fallback-ul {fallback_provider}, "
+                    f"de la {len(fallback_text)} la {fallback_max_len} caractere."
+                )
+                fallback_text = fallback_text[:fallback_max_len]
             primary_attempt = _tts_attempt_path(primary_destination, "primary")
             fallback_attempt = _tts_attempt_path(fallback_destination, "fallback")
             try:
@@ -2653,7 +2658,7 @@ def text_to_speech_tool(
                         )
                     try:
                         generated_path, effective_provider = _generate_tts_with_provider(
-                            text, fallback_attempt, fallback_provider, tts_config,
+                            fallback_text, fallback_attempt, fallback_provider, tts_config,
                         )
                         _ensure_tts_output(generated_path, effective_provider)
                     except Exception as fallback_exc:
@@ -2665,6 +2670,8 @@ def text_to_speech_tool(
                         logger.error("%s", error_msg)
                         return tool_error(error_msg, success=False)
                     fallback_used = True
+                    if fallback_truncation_warning:
+                        truncation_warnings.append(fallback_truncation_warning)
 
                 destination = fallback_destination if fallback_used else primary_destination
                 os.replace(generated_path, destination)
@@ -2748,6 +2755,11 @@ def text_to_speech_tool(
         if fallback_used:
             result["fallback_from"] = _get_provider(tts_config)
             result["fallback_error"] = primary_error
+        if truncation_warnings:
+            result["text_truncated"] = True
+            result["original_text_length"] = original_text_length
+            result["synthesized_text_length"] = len(fallback_text if fallback_used else text)
+            result["warning"] = " ".join(truncation_warnings)
         return json.dumps(result, ensure_ascii=False)
 
     except _TTSProviderUnavailableError as e:
