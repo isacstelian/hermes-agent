@@ -1,6 +1,7 @@
 """Tests for the delivery routing module."""
 
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 from typing import Any, cast
@@ -402,3 +403,79 @@ def test_local_delivery_writes_non_ascii_on_windows_codepage(tmp_path, monkeypat
     written = Path(result["path"]).read_text(encoding="utf-8")
     assert "完了 ✅ café" in written
     assert "日次レポート" in written
+
+
+@pytest.mark.asyncio
+async def test_gateway_message_before_send_adds_plugin_keyboard(tmp_path, monkeypatch):
+    monkeypatch.setattr("gateway.delivery.get_hermes_home", lambda: tmp_path)
+    adapter = RecordingAdapter()
+    router = DeliveryRouter(GatewayConfig(), adapters={Platform.TELEGRAM: adapter})
+    target = DeliveryTarget.parse("telegram:-100123:42")
+    calls = []
+
+    monkeypatch.setattr(
+        "hermes_cli.plugins.has_hook",
+        lambda name: name == "gateway_message_before_send",
+    )
+    monkeypatch.setattr(
+        "hermes_cli.plugins.invoke_hook",
+        lambda name, **kwargs: calls.append((name, kwargs)) or [
+            {
+                "telegram_inline_keyboard": [[
+                    {"text": "👍", "callback_data": "rf:up:exec-1"},
+                    {"text": "👎", "callback_data": "rf:down:exec-1"},
+                ]]
+            }
+        ],
+    )
+
+    await router._deliver_to_platform(
+        target,
+        "hello",
+        metadata={
+            "source": "cron",
+            "execution_id": "exec-1",
+            "job_id": "job-1",
+            "routine_feedback_eligible": True,
+        },
+    )
+
+    assert calls == [(
+        "gateway_message_before_send",
+        {
+            "source": "cron",
+            "execution_id": "exec-1",
+            "job_id": "job-1",
+            "routine_feedback_eligible": True,
+            "platform": "telegram",
+            "chat_id": "-100123",
+            "thread_id": "42",
+        },
+    )]
+    assert adapter.calls[0]["metadata"]["telegram_inline_keyboard"][0][0]["text"] == "👍"
+
+
+@pytest.mark.asyncio
+async def test_gateway_message_before_send_ignores_ineligible_keyboard(monkeypatch):
+    adapter = RecordingAdapter()
+    router = DeliveryRouter(GatewayConfig(), adapters={Platform.TELEGRAM: adapter})
+    target = DeliveryTarget.parse("telegram:12345")
+    monkeypatch.setattr(
+        "hermes_cli.plugins.has_hook",
+        lambda name: name == "gateway_message_before_send",
+    )
+    invoke = MagicMock(return_value=[{
+        "telegram_inline_keyboard": [[
+            {"text": "👍", "callback_data": "rf:up:exec-1"},
+        ]]
+    }])
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", invoke)
+
+    await router._deliver_to_platform(
+        target,
+        "normal Telegram message",
+        metadata={"source": "gateway", "routine_feedback_eligible": False},
+    )
+
+    assert "telegram_inline_keyboard" not in (adapter.calls[0]["metadata"] or {})
+    invoke.assert_not_called()

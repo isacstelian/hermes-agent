@@ -132,11 +132,11 @@ def _auth_reaction_update(user_id, chat_type="private", chat_id=123, message_id=
 class TestHookRegistration:
     def test_gateway_platform_event_registered_reserved_absent(self):
         """register_hook rejects names not in VALID_HOOKS, so the implemented
-        hook must be present. The reserved gateway_* names are deliberately
+        hook must be present. The remaining reserved gateway_* names are deliberately
         absent (no inert surface without a concrete fire site); lock that in."""
         assert "gateway_platform_event" in VALID_HOOKS
         assert "gateway_session_titled" not in VALID_HOOKS
-        assert "gateway_message_delivered" not in VALID_HOOKS
+        assert "gateway_message_delivered" in VALID_HOOKS
         assert "gateway_thread_created" not in VALID_HOOKS
 
 
