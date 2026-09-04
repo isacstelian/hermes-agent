@@ -2066,3 +2066,33 @@ class TestDispatchToolWithoutCliRef:
             assert calls[0][1].get("parent_agent") is None
         finally:
             registry.deregister("_test_dispatch_probe")
+
+
+def test_plugin_requires_supported_hooks(tmp_path, monkeypatch):
+    plugins_dir = tmp_path / "hermes_test" / "plugins"
+    _make_plugin_dir(
+        plugins_dir,
+        "future_plugin",
+        manifest_extra={"requires_hooks": ["future_hook"]},
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_test"))
+
+    mgr = PluginManager()
+    mgr.discover_and_load()
+
+    plugin = mgr._plugins["future_plugin"]
+    assert plugin.enabled is False
+    assert plugin.error == "requires unsupported hook(s): future_hook"
+
+
+def test_telegram_feedback_hooks_are_supported():
+    assert "gateway_message_delivered" in VALID_HOOKS
+    assert "gateway_message_before_send" in VALID_HOOKS
+    assert "telegram_callback_query" in VALID_HOOKS
+
+
+def test_plugin_context_reports_hook_support():
+    ctx = PluginContext(PluginManifest(name="test"), PluginManager())
+
+    assert ctx.supports_hook("telegram_callback_query") is True
+    assert ctx.supports_hook("future_hook") is False
