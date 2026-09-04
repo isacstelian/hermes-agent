@@ -12852,7 +12852,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             reply_snippet = event.reply_to_text[:500]
             if getattr(event, "reply_to_is_own_message", False):
                 message_text = (
-                    f'[Replying to your previous message: "{reply_snippet}"]\n\n'
+                    f'[Replying to your previous message id '
+                    f'{event.reply_to_message_id}: "{reply_snippet}"]\n\n'
                     f"{message_text}"
                 )
             else:
