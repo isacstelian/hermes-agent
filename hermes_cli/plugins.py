@@ -226,6 +226,15 @@ VALID_HOOKS: Set[str] = {
     #   {"action": "allow"}  /  None             -> normal dispatch
     # Kwargs: event: MessageEvent, gateway: GatewayRunner, session_store.
     "pre_gateway_dispatch",
+    # Confirmed outbound Telegram cron text delivery. Observers receive the
+    # execution and Telegram message identifiers, never message content.
+    "gateway_message_delivered",
+    # Outbound delivery customization. Plugins may return a neutral
+    # ``telegram_inline_keyboard`` value for Telegram sends.
+    "gateway_message_before_send",
+    # Unmatched Telegram callback queries. Plugins may return a handled
+    # directive with answer/edit instructions for their own callback prefix.
+    "telegram_callback_query",
     # Approval lifecycle hooks. Fired by tools/approval.py when a dangerous
     # command needs an approval decision -- fires for CLI-interactive prompts,
     # gateway/ACP approvals, and smart-mode auxiliary-LLM decisions.
@@ -389,6 +398,10 @@ VALID_HOOKS: Set[str] = {
 # Support for a shell response shape can lift an event out of this set.
 SHELL_UNSUPPORTED_HOOKS: Set[str] = {
     "transform_api_error_classification",
+    # These hooks return structured Telegram directives that shell-hook
+    # response parsing cannot represent safely.
+    "gateway_message_before_send",
+    "telegram_callback_query",
 }
 
 ENTRY_POINTS_GROUP = "hermes_agent.plugins"
@@ -650,7 +663,7 @@ def _display_author(value: object) -> str:
 # avoid churning existing plugins, at warning for v2+) and continue loading.
 _KNOWN_MANIFEST_FIELDS: Set[str] = {
     # v1
-    "name", "version", "description", "author", "requires_env",
+    "name", "version", "description", "author", "requires_env", "requires_hooks",
     "provides_tools", "provides_hooks", "kind", "hooks", "label",
     "optional_env", "platforms", "external_dependencies", "pip_dependencies",
     "provides_browser_providers", "provides_web_providers",
@@ -1036,6 +1049,7 @@ class PluginManifest:
     description: str = ""
     author: str = ""
     requires_env: List[Union[str, Dict[str, Any]]] = field(default_factory=list)
+    requires_hooks: List[str] = field(default_factory=list)
     provides_tools: List[str] = field(default_factory=list)
     provides_hooks: List[str] = field(default_factory=list)
     source: str = ""        # "user", "project", or "entrypoint"
@@ -3131,6 +3145,10 @@ class PluginContext:
         logger.debug("Plugin %s registered hook: %s", self.manifest.name, hook_name)
         return handle
 
+    def supports_hook(self, hook_name: str) -> bool:
+        """Return whether this Hermes core supports a plugin hook."""
+        return hook_name in VALID_HOOKS
+
     def register_system_prompt_section(
         self,
         id: str,
@@ -4334,6 +4352,11 @@ class PluginManager:
                 description=data.get("description", ""),
                 author=_display_author(data.get("author", "")),
                 requires_env=data.get("requires_env", []),
+                requires_hooks=[
+                    str(hook)
+                    for hook in data.get("requires_hooks", [])
+                    if isinstance(hook, str)
+                ] if isinstance(data.get("requires_hooks", []), list) else [],
                 provides_tools=data.get("provides_tools", []),
                 provides_hooks=data.get("provides_hooks", []),
                 source=source,
@@ -4735,6 +4758,16 @@ class PluginManager:
             manifest.key or manifest.name, manifest.source, manifest.kind, manifest.path,
         )
 
+        missing_hooks = sorted(set(manifest.requires_hooks) - VALID_HOOKS)
+        if missing_hooks:
+            loaded.error = "requires unsupported hook(s): " + ", ".join(missing_hooks)
+            logger.warning(
+                "Plugin %s requires unsupported hook(s): %s",
+                manifest.name, ", ".join(missing_hooks),
+            )
+            self._plugins[manifest.key or manifest.name] = loaded
+            return
+
         if manifest.portable:
             self._load_portable_plugin(manifest, loaded)
             return
@@ -5095,7 +5128,7 @@ class PluginManager:
         # platform events define event-local additive envelopes instead: injecting
         # a bus-wide version here would turn unrelated adapter payloads into one
         # monolithic compatibility contract (#64176).
-        if hook_name != "gateway_platform_event":
+        if hook_name not in {"gateway_platform_event", "gateway_message_delivered"}:
             kwargs.setdefault("telemetry_schema_version", OBSERVER_SCHEMA_VERSION)
         callbacks = self._hooks.get(hook_name, [])
         results: List[Any] = []
