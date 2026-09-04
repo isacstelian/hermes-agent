@@ -41,6 +41,7 @@ Requires:
 """
 
 import asyncio
+import base64
 import errno
 import hashlib
 import hmac
@@ -70,6 +71,93 @@ _PROFILE_REJECTED = object()
 _api_request_profile: ContextVar[Optional[str]] = ContextVar(
     "api_server_request_profile", default=None
 )
+
+_MCP_METADATA_HEADER = "X-Hermes-MCP-Metadata"
+_MAX_MCP_METADATA_HEADER_BYTES = 8 * 1024
+_BASE64URL_RE = re.compile(r"[A-Za-z0-9_-]+")
+
+
+def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """Build a JSON object while rejecting ambiguous duplicate keys."""
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON key")
+        result[key] = value
+    return result
+
+
+def _reject_nonstandard_json_constant(value: str) -> None:
+    """Reject JSON extensions such as NaN and Infinity."""
+    raise ValueError(f"invalid JSON constant: {value}")
+
+
+def _parse_mcp_metadata_header(value: Optional[str]) -> tuple[Optional[dict[str, Any]], Optional[str]]:
+    """Parse the optional run-scoped MCP metadata header.
+
+    The wire format is unpadded base64url UTF-8 JSON. Only a flat JSON object
+    with scalar values is accepted, so callers cannot smuggle an arbitrary
+    JSON-RPC structure into an MCP request.
+    """
+    if value is None:
+        return None, None
+    if (
+        not value
+        or len(value.encode("ascii", "ignore")) != len(value)
+        or len(value) > _MAX_MCP_METADATA_HEADER_BYTES
+        or _BASE64URL_RE.fullmatch(value) is None
+        or len(value) % 4 == 1
+    ):
+        return None, "invalid"
+    try:
+        raw = base64.b64decode(
+            value + "=" * (-len(value) % 4),
+            altchars=b"-_",
+            validate=True,
+        )
+        parsed = json.loads(
+            raw.decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_json_keys,
+            parse_constant=_reject_nonstandard_json_constant,
+        )
+    except (UnicodeDecodeError, ValueError, json.JSONDecodeError):
+        return None, "invalid"
+    if not isinstance(parsed, dict) or not parsed:
+        return None, "invalid"
+    if any(
+        not isinstance(key, str)
+        or not key
+        or isinstance(item, (dict, list))
+        for key, item in parsed.items()
+    ):
+        return None, "invalid"
+    return parsed, None
+
+
+def _capability_manifest_sha256() -> Optional[str]:
+    """Return the stable SHA-256 for this profile's capabilities manifest.
+
+    Hash semantic JSON rather than source bytes, so harmless formatting changes
+    do not invalidate a backend attestation. A missing or malformed manifest
+    remains explicit in the health payload as ``null``.
+    """
+    try:
+        from hermes_constants import get_hermes_home
+
+        manifest_path = get_hermes_home() / "capabilities.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if not isinstance(manifest, dict):
+            return None
+        canonical = json.dumps(
+            manifest,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+        return hashlib.sha256(canonical).hexdigest()
+    except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
+        return None
+
 
 def _approval_event_choices(*, smart_denied: bool, allow_permanent: bool) -> list[str]:
     if smart_denied:
@@ -3003,6 +3091,8 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         return web.json_response({
             "status": readiness["status"],
+            "profile": _api_request_profile.get() or "default",
+            "capability_manifest_sha256": _capability_manifest_sha256(),
             "readiness": readiness,
             "platform": "hermes-agent",
             "version": _hermes_version(),
@@ -6636,6 +6726,14 @@ class APIServerAdapter(BasePlatformAdapter):
     @_admit_api_agent_request
     async def _handle_runs(self, request: "web.Request") -> "web.Response":
         """POST /v1/runs — start an agent run, return run_id immediately."""
+        run_mcp_metadata, metadata_error = _parse_mcp_metadata_header(
+            request.headers.get(_MCP_METADATA_HEADER)
+        )
+        if metadata_error:
+            return web.json_response(
+                _openai_error(f"Invalid {_MCP_METADATA_HEADER} header"),
+                status=400,
+            )
         # Long-term memory scope header (see chat_completions for details).
         gateway_session_key, key_err = self._parse_session_key_header(request)
         if key_err is not None:
@@ -6837,11 +6935,20 @@ class APIServerAdapter(BasePlatformAdapter):
                         set_current_session_key,
                         unregister_gateway_notify,
                     )
+                    from tools.mcp_tool import (
+                        reset_run_mcp_metadata,
+                        set_run_mcp_metadata,
+                    )
 
                     effective_task_id = session_id or run_id
                     approval_token = None
                     session_tokens = []
                     with self._profile_scope(request_profile):
+                        run_mcp_metadata_token = None
+                        if run_mcp_metadata is not None:
+                            run_mcp_metadata_token = set_run_mcp_metadata(
+                                run_mcp_metadata
+                            )
                         try:
                             # Bind approval/session identity for this API run via
                             # contextvars so concurrent runs do not share process
@@ -6872,6 +6979,8 @@ class APIServerAdapter(BasePlatformAdapter):
                                 task_id=effective_task_id,
                             )
                         finally:
+                            if run_mcp_metadata_token is not None:
+                                reset_run_mcp_metadata(run_mcp_metadata_token)
                             # Worker finished (interrupted or complete) —
                             # clear turn ownership immediately so a later
                             # stop/cancel can't reap background work this

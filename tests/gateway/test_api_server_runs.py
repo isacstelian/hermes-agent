@@ -10,6 +10,8 @@ Covers:
 """
 
 import asyncio
+import base64
+import json
 import threading
 import time
 from unittest.mock import MagicMock, patch
@@ -22,6 +24,7 @@ from gateway.config import PlatformConfig
 from gateway.platforms.api_server import (
     APIServerAdapter,
     _approval_event_choices,
+    _parse_mcp_metadata_header,
     cors_middleware,
     security_headers_middleware,
 )
@@ -73,6 +76,20 @@ def _create_runs_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_post("/v1/runs/{run_id}/steer", adapter._handle_steer_run)
     app.router.add_post("/v1/runs/{run_id}/stop", adapter._handle_stop_run)
     return app
+
+
+def _encode_mcp_metadata(payload: object) -> str:
+    encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(encoded).decode("ascii").rstrip("=")
+
+
+async def _wait_for_run_completion(cli: TestClient, run_id: str) -> None:
+    for _ in range(40):
+        status = await (await cli.get(f"/v1/runs/{run_id}")).json()
+        if status["status"] == "completed":
+            return
+        await asyncio.sleep(0.05)
+    pytest.fail(f"run {run_id} did not complete")
 
 
 def _make_slow_agent(**kwargs):
@@ -259,6 +276,79 @@ class TestStartRun:
         assert kwargs["requested_model"] == "MiniMax-M3"
         assert kwargs["requested_provider"] == "minimax"
         assert kwargs["model_options"] == model_options
+
+    def test_metadata_header_accepts_only_flat_base64url_json(self):
+        metadata = {
+            "employee_binding": "opaque-binding",
+            "location_id": 5,
+            "active": True,
+        }
+        assert _parse_mcp_metadata_header(_encode_mcp_metadata(metadata)) == (
+            metadata,
+            None,
+        )
+
+        duplicate_keys = base64.urlsafe_b64encode(
+            b'{"employee_binding":"a","employee_binding":"b"}'
+        ).decode("ascii").rstrip("=")
+        for invalid in (
+            "not base64url",
+            "a" * (8 * 1024 + 1),
+            _encode_mcp_metadata({"employee": {"id": "opaque-binding"}}),
+            _encode_mcp_metadata({"employee": ["opaque-binding"]}),
+            duplicate_keys,
+        ):
+            assert _parse_mcp_metadata_header(invalid) == (None, "invalid")
+
+    @pytest.mark.asyncio
+    async def test_run_metadata_is_scoped_and_cleared_between_runs(self, adapter):
+        app = _create_runs_app(adapter)
+        seen_metadata = []
+
+        def _inspect_run(**_kwargs):
+            from tools.mcp_tool import get_run_mcp_metadata
+
+            seen_metadata.append(get_run_mcp_metadata())
+            return {"final_response": "done"}
+
+        agent = MagicMock()
+        agent.run_conversation.side_effect = _inspect_run
+        agent.session_prompt_tokens = 0
+        agent.session_completion_tokens = 0
+        agent.session_total_tokens = 0
+
+        metadata = {"employee_binding": "opaque-binding", "location_id": 5}
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent", return_value=agent):
+                first = await cli.post(
+                    "/v1/runs",
+                    json={"input": "first"},
+                    headers={"X-Hermes-MCP-Metadata": _encode_mcp_metadata(metadata)},
+                )
+                assert first.status == 202
+                await _wait_for_run_completion(cli, (await first.json())["run_id"])
+
+                second = await cli.post("/v1/runs", json={"input": "second"})
+                assert second.status == 202
+                await _wait_for_run_completion(cli, (await second.json())["run_id"])
+
+        assert seen_metadata == [metadata, None]
+
+    @pytest.mark.asyncio
+    async def test_run_rejects_invalid_metadata_before_agent_creation(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as create_agent:
+                response = await cli.post(
+                    "/v1/runs",
+                    json={"input": "hello"},
+                    headers={"X-Hermes-MCP-Metadata": "not base64url"},
+                )
+                payload = await response.json()
+
+        assert response.status == 400
+        assert "X-Hermes-MCP-Metadata" in payload["error"]["message"]
+        create_agent.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

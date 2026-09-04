@@ -120,6 +120,51 @@ from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
 
+# API runs may attach caller identity metadata to a deliberately opted-in MCP
+# server. Keep it task-local: the MCP transport loop is shared by all agent
+# runs, so a process global would leak one employee's identity into another
+# employee's tool call.
+_run_mcp_metadata: contextvars.ContextVar[Optional[Dict[str, Any]]] = (
+    contextvars.ContextVar("mcp_run_metadata", default=None)
+)
+
+
+def set_run_mcp_metadata(metadata: Dict[str, Any]):
+    """Bind validated API-run metadata to the current agent context."""
+    return _run_mcp_metadata.set(dict(metadata))
+
+
+def reset_run_mcp_metadata(token) -> None:
+    """Clear metadata bound by :func:`set_run_mcp_metadata`."""
+    _run_mcp_metadata.reset(token)
+
+
+def get_run_mcp_metadata() -> Optional[Dict[str, Any]]:
+    """Return a copy of the current run's metadata, if one was supplied."""
+    metadata = _run_mcp_metadata.get()
+    return dict(metadata) if metadata is not None else None
+
+
+def _wrap_with_run_mcp_metadata(coro):
+    """Re-enter caller metadata in the dedicated shared MCP loop task."""
+    metadata = get_run_mcp_metadata()
+    if metadata is None:
+        return coro
+
+    async def _scoped():
+        token = _run_mcp_metadata.set(metadata)
+        try:
+            return await coro
+        finally:
+            _run_mcp_metadata.reset(token)
+
+    return _scoped()
+
+
+def _forward_run_metadata_enabled(config: dict) -> bool:
+    return config.get("forward_run_metadata") is True
+
+
 # Upper bound for the OSV malware preflight during stdio MCP startup. The
 # check makes a blocking urllib HTTPS call whose own timeout can fail to
 # interrupt a stalled SSL handshake, which froze the asyncio event loop and
@@ -4930,6 +4975,7 @@ def _run_on_mcp_loop(coro_or_factory, timeout: float = 30):
     # of the selected profile's. Re-establish the override inside the
     # task's own context (task-local — concurrent calls carrying different
     # scopes don't interfere). No-op when no override is active.
+    coro = _wrap_with_run_mcp_metadata(coro)
     coro = _wrap_with_home_override(coro)
     coro = _wrap_with_dashboard_oauth_flow(coro)
 
@@ -5345,7 +5391,12 @@ def _mark_server_call_started(server: Any) -> None:
         mark_tool_call()
 
 
-def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
+def _make_tool_handler(
+    server_name: str,
+    tool_name: str,
+    tool_timeout: float,
+    forward_run_metadata: bool = False,
+):
     """Return a sync handler that calls an MCP tool via the background loop.
 
     The handler conforms to the registry's dispatch interface:
@@ -5429,7 +5480,16 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 # it and detect the gateway platform / session for routing.
                 server._pending_call_context = contextvars.copy_context()
                 try:
-                    result = await server.session.call_tool(tool_name, arguments=args)
+                    metadata = (
+                        get_run_mcp_metadata() if forward_run_metadata else None
+                    )
+                    call_kwargs = {"arguments": args}
+                    if metadata is not None:
+                        call_kwargs["meta"] = {"magic.employee": metadata}
+                    result = await server.session.call_tool(
+                        tool_name,
+                        **call_kwargs,
+                    )
                 finally:
                     server._pending_call_context = None
             # The RPC round-trip completed — the session is demonstrably
@@ -6320,6 +6380,7 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
 
     registered_names: List[str] = []
     toolset_name = f"mcp-{name}"
+    forward_run_metadata = _forward_run_metadata_enabled(config)
 
     # Selective tool loading: honour include/exclude lists from config.
     # Rules (matching issue #690 spec, extended with glob support):
@@ -6369,7 +6430,10 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
                 "origin": f"tool {mcp_tool.name!r}",
                 "schema": schema,
                 "handler": _make_tool_handler(
-                    name, mcp_tool.name, server.tool_timeout
+                    name,
+                    mcp_tool.name,
+                    server.tool_timeout,
+                    forward_run_metadata=forward_run_metadata,
                 ),
                 "check_fn": check_fn,
             }
@@ -6588,6 +6652,7 @@ def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]
     toolset_name = f"mcp-{name}"
     fingerprint = config_fingerprint(config)
     tool_timeout = config.get("timeout", _DEFAULT_TOOL_TIMEOUT)
+    forward_run_metadata = _forward_run_metadata_enabled(config)
     tools_filter = config.get("tools") or {}
     include_set = _normalize_name_filter(
         tools_filter.get("include"), f"mcp_servers.{name}.tools.include"
@@ -6649,7 +6714,12 @@ def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]
             name=registry_name,
             toolset=toolset_name,
             schema=schema,
-            handler=_make_tool_handler(name, raw_name, tool_timeout),
+            handler=_make_tool_handler(
+                name,
+                raw_name,
+                tool_timeout,
+                forward_run_metadata=forward_run_metadata,
+            ),
             check_fn=check_fn,
             is_async=False,
             description=schema["description"],

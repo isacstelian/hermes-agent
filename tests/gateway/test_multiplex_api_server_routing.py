@@ -6,9 +6,15 @@ owns the port, and secondary profiles are reached via a URL prefix when
 """
 from __future__ import annotations
 
+import hashlib
+import json
+from types import SimpleNamespace
 from typing import Any, cast
 
+import pytest
+
 from gateway.config import GatewayConfig, PlatformConfig
+from gateway.platforms import api_server as api_server_module
 from gateway.platforms.api_server import (
     APIServerAdapter,
     _PROFILE_REJECTED,
@@ -77,6 +83,50 @@ class TestApiServerRouteTable:
         assert "/p/{profile}/api/model/options" in mirrored
         assert "/p/{profile}/v1/chat/completions" in mirrored
         assert "/p/{profile}/api/sessions/{session_id}/model" in mirrored
+
+
+@pytest.mark.asyncio
+async def test_detailed_health_reports_profile_and_manifest_hash(monkeypatch, tmp_path):
+    profile_home = tmp_path / "magic-employee-support"
+    profile_home.mkdir()
+    manifest = {
+        "profile": "magic-employee-support",
+        "tools": ["magic_get_my_income_summary"],
+        "schema_version": 1,
+    }
+    (profile_home / "capabilities.json").write_text(
+        json.dumps(manifest, indent=2),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+
+    adapter = _make_adapter(multiplex=True)
+    monkeypatch.setattr(adapter, "_check_auth", lambda request: None)
+    monkeypatch.setattr(
+        api_server_module,
+        "collect_runtime_readiness",
+        lambda **_kwargs: {"status": "ready"},
+    )
+    monkeypatch.setattr("gateway.status.read_runtime_status", lambda: {})
+    monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda: "")
+
+    token = _api_request_profile.set("magic-employee-support")
+    try:
+        response = await adapter._handle_health_detailed(SimpleNamespace())
+    finally:
+        _api_request_profile.reset(token)
+
+    payload = json.loads(response.body)
+    expected = hashlib.sha256(
+        json.dumps(
+            manifest,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    assert payload["profile"] == "magic-employee-support"
+    assert payload["capability_manifest_sha256"] == expected
 
 
 class TestApiServerModelsUnderProfile:
