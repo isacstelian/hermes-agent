@@ -2195,6 +2195,18 @@ from gateway.config import (
 )
 
 
+
+def next_progress_lines(lines: list, msg, grouping: str) -> list:
+    """Lines of the editable progress bubble after one more tool event.
+
+    ``latest`` keeps only the newest action, so the bubble reads as a
+    one-line live status; the other modes accumulate.
+    """
+    if grouping == "latest":
+        return [msg]
+    lines.append(msg)
+    return lines
+
 class MultiplexConfigError(RuntimeError):
     """A profile multiplexer config is invalid.
 
@@ -5099,7 +5111,9 @@ class TurnRunner:
                     continue
                 else:
                     msg = raw
-                    progress_lines.append(msg)
+                    progress_lines = next_progress_lines(
+                        progress_lines, msg, ctx.progress_grouping
+                    )
 
                 if await _roll_progress_overflow_if_needed():
                     _last_edit_ts = time.monotonic()

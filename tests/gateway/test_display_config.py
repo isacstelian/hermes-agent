@@ -327,3 +327,29 @@ class TestLiveStatusSetting:
         assert resolve_display_setting({}, "slack", "live_status") == "full"
 
 
+
+
+class TestToolProgressLatest:
+    """``latest`` shows one live status line instead of the whole tool log."""
+
+    def test_latest_is_accepted_per_platform(self):
+        from gateway.display_config import resolve_display_setting
+
+        config = {"display": {"platforms": {"telegram": {"tool_progress_grouping": "latest"}}}}
+        assert resolve_display_setting(config, "telegram", "tool_progress_grouping") == "latest"
+
+    def test_latest_keeps_only_the_newest_line(self):
+        from gateway.run import next_progress_lines
+
+        lines: list = []
+        for msg in ("📚 skill_view", "🔎 tool_search", "🗄️ company_location_db_query"):
+            lines = next_progress_lines(lines, msg, "latest")
+        assert lines == ["🗄️ company_location_db_query"]
+
+    def test_accumulate_is_unchanged(self):
+        from gateway.run import next_progress_lines
+
+        lines: list = []
+        for msg in ("a", "b"):
+            lines = next_progress_lines(lines, msg, "accumulate")
+        assert lines == ["a", "b"]
