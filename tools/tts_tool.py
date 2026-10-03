@@ -3439,12 +3439,14 @@ def _text_to_speech_single(
         elif (
             want_opus
             and provider in {"edge", "neutts", "minimax", "xai", "kittentts", "piper"}
-            and not file_str.endswith(".ogg")
         ):
-            opus_path = _convert_to_opus(file_str)
-            if opus_path:
-                file_str = opus_path
-                voice_compatible = True
+            # A caller-chosen .ogg path was already made real Ogg/Opus by
+            # _repair_ogg_container above; only other formats need converting.
+            if not file_str.endswith(".ogg"):
+                opus_path = _convert_to_opus(file_str)
+                if opus_path:
+                    file_str = opus_path
+            voice_compatible = file_str.endswith(".ogg")
         elif provider in {"elevenlabs", "openai", "mistral", "gemini"}:
             voice_compatible = want_opus and file_str.endswith(".ogg")
 
