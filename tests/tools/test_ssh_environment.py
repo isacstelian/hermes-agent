@@ -1,8 +1,13 @@
 """Tests for the SSH remote execution environment backend."""
 
+import io
 import json
+import logging
 import os
+import shlex
 import subprocess
+import tarfile
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -189,6 +194,165 @@ class TestSSHPreflight:
         assert called["count"] == 1
         assert env.host == "example.com"
         assert env.user == "alice"
+
+
+class TestRemoteHermesBase:
+
+    @pytest.fixture(autouse=True)
+    def _mock_connection(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr(ssh_env.shutil, "which", lambda _name: "/usr/bin/ssh")
+        monkeypatch.setattr(SSHEnvironment, "_establish_connection", lambda self: None)
+        monkeypatch.setattr(SSHEnvironment, "_detect_remote_home", lambda self: "/home/testuser")
+        monkeypatch.setattr(SSHEnvironment, "init_session", lambda self: None)
+        monkeypatch.setattr(ssh_env, "FileSyncManager", MagicMock())
+        monkeypatch.setattr(
+            ssh_env.subprocess, "run",
+            MagicMock(return_value=subprocess.CompletedProcess([], 0, stderr=b"")),
+        )
+
+    @pytest.mark.parametrize("value, expected_base", [
+        (None, "/home/testuser/.hermes"),
+        (".hermes-sandbox/junior-dev", "/home/testuser/.hermes-sandbox/junior-dev"),
+        ("/srv/hermes-sandbox", "/srv/hermes-sandbox"),
+        (".hermes-sandbox/./junior-dev/../junior-dev/", "/home/testuser/.hermes-sandbox/junior-dev"),
+        ("/srv/./hermes-sandbox/../hermes-sandbox/", "/srv/hermes-sandbox"),
+        ("/srv/hermes sandbox", "/srv/hermes sandbox"),
+    ])
+    def test_configured_base_used_for_all_sync_paths(self, monkeypatch, tmp_path,
+                                                   value, expected_base):
+        from hermes_cli import config
+
+        if value is not None:
+            (tmp_path / "config.yaml").write_text(
+                json.dumps({"terminal": {"ssh_hermes_dir": value}}), encoding="utf-8",
+            )
+        load_config = MagicMock(wraps=config.load_config)
+        monkeypatch.setattr(config, "load_config", load_config)
+
+        env = SSHEnvironment(host="example.com", user="testuser")
+        mkdir_cmd = ssh_env.subprocess.run.call_args.args[0][-1]
+        assert shlex.split(mkdir_cmd) == [
+            "mkdir", "-p", expected_base,
+            f"{expected_base}/skills", f"{expected_base}/credentials", f"{expected_base}/cache",
+        ]
+
+        iter_files = MagicMock(return_value=[])
+        monkeypatch.setattr(ssh_env, "iter_sync_files", iter_files)
+        manager_kwargs = ssh_env.FileSyncManager.call_args.kwargs
+        manager_kwargs["get_files_fn"]()
+        iter_files.assert_called_once_with(expected_base)
+
+        files = []
+        for directory in ("skills", "credentials", "cache"):
+            source = tmp_path / f"{directory}.txt"
+            source.write_text(directory, encoding="utf-8")
+            files.append((str(source), f"{expected_base}/{directory}/sample.txt"))
+
+        def fake_popen(cmd, **kwargs):
+            if cmd[0] == "tar":
+                staging = Path(cmd[cmd.index("-C") + 1])
+                for directory in ("skills", "credentials", "cache"):
+                    assert (staging / directory / "sample.txt").read_text(encoding="utf-8") == directory
+            proc = MagicMock()
+            proc.returncode = 0
+            proc.poll.return_value = 0
+            proc.communicate.return_value = (b"", b"")
+            proc.stderr.read.return_value = b""
+            return proc
+
+        popen = MagicMock(side_effect=fake_popen)
+        monkeypatch.setattr(ssh_env.subprocess, "Popen", popen)
+        manager_kwargs["bulk_upload_fn"](files)
+        assert shlex.split(ssh_env.subprocess.run.call_args.args[0][-1]) == [
+            "mkdir", "-p", f"{expected_base}/cache",
+            f"{expected_base}/credentials", f"{expected_base}/skills",
+        ]
+        assert popen.call_args.args[0][-1] == (
+            f"tar xf - --no-overwrite-dir -C {shlex.quote(expected_base)}"
+        )
+
+        manager_kwargs["bulk_download_fn"](tmp_path / "download.tar")
+        assert ssh_env.subprocess.run.call_args.args[0][-1] == (
+            f"tar cf - -C / {shlex.quote(expected_base.lstrip('/'))}"
+        )
+        assert env._remote_hermes_base == expected_base
+        load_config.assert_called_once_with()
+
+    @pytest.mark.parametrize("value", [
+        "", "/", "//", "/srv/..", "../x", "..", "nested/../../x",
+        "../testuser-other/x", "bad\npath", "bad\rpath", "bad\x00path", 123,
+    ])
+    def test_invalid_directory_falls_back_with_warning(self, tmp_path, caplog, value):
+        (tmp_path / "config.yaml").write_text(
+            json.dumps({"terminal": {"ssh_hermes_dir": value}}), encoding="utf-8",
+        )
+
+        with caplog.at_level(logging.WARNING, logger=ssh_env.__name__):
+            env = SSHEnvironment(host="example.com", user="testuser")
+
+        assert env._remote_hermes_base == "/home/testuser/.hermes"
+        assert any(
+            record.levelno == logging.WARNING
+            and "terminal.ssh_hermes_dir" in record.message
+            and ".hermes" in record.message
+            for record in caplog.records
+        )
+
+    @pytest.mark.parametrize("empty_config", [None, {}, {"terminal": None}])
+    def test_missing_config_falls_back(self, monkeypatch, empty_config):
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: empty_config)
+        env = SSHEnvironment(host="example.com", user="testuser")
+        assert env._remote_hermes_base == "/home/testuser/.hermes"
+
+    def test_config_loading_exception_falls_back(self, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config", MagicMock(side_effect=OSError("cannot read config")),
+        )
+        env = SSHEnvironment(host="example.com", user="testuser")
+        assert env._remote_hermes_base == "/home/testuser/.hermes"
+
+    @pytest.mark.parametrize("value, expected_base", [
+        (".hermes-sandbox/junior-dev", "/home/testuser/.hermes-sandbox/junior-dev"),
+        ("/srv/hermes-sandbox", "/srv/hermes-sandbox"),
+    ])
+    def test_configured_base_syncs_back_with_real_manager(self, monkeypatch, tmp_path, request,
+                                                        value, expected_base):
+        from tools.environments.file_sync import FileSyncManager
+
+        (tmp_path / "config.yaml").write_text(
+            json.dumps({"terminal": {"ssh_hermes_dir": value}}), encoding="utf-8",
+        )
+        skill = tmp_path / "skills" / "demo" / "SKILL.md"
+        skill.parent.mkdir(parents=True)
+        skill.write_text("original skill", encoding="utf-8")
+        monkeypatch.setattr("tools.credential_files.get_credential_file_mounts", lambda: [])
+        monkeypatch.setattr(ssh_env, "FileSyncManager", FileSyncManager)
+        upload = MagicMock()
+        monkeypatch.setattr(SSHEnvironment, "_ssh_bulk_upload", upload)
+
+        env = SSHEnvironment(host="example.com", user="testuser")
+        # Break the callback cycle before subprocess mocks are restored.
+        request.addfinalizer(lambda: setattr(env, "_sync_manager", None))
+        assert (str(skill), f"{expected_base}/skills/demo/SKILL.md") in upload.call_args.args[0]
+
+        def download(cmd, **kwargs):
+            assert cmd[-1] == f"tar cf - -C / {expected_base.lstrip('/')}"
+            with tarfile.open(fileobj=kwargs["stdout"], mode="w") as archive:
+                for name, data in {
+                    "SKILL.md": b"edited skill",
+                    "new.txt": b"new remote file",
+                }.items():
+                    info = tarfile.TarInfo(f"{expected_base.lstrip('/')}/skills/demo/{name}")
+                    info.size = len(data)
+                    archive.addfile(info, io.BytesIO(data))
+            return subprocess.CompletedProcess([], 0, stderr=b"")
+
+        monkeypatch.setattr(ssh_env.subprocess, "run", download)
+        env.cleanup()
+
+        assert skill.read_text(encoding="utf-8") == "edited skill"
+        assert (skill.parent / "new.txt").read_text(encoding="utf-8") == "new remote file"
 
 
 def _setup_ssh_env(monkeypatch, persistent: bool):

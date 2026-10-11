@@ -3,6 +3,7 @@
 import hashlib
 import logging
 import os
+import posixpath
 
 # Windows OpenSSH has no Unix-domain-socket ControlMaster support —
 # passing ControlPath/ControlMaster options fails the connection outright
@@ -29,6 +30,30 @@ from tools.environments.file_sync import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _get_remote_hermes_base(remote_home: str) -> str:
+    """Resolve the SSH sync directory from terminal.ssh_hermes_dir."""
+    default = posixpath.normpath(posixpath.join(remote_home, ".hermes"))
+    try:
+        from hermes_cli.config import load_config
+        value = ((load_config() or {}).get("terminal") or {}).get("ssh_hermes_dir")
+    except Exception:
+        return default
+    if value is None:
+        return default
+
+    if isinstance(value, str) and value and not any(c in value for c in ("\x00", "\n", "\r")):
+        normalized = posixpath.normpath(value)
+        escapes_home = not value.startswith("/") and (
+            normalized == ".." or normalized.startswith("../")
+        )
+        base = posixpath.normpath(posixpath.join(remote_home, value))
+        if base.lstrip("/") and not escapes_home:
+            return base
+
+    logger.warning("SSH: invalid terminal.ssh_hermes_dir; using default .hermes")
+    return default
 
 
 def _ensure_ssh_available() -> None:
@@ -77,10 +102,11 @@ class SSHEnvironment(BaseEnvironment):
         _ensure_ssh_available()
         self._establish_connection()
         self._remote_home = self._detect_remote_home()
+        self._remote_hermes_base = _get_remote_hermes_base(self._remote_home)
 
         self._ensure_remote_dirs()
         self._sync_manager = FileSyncManager(
-            get_files_fn=lambda: iter_sync_files(f"{self._remote_home}/.hermes"),
+            get_files_fn=lambda: iter_sync_files(self._remote_hermes_base),
             upload_fn=self._scp_upload,
             delete_fn=self._ssh_delete,
             bulk_upload_fn=self._ssh_bulk_upload,
@@ -165,8 +191,8 @@ class SSHEnvironment(BaseEnvironment):
     # ------------------------------------------------------------------
 
     def _ensure_remote_dirs(self) -> None:
-        """Create base ~/.hermes directory tree on remote in one SSH call."""
-        base = f"{self._remote_home}/.hermes"
+        """Create the configured sync directory tree on remote in one SSH call."""
+        base = self._remote_hermes_base
         dirs = [base, f"{base}/skills", f"{base}/credentials", f"{base}/cache"]
         cmd = self._build_ssh_command()
         cmd.append(quoted_mkdir_command(dirs))
@@ -231,7 +257,7 @@ class SSHEnvironment(BaseEnvironment):
         if not files:
             return
 
-        base = f"{self._remote_home}/.hermes"
+        base = self._remote_hermes_base
         parents = unique_parent_dirs(files)
         if parents:
             cmd = self._build_ssh_command()
@@ -349,10 +375,10 @@ class SSHEnvironment(BaseEnvironment):
         logger.debug("SSH: bulk-uploaded %d file(s) via tar pipe", len(files))
 
     def _ssh_bulk_download(self, dest: Path) -> None:
-        """Download remote .hermes/ as a tar archive."""
+        """Download the remote sync directory as a tar archive."""
         # Tar from / with the full path so archive entries preserve absolute
         # paths (e.g. home/user/.hermes/skills/f.py), matching _pushed_hashes keys.
-        rel_base = f"{self._remote_home}/.hermes".lstrip("/")
+        rel_base = self._remote_hermes_base.lstrip("/")
         ssh_cmd = self._build_ssh_command()
         ssh_cmd.append(f"tar cf - -C / {shlex.quote(rel_base)}")
         with open(dest, "wb") as f:
