@@ -984,10 +984,7 @@ def _active_terminal_env(task_id: str | None):
 
 def _agent_cache_base_for_env(env: Any) -> str | None:
     if env is not None:
-        # Forward-looking optional override: an environment may expose its own
-        # agent-visible cache root via this callable. No backend defines it yet
-        # — it's an extension hook, not a typo. The getattr/callable guards make
-        # it a safe no-op until a producer exists.
+        # Environments may expose their configured agent-visible cache root.
         explicit = getattr(env, "agent_visible_cache_base", None)
         if callable(explicit):
             try:
@@ -1013,7 +1010,9 @@ def _agent_cache_base_for_env(env: Any) -> str | None:
     if backend in {"docker", "singularity", "modal"}:
         return "/root/.hermes"
     if backend == "ssh":
-        return "~/.hermes"
+        from tools.environments.ssh import ssh_shell_hermes_base
+
+        return ssh_shell_hermes_base()
     return None
 
 

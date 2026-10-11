@@ -277,6 +277,7 @@ class TestRemoteHermesBase:
             f"tar cf - -C / {shlex.quote(expected_base.lstrip('/'))}"
         )
         assert env._remote_hermes_base == expected_base
+        assert env.agent_visible_cache_base() == expected_base
         load_config.assert_called_once_with()
 
     @pytest.mark.parametrize("value", [
@@ -292,6 +293,7 @@ class TestRemoteHermesBase:
             env = SSHEnvironment(host="example.com", user="testuser")
 
         assert env._remote_hermes_base == "/home/testuser/.hermes"
+        assert ssh_env.ssh_shell_hermes_base() == "~/.hermes"
         assert any(
             record.levelno == logging.WARNING
             and "terminal.ssh_hermes_dir" in record.message
@@ -304,6 +306,7 @@ class TestRemoteHermesBase:
         monkeypatch.setattr("hermes_cli.config.load_config", lambda: empty_config)
         env = SSHEnvironment(host="example.com", user="testuser")
         assert env._remote_hermes_base == "/home/testuser/.hermes"
+        assert ssh_env.ssh_shell_hermes_base() == "~/.hermes"
 
     def test_config_loading_exception_falls_back(self, monkeypatch):
         monkeypatch.setattr(
@@ -311,6 +314,51 @@ class TestRemoteHermesBase:
         )
         env = SSHEnvironment(host="example.com", user="testuser")
         assert env._remote_hermes_base == "/home/testuser/.hermes"
+        assert ssh_env.ssh_shell_hermes_base() == "~/.hermes"
+
+    @pytest.mark.parametrize("config_text", ["", "terminal:\n  ssh_hermes_dir: null\n"])
+    def test_default_preserves_remote_home_trailing_slash(self, monkeypatch, tmp_path, config_text):
+        (tmp_path / "config.yaml").write_text(config_text, encoding="utf-8")
+        monkeypatch.setattr(SSHEnvironment, "_detect_remote_home", lambda self: "/home/fixture/")
+
+        env = SSHEnvironment(host="example.com", user="testuser")
+
+        assert env._remote_hermes_base == "/home/fixture//.hermes"
+        assert env.agent_visible_cache_base() == "/home/fixture//.hermes"
+
+    def test_yaml_null_uses_default_without_warning(self, tmp_path, caplog):
+        (tmp_path / "config.yaml").write_text(
+            "terminal:\n  ssh_hermes_dir: null\n", encoding="utf-8",
+        )
+
+        with caplog.at_level(logging.WARNING, logger=ssh_env.__name__):
+            env = SSHEnvironment(host="example.com", user="testuser")
+            shell_base = ssh_env.ssh_shell_hermes_base()
+
+        assert env._remote_hermes_base == "/home/testuser/.hermes"
+        assert shell_base == "~/.hermes"
+        assert not any(
+            record.levelno >= logging.WARNING and record.name == ssh_env.__name__
+            for record in caplog.records
+        )
+
+    @pytest.mark.parametrize("value, expected_base", [
+        (None, "~/.hermes"),
+        (".hermes-sandbox/junior-dev", "~/.hermes-sandbox/junior-dev"),
+        (".hermes-sandbox/./junior-dev/../junior-dev/", "~/.hermes-sandbox/junior-dev"),
+        ("/srv/x", "/srv/x"),
+        ("/srv/./x/../x/", "/srv/x"),
+    ])
+    def test_shell_base_without_connection(self, monkeypatch, tmp_path, value, expected_base):
+        if value is not None:
+            (tmp_path / "config.yaml").write_text(
+                json.dumps({"terminal": {"ssh_hermes_dir": value}}), encoding="utf-8",
+            )
+        connect = MagicMock(side_effect=AssertionError("must not connect"))
+        monkeypatch.setattr(SSHEnvironment, "_establish_connection", connect)
+
+        assert ssh_env.ssh_shell_hermes_base() == expected_base
+        connect.assert_not_called()
 
     @pytest.mark.parametrize("value, expected_base", [
         (".hermes-sandbox/junior-dev", "/home/testuser/.hermes-sandbox/junior-dev"),

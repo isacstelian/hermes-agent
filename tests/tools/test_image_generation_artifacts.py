@@ -3,9 +3,18 @@ import json
 import threading
 from types import SimpleNamespace
 
+import pytest
 
-def test_postprocess_adds_agent_visible_image_for_active_ssh_env(monkeypatch, tmp_path):
+
+@pytest.mark.parametrize("value, expected_base", [
+    (None, "/home/fixture/.hermes"),
+    (".hermes-sandbox/junior-dev", "/home/fixture/.hermes-sandbox/junior-dev"),
+    ("/srv/x", "/srv/x"),
+])
+def test_postprocess_adds_agent_visible_image_for_active_ssh_env(monkeypatch, tmp_path,
+                                                              value, expected_base):
     from tools import image_generation_tool
+    from tools.environments import ssh as ssh_env
 
     hermes_home = tmp_path / ".hermes"
     image_dir = hermes_home / "cache" / "images"
@@ -19,12 +28,19 @@ def test_postprocess_adds_agent_visible_image_for_active_ssh_env(monkeypatch, tm
         def sync(self, *, force=False):
             sync_calls.append(force)
 
-    env = SimpleNamespace(
-        _remote_home="/home/remotesshuser",
-        _sync_manager=FakeSyncManager(),
-    )
-
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    if value is not None:
+        (hermes_home / "config.yaml").write_text(
+            json.dumps({"terminal": {"ssh_hermes_dir": value}}), encoding="utf-8",
+        )
+    monkeypatch.setattr(ssh_env, "_ensure_ssh_available", lambda: None)
+    monkeypatch.setattr(ssh_env.SSHEnvironment, "_establish_connection", lambda self: None)
+    monkeypatch.setattr(ssh_env.SSHEnvironment, "_detect_remote_home", lambda self: "/home/fixture")
+    monkeypatch.setattr(ssh_env.SSHEnvironment, "_ensure_remote_dirs", lambda self: None)
+    monkeypatch.setattr(ssh_env.SSHEnvironment, "init_session", lambda self: None)
+    monkeypatch.setattr(ssh_env, "FileSyncManager", lambda **kwargs: FakeSyncManager())
+    env = ssh_env.SSHEnvironment(host="example.com", user="fixture")
+    sync_calls.clear()
     monkeypatch.setattr(image_generation_tool, "_active_terminal_env", lambda task_id: env)
 
     raw = json.dumps({"success": True, "image": str(image_path)})
@@ -35,9 +51,50 @@ def test_postprocess_adds_agent_visible_image_for_active_ssh_env(monkeypatch, tm
     assert result["image"] == str(image_path)
     assert result["host_image"] == str(image_path)
     assert result["agent_visible_image"] == (
-        "/home/remotesshuser/.hermes/cache/images/xai_grok-imagine-image_test.jpg"
+        f"{expected_base}/cache/images/xai_grok-imagine-image_test.jpg"
     )
     assert sync_calls == [True]
+
+
+@pytest.mark.parametrize("value, expected_base", [
+    (None, "~/.hermes"),
+    (".hermes-sandbox/junior-dev", "~/.hermes-sandbox/junior-dev"),
+    (".hermes-sandbox/./junior-dev/../junior-dev/", "~/.hermes-sandbox/junior-dev"),
+    ("/srv/x", "/srv/x"),
+    ("/srv/./x/../x/", "/srv/x"),
+])
+def test_postprocess_ssh_image_without_active_env(monkeypatch, tmp_path, value, expected_base):
+    from tools import image_generation_tool
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("TERMINAL_ENV", "ssh")
+    monkeypatch.setattr(image_generation_tool, "_active_terminal_env", lambda task_id: None)
+    if value is not None:
+        (tmp_path / "config.yaml").write_text(
+            json.dumps({"terminal": {"ssh_hermes_dir": value}}), encoding="utf-8",
+        )
+    image_path = tmp_path / "cache" / "images" / "generated.png"
+    raw = json.dumps({"success": True, "image": str(image_path)})
+
+    result = json.loads(image_generation_tool._postprocess_image_generate_result(raw))
+
+    assert result["image"] == str(image_path)
+    assert result["agent_visible_image"] == f"{expected_base}/cache/images/generated.png"
+
+
+def test_daytona_cache_base_ignores_ssh_directory(monkeypatch, tmp_path):
+    from tools import image_generation_tool
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("TERMINAL_ENV", "daytona")
+    (tmp_path / "config.yaml").write_text(
+        json.dumps({"terminal": {"ssh_hermes_dir": ".hermes-sandbox/junior-dev"}}),
+        encoding="utf-8",
+    )
+    env = SimpleNamespace(_remote_home="/home/fixture")
+
+    assert image_generation_tool._agent_cache_base_for_env(env) == "/home/fixture/.hermes"
+    assert image_generation_tool._agent_cache_base_for_env(None) is None
 
 
 def test_concurrent_image_results_preserve_shared_remote_sync_state(monkeypatch, tmp_path):

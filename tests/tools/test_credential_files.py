@@ -1,5 +1,6 @@
 """Tests for credential file passthrough and skills directory mounting."""
 
+import json
 import os
 from pathlib import Path
 from unittest.mock import patch
@@ -457,6 +458,39 @@ class TestToAgentVisiblePathPerBackend:
         staged = self._staged(tmp_path, monkeypatch)
         monkeypatch.setenv("TERMINAL_ENV", "ssh")
         from tools.credential_files import to_agent_visible_cache_path
+        assert to_agent_visible_cache_path(staged) == "~/.hermes/attachments/drop.zip"
+
+    @pytest.mark.parametrize("value, expected_base", [
+        (".hermes-sandbox/junior-dev", "~/.hermes-sandbox/junior-dev"),
+        (".hermes-sandbox/./junior-dev/../junior-dev/", "~/.hermes-sandbox/junior-dev"),
+        ("/srv/x", "/srv/x"),
+        ("/srv/./x/../x/", "/srv/x"),
+    ])
+    def test_ssh_maps_configured_hermes_directory(self, tmp_path, monkeypatch,
+                                               value, expected_base):
+        staged = self._staged(tmp_path, monkeypatch)
+        hermes_home = tmp_path / ".hermes"
+        (hermes_home / "config.yaml").write_text(
+            json.dumps({"terminal": {"ssh_hermes_dir": value}}), encoding="utf-8",
+        )
+        monkeypatch.setenv("TERMINAL_ENV", "ssh")
+        from tools.credential_files import to_agent_visible_cache_path
+
+        assert to_agent_visible_cache_path(staged) == f"{expected_base}/attachments/drop.zip"
+        assert to_agent_visible_cache_path(str(hermes_home / "cache" / "images" / "generated.png")) == (
+            f"{expected_base}/cache/images/generated.png"
+        )
+
+    @pytest.mark.parametrize("backend", ["daytona", "vercel_sandbox"])
+    def test_other_remote_backends_ignore_ssh_directory(self, tmp_path, monkeypatch, backend):
+        staged = self._staged(tmp_path, monkeypatch)
+        (tmp_path / ".hermes" / "config.yaml").write_text(
+            json.dumps({"terminal": {"ssh_hermes_dir": ".hermes-sandbox/junior-dev"}}),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("TERMINAL_ENV", backend)
+        from tools.credential_files import to_agent_visible_cache_path
+
         assert to_agent_visible_cache_path(staged) == "~/.hermes/attachments/drop.zip"
 
     @pytest.mark.parametrize("backend", ["local", "singularity", ""])

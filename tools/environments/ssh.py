@@ -32,28 +32,42 @@ from tools.environments.file_sync import (
 logger = logging.getLogger(__name__)
 
 
-def _get_remote_hermes_base(remote_home: str) -> str:
-    """Resolve the SSH sync directory from terminal.ssh_hermes_dir."""
-    default = posixpath.normpath(posixpath.join(remote_home, ".hermes"))
+def _validated_ssh_hermes_dir() -> str | None:
+    """Read and normalize terminal.ssh_hermes_dir; None selects the default."""
     try:
         from hermes_cli.config import load_config
         value = ((load_config() or {}).get("terminal") or {}).get("ssh_hermes_dir")
     except Exception:
-        return default
+        return None
     if value is None:
-        return default
+        return None
 
     if isinstance(value, str) and value and not any(c in value for c in ("\x00", "\n", "\r")):
         normalized = posixpath.normpath(value)
         escapes_home = not value.startswith("/") and (
             normalized == ".." or normalized.startswith("../")
         )
-        base = posixpath.normpath(posixpath.join(remote_home, value))
-        if base.lstrip("/") and not escapes_home:
-            return base
+        if normalized.lstrip("/") and not escapes_home:
+            return normalized
 
     logger.warning("SSH: invalid terminal.ssh_hermes_dir; using default .hermes")
-    return default
+    return None
+
+
+def _get_remote_hermes_base(remote_home: str) -> str:
+    """Resolve the SSH sync directory from terminal.ssh_hermes_dir."""
+    directory = _validated_ssh_hermes_dir()
+    if directory is None:
+        return f"{remote_home}/.hermes"
+    return posixpath.normpath(posixpath.join(remote_home, directory))
+
+
+def ssh_shell_hermes_base() -> str:
+    """Resolve the shell-visible SSH sync directory without connecting."""
+    directory = _validated_ssh_hermes_dir()
+    if directory is None:
+        return "~/.hermes"
+    return directory if posixpath.isabs(directory) else f"~/{directory}"
 
 
 def _ensure_ssh_available() -> None:
@@ -115,6 +129,10 @@ class SSHEnvironment(BaseEnvironment):
         self._sync_manager.sync(force=True)
 
         self.init_session()
+
+    def agent_visible_cache_base(self) -> str:
+        """Return the configured remote Hermes directory for cache paths."""
+        return self._remote_hermes_base
 
     def _build_ssh_command(self, extra_args: list | None = None) -> list:
         cmd = ["ssh"]
