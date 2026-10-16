@@ -218,6 +218,107 @@ class TestTextToSpeechToolWithPiper:
         assert "piper-tts" in data["error"]
 
 
+class TestPiperOggOutput:
+    def test_ogg_path_is_transcoded_to_opus(self, tmp_path, monkeypatch):
+        """ffmpeg's ogg muxer picks Vorbis; a voice bubble needs Opus."""
+        model = tmp_path / f"{DEFAULT_PIPER_VOICE}.onnx"
+        model.write_bytes(b"model")
+        (tmp_path / f"{DEFAULT_PIPER_VOICE}.onnx.json").write_text("{}")
+        monkeypatch.setattr(tts_tool, "_import_piper", lambda: _StubPiperVoice)
+        transcodes = []
+
+        def fake_transcode(input_path, ogg_path):
+            transcodes.append((input_path, ogg_path))
+            Path(ogg_path).write_bytes(b"OggS\x00\x02" + b"\x00" * 8)
+            return ogg_path
+
+        monkeypatch.setattr(tts_tool, "_ffmpeg_transcode_to_opus", fake_transcode)
+        out = tmp_path / "voice.ogg"
+
+        result = tts_tool._generate_piper_tts("salut", str(out), {"piper": {"voice": str(model)}})
+
+        assert result == str(out)
+        assert transcodes == [(str(tmp_path / "voice.wav"), str(out))]
+        assert not (tmp_path / "voice.wav").exists()
+
+
+# ---------------------------------------------------------------------------
+# Edge -> Piper fallback (tts.fallback_provider: piper)
+# ---------------------------------------------------------------------------
+
+class TestEdgeFallsBackToPiper:
+    @pytest.fixture
+    def model(self, tmp_path):
+        model = tmp_path / f"{DEFAULT_PIPER_VOICE}.onnx"
+        model.write_bytes(b"model")
+        (tmp_path / f"{DEFAULT_PIPER_VOICE}.onnx.json").write_text("{}")
+        return model
+
+    def _edge_fails(self, monkeypatch, calls):
+        async def fail(_text, _output_path, _tts_config):
+            calls.append(_text)
+            raise ConnectionError("403, message='Invalid response status'")
+
+        monkeypatch.setattr(tts_tool, "_import_edge_tts", lambda: object())
+        monkeypatch.setattr(tts_tool, "_generate_edge_tts", fail)
+        monkeypatch.setattr(tts_tool, "_import_piper", lambda: _StubPiperVoice)
+        monkeypatch.setattr(tts_tool, "_check_piper_available", lambda: True)
+
+    def test_edge_failure_uses_configured_piper(self, tmp_path, monkeypatch, model):
+        edge_calls = []
+        self._edge_fails(monkeypatch, edge_calls)
+        cfg = {"provider": "edge", "fallback_provider": "piper", "piper": {"voice": str(model)}}
+        monkeypatch.setattr(tts_tool, "_load_tts_config", lambda: cfg)
+
+        data = json.loads(text_to_speech_tool(text="salut", output_path=str(tmp_path / "clip.wav")))
+
+        assert data["success"] is True, data
+        assert data["provider"] == "piper"
+        assert Path(data["file_path"]).stat().st_size > 0
+        assert edge_calls == ["salut"]
+        assert [c[0] for c in _StubPiperVoice.calls] == ["salut"]
+
+    def test_edge_failure_without_fallback_still_fails(self, tmp_path, monkeypatch, model):
+        self._edge_fails(monkeypatch, [])
+        cfg = {"provider": "edge", "piper": {"voice": str(model)}}
+        monkeypatch.setattr(tts_tool, "_load_tts_config", lambda: cfg)
+
+        data = json.loads(text_to_speech_tool(text="salut", output_path=str(tmp_path / "clip.wav")))
+
+        assert data["success"] is False
+        assert "edge" in data["error"]
+        assert _StubPiperVoice.calls == []
+
+    def test_fallback_needs_piper_installed(self, tmp_path, monkeypatch, model):
+        self._edge_fails(monkeypatch, [])
+        monkeypatch.setattr(tts_tool, "_check_piper_available", lambda: False)
+        cfg = {"provider": "edge", "fallback_provider": "piper", "piper": {"voice": str(model)}}
+        monkeypatch.setattr(tts_tool, "_load_tts_config", lambda: cfg)
+
+        data = json.loads(text_to_speech_tool(text="salut", output_path=str(tmp_path / "clip.wav")))
+
+        assert data["success"] is False
+        assert _StubPiperVoice.calls == []
+
+    def test_long_narration_stays_on_piper_after_fallback(self, tmp_path, monkeypatch, model):
+        edge_calls = []
+        self._edge_fails(monkeypatch, edge_calls)
+        cfg = {"provider": "edge", "fallback_provider": "piper", "piper": {"voice": str(model)}}
+        monkeypatch.setattr(tts_tool, "_load_tts_config", lambda: cfg)
+        monkeypatch.setattr(
+            tts_tool, "_build_audio_delivery_files",
+            lambda paths, _base, _profile, voice_compatible=False: (list(paths), False),
+        )
+        text = " ".join(f"Propoziția {i} din raportul de seară." for i in range(400))
+
+        data = json.loads(text_to_speech_tool(text=text, output_path=str(tmp_path / "long.wav")))
+
+        assert data["success"] is True, data
+        assert data["chunk_count"] > 1
+        assert len(edge_calls) == 1
+        assert len(_StubPiperVoice.calls) == data["chunk_count"]
+
+
 # ---------------------------------------------------------------------------
 # check_tts_requirements
 # ---------------------------------------------------------------------------
