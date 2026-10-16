@@ -176,7 +176,7 @@ parallel-web = ["parallel-web==0.4.2"]
 fal = ["fal-client==0.13.1"]
 # Edge TTS — default TTS provider but still optional (users can pick
 # ElevenLabs / OpenAI / MiniMax instead).
-edge-tts = ["edge-tts==7.2.7"]
+edge-tts = ["edge-tts==7.3.1"]
 modal = ["modal==1.3.4"]
 daytona = ["daytona==0.155.0"]
 vercel = ["vercel==0.7.2"]
@@ -406,7 +406,11 @@ exclude-newer = "14 days"
 # cutoff can still brick installs. Exempting exact pins is pure brick-risk
 # removal at no supply-chain cost. Guarded by
 # tests/test_packaging_metadata.py::test_build_system_requires_exempt_from_exclude_newer.
-exclude-newer-package = { vercel = false, nemo-relay = false, huggingface_hub = false, h2 = false, aiohttp = false, cryptography = false, defusedxml = false, python-olm = false, unpaddedbase64 = false, setuptools = false, pillow = false, mcp = false }
+#
+# edge-tts: exact-pinned, same reasoning as above. Microsoft's Edge read-aloud
+# endpoint answers 403 to the Sec-MS-GEC token sent by 7.2.7 since 2026-10-14;
+# 7.3.1 (published 2026-10-13) is the first release it accepts.
+exclude-newer-package = { edge-tts = false, vercel = false, nemo-relay = false, huggingface_hub = false, h2 = false, aiohttp = false, cryptography = false, defusedxml = false, python-olm = false, unpaddedbase64 = false, setuptools = false, pillow = false, mcp = false }
 
 [tool.setuptools]
 # Top-level single-file modules (not packages). Without this, uv2nix's
