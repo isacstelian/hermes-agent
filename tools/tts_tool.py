@@ -1742,6 +1742,28 @@ async def _generate_edge_tts(text: str, output_path: str, tts_config: Dict[str, 
     return output_path
 
 
+def _run_edge_tts(text: str, output_path: str, tts_config: Dict[str, Any]) -> None:
+    """Run the async Edge generator from sync code.
+
+    The 60-second result timeout surfaces only after the worker thread ends,
+    so a slow Edge stream can still take longer than that.
+    """
+    try:
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            pool.submit(
+                lambda: asyncio.run(_generate_edge_tts(text, output_path, tts_config))
+            ).result(timeout=60)
+    except RuntimeError:
+        asyncio.run(_generate_edge_tts(text, output_path, tts_config))
+
+
+def _edge_falls_back_to_piper(tts_config: Dict[str, Any]) -> bool:
+    """Whether ``tts.fallback_provider: piper`` asks for local synthesis when Edge fails."""
+    fallback = str(tts_config.get("fallback_provider") or "").lower().strip()
+    return fallback == "piper" and _check_piper_available()
+
+
 # ===========================================================================
 # Provider: ElevenLabs (premium)
 # ===========================================================================
@@ -3046,6 +3068,13 @@ def _generate_piper_tts(text: str, output_path: str, tts_config: Dict[str, Any])
 
     # Convert to desired format if caller requested mp3/ogg
     if wav_path != output_path:
+        # ffmpeg's ogg muxer defaults to Vorbis; voice bubbles need Opus.
+        if output_path.endswith(".ogg") and _ffmpeg_transcode_to_opus(wav_path, output_path):
+            try:
+                os.remove(wav_path)
+            except OSError:
+                pass
+            return output_path
         ffmpeg = shutil.which("ffmpeg")
         if ffmpeg:
             conv_cmd = [ffmpeg, "-i", wav_path, "-y", "-loglevel", "error", output_path]
@@ -3376,13 +3405,19 @@ def _text_to_speech_single(
             if edge_available:
                 logger.info("Generating speech with Edge TTS...")
                 try:
-                    import concurrent.futures
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                        pool.submit(
-                            lambda: asyncio.run(_generate_edge_tts(text, file_str, tts_config))
-                        ).result(timeout=60)
-                except RuntimeError:
-                    asyncio.run(_generate_edge_tts(text, file_str, tts_config))
+                    _run_edge_tts(text, file_str, tts_config)
+                except Exception as edge_error:
+                    # Edge is an unofficial endpoint: it returned 403 for two
+                    # days in October 2026 and times out on long text. A
+                    # configured local Piper voice keeps the reply audible.
+                    if not _edge_falls_back_to_piper(tts_config):
+                        raise
+                    logger.warning(
+                        "Edge TTS failed (%s); falling back to Piper (local)",
+                        str(edge_error) or type(edge_error).__name__,
+                    )
+                    provider = "piper"
+                    _generate_piper_tts(text, file_str, tts_config)
             elif _check_neutts_available():
                 logger.info("Edge TTS not available, falling back to NeuTTS (local)...")
                 provider = "neutts"
@@ -3643,6 +3678,9 @@ def text_to_speech_tool(
             generated_artifacts.add(actual_path)
             encoded_paths.append(actual_path)
             chunk_results.append(chunk_result)
+            if chunk_result.get("provider") == "piper" and provider != "piper":
+                # Edge fell back mid-narration; keep one voice for the rest.
+                provider = "piper"
 
         voice_compatible = bool(chunk_results) and all(
             bool(result.get("voice_compatible")) for result in chunk_results
