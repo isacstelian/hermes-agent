@@ -1743,7 +1743,11 @@ async def _generate_edge_tts(text: str, output_path: str, tts_config: Dict[str, 
 
 
 def _run_edge_tts(text: str, output_path: str, tts_config: Dict[str, Any]) -> None:
-    """Run the async Edge generator from sync code, bounded to 60 seconds."""
+    """Run the async Edge generator from sync code.
+
+    The 60-second result timeout surfaces only after the worker thread ends,
+    so a slow Edge stream can still take longer than that.
+    """
     try:
         import concurrent.futures
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
