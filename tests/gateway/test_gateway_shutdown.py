@@ -12,6 +12,61 @@ from tests.gateway.restart_test_helpers import make_restart_runner, make_restart
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("persist_across_processes", [True, False])
+@pytest.mark.parametrize("restart", [False, True])
+@pytest.mark.parametrize("leased", [False, True])
+async def test_gateway_stop_honors_container_persist_mode(
+    monkeypatch, tmp_path, persist_across_processes, restart, leased,
+):
+    from tools import terminal_tool
+    from tools.environments.docker import DockerEnvironment
+
+    env = DockerEnvironment.__new__(DockerEnvironment)
+    container_id = env._container_id = "shared-container"
+    env._docker_exe = "/usr/bin/docker"
+    env._persist_across_processes = persist_across_processes
+    env._persistent = True
+    env._cleanup_thread = None
+    monkeypatch.setattr(terminal_tool, "_active_environments", {"default": env})
+    monkeypatch.setattr(terminal_tool, "_last_activity", {"default": 1})
+    monkeypatch.setattr(terminal_tool, "_environment_leases", {})
+    monkeypatch.setattr(terminal_tool, "_pending_environment_cleanup", {})
+    monkeypatch.setattr(terminal_tool, "_creation_locks", {})
+    monkeypatch.setattr(terminal_tool, "_get_scratch_dir", lambda: tmp_path)
+    lease = terminal_tool.acquire_environment_lease("default") if leased else None
+    runner, _adapter = make_restart_runner()
+    with (
+        patch("gateway.status.remove_pid_file"),
+        patch("gateway.status.write_runtime_status"),
+        patch("tools.environments.docker.subprocess.run") as docker_run,
+    ):
+        await runner.stop(restart=restart)
+
+        if lease is not None:
+            assert terminal_tool._active_environments == {"default": env}
+            assert terminal_tool._environment_leases == {"default": 1}
+            assert terminal_tool._pending_environment_cleanup == {"default": False}
+            assert env._container_id == container_id
+            docker_run.assert_not_called()
+            lease.release()
+
+        assert env.wait_for_cleanup(timeout=5)
+        commands = [call.args[0] for call in docker_run.call_args_list]
+        if persist_across_processes:
+            assert env._container_id == container_id
+            assert not any(cmd[1] in {"stop", "rm"} for cmd in commands)
+        else:
+            assert env._container_id is None
+            assert [cmd[1] for cmd in commands] == ["stop", "rm"]
+            assert all(cmd[-1] == container_id for cmd in commands)
+
+    assert terminal_tool._active_environments == {}
+    assert terminal_tool._last_activity == {}
+    assert terminal_tool._environment_leases == {}
+    assert terminal_tool._pending_environment_cleanup == {}
+
+
+@pytest.mark.asyncio
 async def test_cancel_background_tasks_cancels_inflight_message_processing():
     _runner, adapter = make_restart_runner()
     release = asyncio.Event()

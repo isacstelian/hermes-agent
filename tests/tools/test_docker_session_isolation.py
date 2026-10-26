@@ -27,6 +27,7 @@ These tests pin the fix:
 """
 
 import os
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -269,6 +270,24 @@ class TestRecordedHostCwdDiscardedOnContainers:
 
 
 class TestSessionScopedContainerLifecycle:
+    def test_alias_cleanup_leaves_parent_registered_until_forced(self, monkeypatch):
+        _enable_isolation(monkeypatch)
+        terminal_tool.register_container_alias("sa-1-abcd1234", "tui:parent")
+        env = MagicMock(_container_id="parent-container")
+        monkeypatch.setattr(terminal_tool, "_active_environments", {"tui:parent": env})
+        monkeypatch.setattr(terminal_tool, "_environment_leases", {})
+        monkeypatch.setattr(terminal_tool, "_pending_environment_cleanup", {})
+
+        terminal_tool.cleanup_vm("sa-1-abcd1234")
+
+        assert terminal_tool.get_active_env("tui:parent") is env
+        assert env._container_id == "parent-container"
+        env.cleanup.assert_not_called()
+
+        terminal_tool.cleanup_vm("sa-1-abcd1234", force_remove=True)
+        assert terminal_tool.get_active_env("tui:parent") is None
+        env.cleanup.assert_called_once()
+
     def test_session_scoped_env_counts_persistent_for_turn_teardown(self, monkeypatch):
         """Session-scoped containers survive between turns (torn down at
         session close, not per-turn)."""

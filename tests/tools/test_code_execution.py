@@ -70,6 +70,26 @@ def _mock_handle_function_call(function_name, function_args, task_id=None, user_
     return json.dumps({"error": f"Unknown tool in mock: {function_name}"})
 
 
+def test_remote_container_config_matches_terminal(monkeypatch):
+    from tools import terminal_tool, code_execution_tool
+
+    config = {
+        "env_type": "docker", "docker_image": "test-image", "cwd": "/root", "timeout": 60,
+        "docker_extra_args": ["--runtime=runsc", "--read-only", "--user=1000:1000"],
+        "docker_env": {"APP_MODE": "test"}, "docker_forward_env": ["APP_MODE"],
+        "docker_mount_cwd_to_workspace": True, "docker_shm_size": "2g",
+        "docker_network": False,
+        "docker_persist_across_processes": False, "docker_orphan_reaper": False,
+    }
+    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: config)
+    for name in ("_active_environments", "_last_activity", "_creation_locks", "_task_env_overrides"):
+        monkeypatch.setattr(terminal_tool, name, {})
+    monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
+    with patch.object(terminal_tool, "_create_environment") as create:
+        code_execution_tool._get_or_create_env("code-first")
+    assert create.call_args.kwargs["container_config"] == terminal_tool._container_config_from_config(config)
+
+
 class TestSandboxRequirements(unittest.TestCase):
     def test_available_on_posix(self):
         if sys.platform != "win32":

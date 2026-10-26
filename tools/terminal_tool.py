@@ -2266,6 +2266,9 @@ def cleanup_vm(task_id: str, *, force_remove: bool = False):
     contract — exactly the bug Ben reported when the container was killed
     on every TUI session close.
 
+    Tasks that borrow a persistent shared environment or a parent's alias
+    leave its registry entry and leases untouched unless forced.
+
     Pass ``force_remove=True`` for actual user-initiated teardown
     (e.g. ``/reset``-style flows that haven't been wired yet, or future
     "destroy my sandbox" commands).
@@ -2277,7 +2280,19 @@ def cleanup_vm(task_id: str, *, force_remove: bool = False):
     # Remove from tracking dicts while holding the lock, but defer the
     # actual (potentially slow) env.cleanup() call to outside the lock
     # so other tool calls aren't blocked.
+    requested_task_id = task_id or "default"
     task_id = _resolve_container_task_id(task_id)
+    if not force_remove and requested_task_id != task_id:
+        # A borrower cannot tear down its parent's environment, including
+        # by scheduling deferred cleanup behind an artifact lease.
+        if _resolve_container_alias(requested_task_id) != requested_task_id:
+            return
+        config = _get_env_config()
+        if (
+            config["env_type"] in _CONTAINER_BACKENDS
+            and config.get("container_persistent", True)
+        ):
+            return
     env = None
     with _env_lock:
         if _environment_leases.get(task_id, 0) > 0:
