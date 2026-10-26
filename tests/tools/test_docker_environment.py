@@ -1850,11 +1850,15 @@ def test_cleanup_with_persist_is_noop_for_container(monkeypatch):
         f"docker rm must NOT be called when persist_across_processes=True; "
         f"reuse would be impossible. Got: {rms}"
     )
-    # The in-process handle must still be cleared so the next __init__
-    # re-probes via labels (and reuses the still-running container).
-    assert env._container_id is None, (
-        "in-process container_id should be cleared even in no-op cleanup"
+    # Concurrent tasks still hold this shared environment after cleanup.
+    assert env._container_id == container_id, (
+        "persist-mode cleanup must preserve the shared container handle"
     )
+
+    env.cleanup(force_remove=True)
+    assert env._container_id is None
+    assert any(cmd[1] == "stop" for cmd, _ in cleanup_calls)
+    assert any(cmd[1] == "rm" for cmd, _ in cleanup_calls)
 
 
 def test_cleanup_vm_default_honors_persist_mode(monkeypatch):

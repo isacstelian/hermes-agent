@@ -3459,10 +3459,7 @@ class DockerEnvironment(BaseEnvironment):
             should_stop = True
             should_remove = True
         elif self._persist_across_processes:
-            # No-op for the container. Drop the in-process handle so a fresh
-            # __init__ will re-probe via labels (and find the running
-            # container) instead of trying to reuse a stale Python reference.
-            self._container_id = None
+            # Other tasks can still be executing through this shared handle.
             return
         else:
             should_stop = True
