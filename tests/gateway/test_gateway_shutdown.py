@@ -12,6 +12,30 @@ from tests.gateway.restart_test_helpers import make_restart_runner, make_restart
 
 
 @pytest.mark.asyncio
+async def test_gateway_stop_forces_persistent_container_teardown(monkeypatch, tmp_path):
+    from tools import terminal_tool
+
+    class PersistentEnvironment:
+        _container_id = "shared-container"
+
+        def cleanup(self, *, force_remove=False):
+            if force_remove:
+                self._container_id = None
+
+    env = PersistentEnvironment()
+    monkeypatch.setattr(terminal_tool, "_active_environments", {"default": env})
+    monkeypatch.setattr(terminal_tool, "_last_activity", {"default": 1})
+    monkeypatch.setattr(terminal_tool, "_environment_leases", {})
+    monkeypatch.setattr(terminal_tool, "_get_scratch_dir", lambda: tmp_path)
+    runner, _adapter = make_restart_runner()
+    with patch("gateway.status.remove_pid_file"), patch("gateway.status.write_runtime_status"):
+        await runner.stop()
+
+    assert env._container_id is None
+    assert terminal_tool._active_environments == {}
+
+
+@pytest.mark.asyncio
 async def test_cancel_background_tasks_cancels_inflight_message_processing():
     _runner, adapter = make_restart_runner()
     release = asyncio.Event()
