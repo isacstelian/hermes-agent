@@ -1349,7 +1349,10 @@ class ShellFileOperations(FileOperations):
             return ExecuteResult(exit_code=-1), ReadResult(
                 error=f"File could not be read right now: {path}: {exc}"
             )
-        if result.exit_code != 0 and result.stdout.strip() != MISSING_FILE_SENTINEL:
+        # Login-shell warnings can precede the probe's final status line.
+        output_lines = _strip_terminal_fence_leaks(result.stdout).strip().splitlines()
+        is_missing = bool(output_lines) and output_lines[-1].strip() == MISSING_FILE_SENTINEL
+        if result.exit_code != 0 and not is_missing:
             reason = result.stdout.strip() or f"size probe exited with status {result.exit_code}"
             return result, ReadResult(
                 error=f"File could not be read right now: {path}: {reason}"
