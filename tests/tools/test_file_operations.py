@@ -898,3 +898,45 @@ class TestEscapeNativeToolArg:
         assert node_cmds, f"no node command captured in: {commands}"
         assert "'C:/Users/alice/app/main.js'" in node_cmds[0]
         assert "/c/Users" not in node_cmds[0]
+
+
+def test_sandbox_read_probe_failure_is_not_missing():
+    import errno
+    failures = [
+        {"output": "bash: /usr/bin/sed: Cannot allocate memory", "returncode": 1},
+        {"output": "bash: fork: Resource temporarily unavailable", "returncode": 1},
+        {"output": "ENOMEM", "returncode": 1},
+        {"output": "EAGAIN", "returncode": 1},
+        {"output": "Permission denied", "returncode": 1},
+        {"output": "", "returncode": 126},
+        {"output": "No such container: sandbox", "returncode": 1},
+        OSError(errno.ENOMEM, "Cannot allocate memory"),
+        OSError(errno.EAGAIN, "Resource temporarily unavailable"),
+        RuntimeError("backend unavailable"),
+    ]
+    for method in ("read_file", "read_file_raw", "read_file_bytes"):
+        for failure in failures:
+            env = MagicMock()
+            env.cwd = "/root"
+            if isinstance(failure, Exception):
+                env.execute.side_effect = failure
+            else:
+                env.execute.return_value = failure
+            result = getattr(ShellFileOperations(env), method)("/root/present.txt")
+            assert result.error
+            assert "File not found" not in result.error
+            assert "could not be read right now" in result.error
+            reason = str(failure) if isinstance(failure, Exception) else failure["output"]
+            assert (reason or "126") in result.error
+            assert env.execute.call_count == 1
+
+        # Execute the actual probe command through a mocked backend to pin its
+        # explicit missing-file signal, without needing a sandbox container.
+        env = MagicMock()
+        env.cwd = "/root"
+        def missing(command, **kw):
+            proc = subprocess.run(["bash", "-c", command], capture_output=True, text=True)
+            return {"output": proc.stdout + proc.stderr, "returncode": proc.returncode}
+        env.execute.side_effect = missing
+        result = getattr(ShellFileOperations(env), method)("/nonexistent/hermes-sandbox-probe.txt")
+        assert "File not found" in result.error
