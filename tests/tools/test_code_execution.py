@@ -78,6 +78,7 @@ def test_remote_container_config_matches_terminal(monkeypatch):
         "docker_extra_args": ["--runtime=runsc", "--read-only", "--user=1000:1000"],
         "docker_env": {"APP_MODE": "test"}, "docker_forward_env": ["APP_MODE"],
         "docker_mount_cwd_to_workspace": True, "docker_shm_size": "2g",
+        "docker_network": False,
         "docker_persist_across_processes": False, "docker_orphan_reaper": False,
     }
     monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: config)

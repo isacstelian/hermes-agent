@@ -62,6 +62,7 @@ class TestFileToolsContainerConfig:
         config = _make_env_config(
             docker_extra_args=["--runtime=runsc", "--read-only", "--user=1000:1000"],
             docker_env={"APP_MODE": "test"}, docker_shm_size="2g",
+            docker_network=False,
             docker_persist_across_processes=False, docker_orphan_reaper=False,
         )
         captured = self._run(config, "file-first")
