@@ -14138,11 +14138,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except Exception as _e:
                     logger.debug("async interrupt_all (%s) error: %s", phase, _e)
                 try:
-                    from tools.terminal_tool import (
-                        _active_environments, cleanup_all_environments, cleanup_vm,
-                    )
-                    for task_id in list(_active_environments):
-                        cleanup_vm(task_id, force_remove=True)
+                    from tools.terminal_tool import cleanup_all_environments
                     cleanup_all_environments()
                 except Exception as _e:
                     logger.debug("cleanup_all_environments (%s) error: %s", phase, _e)

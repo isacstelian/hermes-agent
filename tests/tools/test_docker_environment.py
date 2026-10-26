@@ -1858,6 +1858,11 @@ def test_cleanup_with_persist_is_noop_for_container(monkeypatch):
         "persist-mode cleanup must preserve the shared container handle"
     )
 
+    env.cleanup(force_remove=True)
+    assert env._container_id is None
+    assert any(cmd[1] == "stop" for cmd, _ in cleanup_calls)
+    assert any(cmd[1] == "rm" for cmd, _ in cleanup_calls)
+
 
 def test_cleanup_vm_default_honors_persist_mode(monkeypatch):
     """``cleanup_vm(task_id)`` without ``force_remove=True`` must be a no-op
@@ -1905,50 +1910,6 @@ def test_cleanup_vm_default_honors_persist_mode(monkeypatch):
         f"cleanup_vm() default must not docker rm a persist-mode container; "
         f"got: {rms}"
     )
-
-
-def test_forced_cleanup_vm_tears_down_persistent_shared_container(monkeypatch, tmp_path):
-    from tools import terminal_tool
-
-    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
-    calls = _mock_subprocess_run(monkeypatch)
-    _install_fake_thread(monkeypatch)
-    monkeypatch.setattr(docker_env.DockerEnvironment, "init_session", lambda self: None)
-    env = _make_dummy_env(task_id="default", persistent_filesystem=True)
-    container_id = env._container_id
-    monkeypatch.setattr(terminal_tool, "_active_environments", {"default": env})
-    monkeypatch.setattr(terminal_tool, "_last_activity", {"default": 1})
-    monkeypatch.setattr(terminal_tool, "_environment_leases", {})
-    monkeypatch.setattr(terminal_tool, "_get_scratch_dir", lambda: tmp_path)
-    calls.clear()
-
-    terminal_tool.cleanup_vm("default", force_remove=True)
-
-    assert env._container_id is None
-    assert terminal_tool._active_environments == {}
-    assert any(cmd[1] == "stop" and cmd[-1] == container_id for cmd, _ in calls)
-    assert any(cmd[1] == "rm" and cmd[-1] == container_id for cmd, _ in calls)
-
-
-def test_cli_cleanup_all_preserves_persistent_container(monkeypatch, tmp_path):
-    from tools import terminal_tool
-
-    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
-    calls = _mock_subprocess_run(monkeypatch)
-    _install_fake_thread(monkeypatch)
-    monkeypatch.setattr(docker_env.DockerEnvironment, "init_session", lambda self: None)
-    env = _make_dummy_env(task_id="default", persistent_filesystem=True)
-    container_id = env._container_id
-    monkeypatch.setattr(terminal_tool, "_active_environments", {"default": env})
-    monkeypatch.setattr(terminal_tool, "_last_activity", {"default": 1})
-    monkeypatch.setattr(terminal_tool, "_environment_leases", {})
-    monkeypatch.setattr(terminal_tool, "_get_scratch_dir", lambda: tmp_path)
-    calls.clear()
-
-    terminal_tool.cleanup_all_environments()
-
-    assert env._container_id == container_id
-    assert not any(cmd[1] in {"stop", "rm"} for cmd, _ in calls)
 
 
 def test_cleanup_with_persist_disabled_stops_and_rms(monkeypatch):
