@@ -2409,3 +2409,20 @@ def test_extra_args_set_shm_size_helper():
     assert docker_env._extra_args_set_shm_size(None) is False
     # non-string entries must not crash (config.yaml can be malformed)
     assert docker_env._extra_args_set_shm_size([42, None, "--shm-size=1g"]) is True
+
+
+def test_sandbox_terminal_output_cache_is_read_only(tmp_path, monkeypatch):
+    from tools.credential_files import _CACHE_DIRS, get_cache_directory_mounts
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+    _make_dummy_env()
+    target = "/root/.hermes/cache/terminal-output"
+    mounts = get_cache_directory_mounts()
+    assert any(new == "cache/terminal-output" for new, old in _CACHE_DIRS)
+    assert {"host_path": str(tmp_path / "cache/terminal-output"),
+            "container_path": target} in mounts
+    run = next(cmd for cmd, kw in calls if isinstance(cmd, list) and cmd[1] == "run")
+    assert f"{tmp_path}/cache/terminal-output:{target}:ro" in run
+    assert not any(arg.endswith(f":{target}") or arg.endswith(f":{target}:rw")
+                   for arg in run)

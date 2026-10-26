@@ -1876,3 +1876,23 @@ class TestFallbackModelInheritance(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_sandbox_child_prompt_omits_host_workspace(tmp_path, monkeypatch):
+    from tools.delegate_tool import _resolve_workspace_hint
+    host_workspace = tmp_path / "host-workspace"
+    host_workspace.mkdir()
+    parent = _make_mock_parent()
+    monkeypatch.setenv("TERMINAL_CWD", str(host_workspace))
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+    assert _resolve_workspace_hint(parent) == str(host_workspace)
+    for backend in ("docker", "modal", "ssh", "daytona", "vercel_sandbox"):
+        monkeypatch.setenv("TERMINAL_ENV", backend)
+        with patch("run_agent.AIAgent") as agent:
+            _build_child_agent(
+                task_index=0, goal="Inspect safely", context=None, toolsets=None,
+                model=None, max_iterations=10, parent_agent=parent,
+                task_count=1, role="leaf",
+            )
+        prompt = agent.call_args.kwargs["ephemeral_system_prompt"]
+        assert str(host_workspace) not in prompt

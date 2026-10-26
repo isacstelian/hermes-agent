@@ -1143,6 +1143,12 @@ def _resolve_workspace_hint(parent_agent) -> Optional[str]:
     teaching subagents a fake container path while still helping them avoid
     guessing `/workspace/...` for local repo tasks.
     """
+    # These candidates describe the host, not a remote sandbox's cwd.
+    if (os.getenv("TERMINAL_ENV") or "local").strip().lower() not in (
+        "local", "singularity",
+    ):
+        return None
+
     candidates = [
         os.getenv("TERMINAL_CWD"),
         getattr(
@@ -2176,6 +2182,10 @@ def _trim_summary_with_footer(
         tail = tail[nl + 1:]
 
     spill_path = _spill_summary_to_file(task_index, summary)
+    if spill_path:
+        # read_file runs inside the active terminal backend.
+        from tools.credential_files import to_agent_visible_cache_path
+        spill_path = to_agent_visible_cache_path(spill_path)
 
     footer_lines = [
         "",
@@ -3628,6 +3638,8 @@ def delegate_task(
     live_deleg_id, live_writers, live_paths = create_live_transcripts(
         task_list, context
     )
+    from tools.credential_files import to_agent_visible_cache_path
+    live_paths = [to_agent_visible_cache_path(path) for path in live_paths]
 
     # Capture the ORIGINATING session's wake target BEFORE any child agent is
     # constructed: _build_child_agent() -> AIAgent() -> agent_init calls
@@ -3706,7 +3718,7 @@ def delegate_task(
             child.tool_progress_callback = wrap_progress_callback(
                 getattr(child, "tool_progress_callback", None), _writer
             )
-            child._live_transcript_path = str(_writer.path)
+            child._live_transcript_path = to_agent_visible_cache_path(str(_writer.path))
         children.append((i, t, child))
 
     def _execute_and_aggregate(*, honor_parent_interrupt: bool = True) -> dict:

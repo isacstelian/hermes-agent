@@ -898,3 +898,120 @@ class TestEscapeNativeToolArg:
         assert node_cmds, f"no node command captured in: {commands}"
         assert "'C:/Users/alice/app/main.js'" in node_cmds[0]
         assert "/c/Users" not in node_cmds[0]
+
+
+def test_sandbox_read_probe_failure_is_not_missing():
+    import errno
+    failures = [
+        {"output": "bash: /usr/bin/sed: Cannot allocate memory", "returncode": 1},
+        {"output": "bash: fork: Resource temporarily unavailable", "returncode": 1},
+        {"output": "ENOMEM", "returncode": 1},
+        {"output": "EAGAIN", "returncode": 1},
+        {"output": "Permission denied", "returncode": 1},
+        {"output": "", "returncode": 126},
+        {"output": "No such container: sandbox", "returncode": 1},
+        OSError(errno.ENOMEM, "Cannot allocate memory"),
+        OSError(errno.EAGAIN, "Resource temporarily unavailable"),
+        RuntimeError("backend unavailable"),
+    ]
+    for method in ("read_file", "read_file_raw", "read_file_bytes"):
+        for failure in failures:
+            env = MagicMock()
+            env.cwd = "/root"
+            if isinstance(failure, Exception):
+                env.execute.side_effect = failure
+            else:
+                env.execute.return_value = failure
+            result = getattr(ShellFileOperations(env), method)("/root/present.txt")
+            assert result.error
+            assert "File not found" not in result.error
+            assert "could not be read right now" in result.error
+            reason = str(failure) if isinstance(failure, Exception) else failure["output"]
+            assert (reason or "126") in result.error
+            assert env.execute.call_count == 1
+
+        # Execute the actual probe command through a mocked backend to pin its
+        # explicit missing-file signal, without needing a sandbox container.
+        env = MagicMock()
+        env.cwd = "/root"
+        def missing(command, **kw):
+            proc = subprocess.run(["bash", "-c", command], capture_output=True, text=True)
+            return {"output": proc.stdout + proc.stderr, "returncode": proc.returncode}
+        env.execute.side_effect = missing
+        result = getattr(ShellFileOperations(env), method)("/nonexistent/hermes-sandbox-probe.txt")
+        assert "File not found" in result.error
+
+
+@pytest.mark.parametrize("method", ["read_file", "read_file_raw", "read_file_bytes"])
+@pytest.mark.parametrize(
+    ("output", "missing"),
+    [
+        pytest.param(
+            "bash: warning: setlocale: LC_ALL: cannot change locale\n__hermes_missing_file__",
+            True,
+            id="locale-warning",
+        ),
+        pytest.param("__hermes_missing_file__\n", True, id="trailing-newline"),
+        pytest.param(
+            "login profile output\n__hermes_missing_file__\n\n \t\n",
+            True,
+            id="trailing-blank-lines",
+        ),
+        pytest.param(
+            "login profile output\n__hermes_missing_file__\n"
+            "\x1b]133;D;1\x07'\x07__HERMES_FENCE_probe__\x07'\n",
+            True,
+            id="terminal-fences",
+        ),
+        pytest.param("Cannot allocate memory", False, id="memory-error"),
+        pytest.param(
+            "__hermes_missing_file__\nCannot allocate memory",
+            False,
+            id="nonterminal-sentinel",
+        ),
+    ],
+)
+def test_sandbox_read_probe_output_classification(mock_env, method, output, missing):
+    def execute(command, **kwargs):
+        if command.startswith("if [ -f"):
+            return {"output": output, "returncode": 1}
+        return {"output": "present.txt\n", "returncode": 0}
+
+    mock_env.execute.side_effect = execute
+    result = getattr(ShellFileOperations(mock_env), method)("/root/presnt.txt")
+
+    assert result.error is not None
+    if missing:
+        assert result.error == "File not found: /root/presnt.txt"
+        if method != "read_file_bytes":
+            assert result.similar_files == ["/root/present.txt"]
+    else:
+        assert "could not be read right now" in result.error
+        assert "File not found" not in result.error
+        assert mock_env.execute.call_count == 1
+
+
+@pytest.mark.parametrize("method", ["read_file", "read_file_raw", "read_file_bytes"])
+def test_sandbox_read_missing_file_with_shell_warning(mock_env, tmp_path, method):
+    (tmp_path / "present.txt").write_text("content", encoding="utf-8")
+
+    def execute(command, **kwargs):
+        proc = subprocess.run(
+            [
+                "bash", "-c",
+                "printf '%s\\n' 'bash: warning: setlocale: LC_ALL: cannot change locale' >&2\n"
+                + command,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        return {"output": proc.stdout, "returncode": proc.returncode}
+
+    mock_env.execute.side_effect = execute
+    path = str(tmp_path / "presnt.txt")
+    result = getattr(ShellFileOperations(mock_env), method)(path)
+
+    assert result.error == f"File not found: {path}"
+    if method != "read_file_bytes":
+        assert str(tmp_path / "present.txt") in result.similar_files

@@ -552,6 +552,10 @@ def _truncate_with_footer(
 
     total = len(content)
     stored_path = _store_full_text(url, content)
+    if stored_path:
+        # read_file runs inside the active terminal backend.
+        from tools.credential_files import to_agent_visible_cache_path
+        stored_path = to_agent_visible_cache_path(stored_path)
 
     footer_lines = [
         "",

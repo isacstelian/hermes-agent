@@ -396,6 +396,7 @@ _CACHE_DIRS: list[tuple[str, str]] = [
     ("cache/screenshots", "browser_screenshots"),
     ("cache/web", "web_cache"),
     ("cache/delegation", "delegation_cache"),
+    ("cache/terminal-output", "cache/terminal-output"),
     # Desktop/clipboard/PDF uploads land in the flat top-level ``images/`` dir
     # (tui_gateway attach RPCs), not under ``cache/``. Mount it so vision can
     # reach uploads inside sandbox containers (#69575). No legacy alias exists,

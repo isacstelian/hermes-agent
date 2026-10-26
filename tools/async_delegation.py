@@ -1172,6 +1172,8 @@ def _push_batch_completion_event(
         )
         return
 
+    from tools.credential_files import to_agent_visible_cache_path
+
     dispatched_at = event_record.get("dispatched_at") or time.time()
     completed_at = event_record.get("completed_at") or time.time()
     evt = {
@@ -1195,7 +1197,10 @@ def _push_batch_completion_event(
         # Per-task live transcript log paths (cache/delegation/live/...).
         # They persist after completion and double as the full-fidelity
         # operational record of each child's run.
-        "live_transcripts": combined.get("live_transcripts"),
+        "live_transcripts": [
+            to_agent_visible_cache_path(path)
+            for path in combined["live_transcripts"]
+        ] if combined.get("live_transcripts") is not None else None,
         "error": combined.get("error"),
         "total_duration_seconds": combined.get("total_duration_seconds"),
         "dispatched_at": dispatched_at,

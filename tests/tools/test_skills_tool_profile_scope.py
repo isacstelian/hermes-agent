@@ -80,3 +80,33 @@ def test_explicit_skills_dir_monkeypatch_still_wins(tmp_path, monkeypatch):
 
     assert result["success"] is True
     assert Path(result["skill_dir"]) == patched_skill_dir
+
+
+def test_sandbox_skill_dir_matches_mount(tmp_path, monkeypatch):
+    from tools.credential_files import get_skills_directory_mount
+    skill_dir = _write_skill(tmp_path, "development", "sandbox-skill", "Sandbox skill")
+    external = tmp_path / "external"
+    external_skill = _write_skill(external, "development", "external-skill", "External skill")
+    monkeypatch.setattr("agent.skill_utils.get_external_skills_dirs",
+                        lambda: [external / "skills"])
+    # Mount sanitization must not change the directory advertised to the model.
+    (skill_dir / "link").symlink_to(tmp_path / "outside")
+    skills_tool = _reload_skills_tool(tmp_path, monkeypatch)
+    for backend in ("local", "singularity", "docker"):
+        monkeypatch.setenv("TERMINAL_ENV", backend)
+        result = json.loads(skills_tool.skill_view("sandbox-skill", preprocess=False))
+        assert result["success"], result
+        expected = ("/root/.hermes/skills/development/sandbox-skill"
+                    if backend == "docker" else str(skill_dir))
+        assert result["skill_dir"] == expected
+        if backend == "docker":
+            mount = get_skills_directory_mount()[0]
+            assert expected == mount["container_path"] + "/development/sandbox-skill"
+        assert result["_source_path"] == str(skill_dir / "SKILL.md")
+        external_result = json.loads(skills_tool.skill_view("external-skill", preprocess=False))
+        assert external_result["success"], external_result
+        external_expected = (
+            "/root/.hermes/external_skills/0/development/external-skill"
+            if backend == "docker" else str(external_skill)
+        )
+        assert external_result["skill_dir"] == external_expected

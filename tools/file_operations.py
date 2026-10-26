@@ -799,6 +799,7 @@ DEFAULT_SEARCH_LIMIT = 50
 # Echoed by the size probe when the path exists but is not a regular file.
 # `wc -c` prints only digits, so this can never collide with a real size.
 NOT_REGULAR_SENTINEL = "__hermes_not_regular__"
+MISSING_FILE_SENTINEL = "__hermes_missing_file__"
 
 
 def _coerce_int(value: Any, default: int) -> int:
@@ -1335,10 +1336,28 @@ class ShellFileOperations(FileOperations):
         """
         arg = self._escape_shell_arg(path)
         return (
-            f"if [ -f {arg} ]; then wc -c < {arg} 2>/dev/null; "
+            f"if [ -f {arg} ]; then wc -c < {arg}; "
             f"elif [ -e {arg} ]; then echo {NOT_REGULAR_SENTINEL}; "
-            f"else exit 1; fi"
+            f"else echo {MISSING_FILE_SENTINEL}; exit 1; fi"
         )
+
+    def _probe_read_size(self, path: str) -> tuple[ExecuteResult, Optional[ReadResult]]:
+        """Only a completed absence check may report a missing file."""
+        try:
+            result = self._exec(self._size_probe_cmd(path))
+        except Exception as exc:
+            return ExecuteResult(exit_code=-1), ReadResult(
+                error=f"File could not be read right now: {path}: {exc}"
+            )
+        # Login-shell warnings can precede the probe's final status line.
+        output_lines = _strip_terminal_fence_leaks(result.stdout).strip().splitlines()
+        is_missing = bool(output_lines) and output_lines[-1].strip() == MISSING_FILE_SENTINEL
+        if result.exit_code != 0 and not is_missing:
+            reason = result.stdout.strip() or f"size probe exited with status {result.exit_code}"
+            return result, ReadResult(
+                error=f"File could not be read right now: {path}: {reason}"
+            )
+        return result, None
 
     @staticmethod
     def _not_regular_error(path: str) -> ReadResult:
@@ -1368,7 +1387,9 @@ class ShellFileOperations(FileOperations):
         offset, limit = normalize_read_pagination(offset, limit)
         
         # Check if file exists and get size (POSIX, works on Linux + macOS)
-        stat_result = self._exec(self._size_probe_cmd(path))
+        stat_result, probe_error = self._probe_read_size(path)
+        if probe_error is not None:
+            return probe_error
 
         if stat_result.exit_code != 0:
             # File not found. Before failing, try unicode-equivalent
@@ -1643,7 +1664,9 @@ class ShellFileOperations(FileOperations):
         Uses cat so the full file is returned regardless of size.
         """
         path = self._expand_path(path)
-        stat_result = self._exec(self._size_probe_cmd(path))
+        stat_result, probe_error = self._probe_read_size(path)
+        if probe_error is not None:
+            return probe_error
         if stat_result.exit_code != 0:
             return self._suggest_similar_files(path)
         stat_output = _strip_terminal_fence_leaks(stat_result.stdout)
@@ -1685,7 +1708,9 @@ class ShellFileOperations(FileOperations):
     def read_file_bytes(self, path: str, max_bytes: Optional[int] = None) -> ReadResult:
         """Read binary-safe bytes from any shell-backed environment."""
         path = self._expand_path(path)
-        stat_result = self._exec(self._size_probe_cmd(path))
+        stat_result, probe_error = self._probe_read_size(path)
+        if probe_error is not None:
+            return probe_error
         if stat_result.exit_code != 0:
             return ReadResult(error=f"File not found: {path}")
         stat_output = _strip_terminal_fence_leaks(stat_result.stdout)
