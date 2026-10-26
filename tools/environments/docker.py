@@ -2656,12 +2656,18 @@ class DockerEnvironment(BaseEnvironment):
         """Return True if the output indicates the container no longer exists."""
         return any(p in output for p in self._NO_CONTAINER_PATTERNS)
 
-    def _recreate_container(self) -> bool:
+    def _recreate_container(self, expected_generation: int | None = None) -> bool:
         lock = getattr(self, "_artifact_transfer_lock", None)
         if lock is None:
             lock = threading.RLock()
             self._artifact_transfer_lock = lock
         with lock:
+            if (
+                expected_generation is not None
+                and self._container_generation != expected_generation
+            ):
+                # Another exec already recovered the generation that failed.
+                return True
             return self._recreate_container_locked()
 
     def _recreate_container_locked(self) -> bool:
@@ -2676,7 +2682,7 @@ class DockerEnvironment(BaseEnvironment):
         logger.warning(
             "Container %s appears to be gone — attempting recovery", old_id,
         )
-        self._container_id = None
+        replacement_id = None
 
         # 1. Try label-based reuse (another process may have recreated it).
         task_label = self._labels.get("hermes-task-id", "")
@@ -2688,7 +2694,7 @@ class DockerEnvironment(BaseEnvironment):
         if existing is not None:
             cid, state = existing
             if state == "running":
-                self._container_id = cid
+                replacement_id = cid
                 logger.info("Recovery: reusing running container %s", cid[:12])
             else:
                 try:
@@ -2697,13 +2703,13 @@ class DockerEnvironment(BaseEnvironment):
                         capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=30, check=True,
                         stdin=subprocess.DEVNULL,
                     )
-                    self._container_id = cid
+                    replacement_id = cid
                     logger.info("Recovery: restarted container %s", cid[:12])
-                except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+                except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as e:
                     logger.warning("Recovery: failed to start container %s: %s", cid[:12], e)
 
         # 2. No reusable container — create a fresh one.
-        if not self._container_id:
+        if not replacement_id:
             if not self._image:
                 logger.error("Recovery: no saved image name, cannot recreate container")
                 return False
@@ -2728,17 +2734,20 @@ class DockerEnvironment(BaseEnvironment):
                     run_cmd, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=120, check=True,
                     stdin=subprocess.DEVNULL,
                 )
-                self._container_id = result.stdout.strip()
+                replacement_id = result.stdout.strip()
                 self._container_name = new_name
                 logger.info(
                     "Recovery: created fresh container %s (%s)",
-                    new_name, self._container_id[:12],
+                    new_name, replacement_id[:12],
                 )
             except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as e:
                 logger.error("Recovery: failed to create new container: %s", e)
                 return False
 
         # 3. Re-initialize session snapshot in the (re)created container.
+        if not replacement_id:
+            return False
+        self._container_id = replacement_id
         self._container_generation += 1
         try:
             self._snapshot_ready = False
@@ -2770,6 +2779,7 @@ class DockerEnvironment(BaseEnvironment):
                 "returncode": 125,
                 "output": "Docker container generation changed during artifact transfer",
             }
+        generation = getattr(self, "_container_generation", 0)
         result = super().execute(command, cwd, **kwargs)
         if expected_generation is not None:
             return result
@@ -2778,7 +2788,7 @@ class DockerEnvironment(BaseEnvironment):
             and self._is_container_gone(result.get("output", ""))
             and self._persist_across_processes
         ):
-            if self._recreate_container():
+            if self._recreate_container(expected_generation=generation):
                 result = super().execute(command, cwd, **kwargs)
         return result
 

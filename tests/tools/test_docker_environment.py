@@ -7,6 +7,9 @@ from io import BytesIO, StringIO
 from pathlib import Path
 import subprocess
 import tarfile
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 
 import pytest
 
@@ -2316,6 +2319,85 @@ def test_recreate_container_increments_generation(monkeypatch):
     assert env._recreate_container() is True
     assert env._container_id == "replacement-cid"
     assert env.container_generation == 2
+
+
+@pytest.mark.parametrize("reuse_exited", [True, False], ids=["restart", "recreate"])
+def test_concurrent_dead_execs_recover_once_without_blanking_handle(monkeypatch, reuse_exited):
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    _mock_subprocess_run(monkeypatch)
+    monkeypatch.setattr(docker_env.DockerEnvironment, "init_session", lambda self: None)
+    env = _make_dummy_env(persistent_filesystem=True)
+    env._container_id = "dead-cid"
+    env._snapshot_ready = True
+    generation = env.container_generation
+    monkeypatch.setattr(env, "_find_reusable_container", lambda *_: (
+        ("dead-cid", "exited") if reuse_exited else None
+    ))
+
+    dead_execs = threading.Barrier(2)
+    recovering = threading.Event()
+    resume = threading.Event()
+    recovered = threading.Event()
+    recovery_commands = []
+    exec_ids = []
+
+    def popen(cmd, stdin_data):
+        cid = cmd[2]
+        assert cid is not None
+        exec_ids.append(cid)
+        return SimpleNamespace(dead=not recovered.is_set())
+
+    def wait(proc, **kwargs):
+        if proc.dead:
+            dead_execs.wait(timeout=10)
+            return {"returncode": 1, "output": "Error: container dead-cid is not running"}
+        return {"returncode": 0, "output": "ok"}
+
+    def run(cmd, **kwargs):
+        assert cmd[1] in {"start", "run"}
+        recovery_commands.append(cmd)
+        recovering.set()
+        assert resume.wait(timeout=10)
+        recovered.set()
+        cid = "dead-cid" if reuse_exited else "replacement-cid"
+        return subprocess.CompletedProcess(cmd, 0, stdout=cid + "\n", stderr="")
+
+    monkeypatch.setattr(docker_env, "_popen_bash", popen)
+    monkeypatch.setattr(env, "_wait_for_process", wait)
+    monkeypatch.setattr(docker_env.subprocess, "run", run)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(env.execute, "echo ok") for _ in range(2)]
+        try:
+            assert recovering.wait(timeout=10)
+            # Exercise the real spawn boundary while recovery is paused.
+            env._run_bash("echo concurrent observer")
+        finally:
+            resume.set()
+        results = [future.result(timeout=10) for future in futures]
+
+    assert all(result["returncode"] == 0 for result in results)
+    assert len(recovery_commands) == 1
+    assert env.container_generation == generation + 1
+    assert env._container_id == ("dead-cid" if reuse_exited else "replacement-cid")
+    assert all(exec_ids)
+
+
+def test_failed_recovery_keeps_previous_handle(monkeypatch):
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    _mock_subprocess_run(monkeypatch)
+    monkeypatch.setattr(docker_env.DockerEnvironment, "init_session", lambda self: None)
+    env = _make_dummy_env(persistent_filesystem=True)
+    previous_id = env._container_id
+    generation = env.container_generation
+    monkeypatch.setattr(env, "_find_reusable_container", lambda *_: (previous_id, "exited"))
+
+    def fail(cmd, **kwargs):
+        raise subprocess.CalledProcessError(1, cmd, stderr="daemon unavailable")
+
+    monkeypatch.setattr(docker_env.subprocess, "run", fail)
+    assert env._recreate_container() is False
+    assert env._container_id == previous_id
+    assert env.container_generation == generation
 
 
 def test_execute_does_not_recover_on_ordinary_failure(monkeypatch):
