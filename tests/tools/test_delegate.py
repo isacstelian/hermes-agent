@@ -34,6 +34,39 @@ from tools.delegate_tool import (
 from hermes_state import SessionDB
 
 
+def test_delegated_child_close_preserves_parent_environment(monkeypatch):
+    from run_agent import AIAgent
+    from tools import terminal_tool
+
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
+    monkeypatch.setenv("TERMINAL_CONTAINER_PERSISTENT", "true")
+    monkeypatch.setattr(terminal_tool, "_terminal_config_bridge_attempted", True)
+    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: {
+        "env_type": "docker", "container_persistent": True,
+    })
+    child_id = "sa-1-abcd1234"
+    monkeypatch.setattr(terminal_tool, "_container_aliases", {child_id: "parent"})
+    env = MagicMock(_container_id="parent-container")
+    env.execute.return_value = {"returncode": 0, "output": "parent still running"}
+    monkeypatch.setattr(terminal_tool, "_active_environments", {"default": env})
+    monkeypatch.setattr(terminal_tool, "_environment_leases", {})
+    monkeypatch.setattr(terminal_tool, "_pending_environment_cleanup", {})
+    child = AIAgent.__new__(AIAgent)
+    child.session_id = child_id
+    monkeypatch.setattr(child, "shutdown_memory_provider", lambda *_: None)
+    with patch("tools.process_registry.process_registry.kill_all"), \
+         patch("run_agent.cleanup_browser"), \
+         patch("tools.computer_use.release_computer_use_session"):
+        child.close()
+        child.close()
+
+    parent_env = terminal_tool.get_active_env("parent")
+    assert parent_env is env
+    assert parent_env._container_id == "parent-container"
+    assert parent_env.execute("echo parent still running")["returncode"] == 0
+    env.cleanup.assert_not_called()
+
+
 def _make_mock_parent(depth=0):
     """Create a mock parent agent with the fields delegate_task expects."""
     parent = MagicMock()

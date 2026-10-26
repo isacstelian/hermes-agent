@@ -16,6 +16,7 @@ Docker Backend in ``website/docs/user-guide/configuration.md``.
 """
 
 import pytest
+from unittest.mock import MagicMock
 
 from tools import terminal_tool
 
@@ -67,3 +68,39 @@ def test_env_type_override_keeps_own_id():
         )
     finally:
         terminal_tool.clear_task_env_overrides("bench-env")
+
+
+@pytest.mark.parametrize("task_id", ["sa-1-abcd1234", "session-close", "cron-close"])
+def test_collapsed_task_cleanup_preserves_shared_environment(monkeypatch, task_id):
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
+    monkeypatch.setenv("TERMINAL_CONTAINER_PERSISTENT", "true")
+    monkeypatch.setattr(terminal_tool, "_terminal_config_bridge_attempted", True)
+    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: {
+        "env_type": "docker", "container_persistent": True,
+    })
+    env = MagicMock(_container_id="parent-container")
+    monkeypatch.setattr(terminal_tool, "_active_environments", {"default": env})
+    monkeypatch.setattr(terminal_tool, "_last_activity", {"default": 123})
+    monkeypatch.setattr(terminal_tool, "_pending_environment_cleanup", {})
+    monkeypatch.setattr(terminal_tool, "_environment_leases", {"default": 1})
+    creation_lock = object()
+    monkeypatch.setattr(terminal_tool, "_creation_locks", {"default": creation_lock})
+
+    terminal_tool.cleanup_vm(task_id)
+
+    assert terminal_tool.get_active_env(task_id) is env
+    assert env._container_id == "parent-container"
+    assert terminal_tool._last_activity["default"] == 123
+    assert terminal_tool._creation_locks["default"] is creation_lock
+    assert terminal_tool._pending_environment_cleanup == {}
+    env.cleanup.assert_not_called()
+
+    # A child must not leave deferred teardown for an artifact lease release.
+    terminal_tool._environment_leases.clear()
+    terminal_tool.cleanup_vm(task_id)
+    assert terminal_tool.get_active_env(task_id) is env
+    env.cleanup.assert_not_called()
+
+    terminal_tool.cleanup_vm(task_id, force_remove=True)
+    assert terminal_tool.get_active_env(task_id) is None
+    env.cleanup.assert_called_once()
