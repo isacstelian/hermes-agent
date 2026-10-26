@@ -825,3 +825,21 @@ def test_batch_truncation_banner_marks_only_truncated_task():
     # The header banner for task 2 appears after task 1's summary.
     assert banner_pos > clean_pos
 
+
+
+def test_sandbox_async_transcripts(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    transcript = tmp_path / "cache/delegation/live/deleg_test/task-0.log"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text("live transcript")
+    for backend in ("local", "singularity", "docker"):
+        monkeypatch.setenv("TERMINAL_ENV", backend)
+        combined = {"results": [], "live_transcripts": [str(transcript)]}
+        ad._push_batch_completion_event(
+            {"delegation_id": "deleg_test", "session_key": ""}, combined, "completed"
+        )
+        event = process_registry.completion_queue.get_nowait()
+        expected = ("/root/.hermes/cache/delegation/live/deleg_test/task-0.log"
+                    if backend == "docker" else str(transcript))
+        assert event["live_transcripts"] == [expected]
+        assert combined["live_transcripts"] == [str(transcript)]

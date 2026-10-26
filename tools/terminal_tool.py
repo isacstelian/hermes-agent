@@ -3554,11 +3554,14 @@ def terminal_tool(
                         errors="replace",
                     )
                     result_dict["output_total_chars"] = spill_total_chars
-                    result_dict["full_output_path"] = spill_file_path
+                    from tools.credential_files import to_agent_visible_cache_path
+
+                    visible_spill_path = to_agent_visible_cache_path(spill_file_path)
+                    result_dict["full_output_path"] = visible_spill_path
                     result_dict["truncation_note"] = (
                         "Output exceeded the capture window (head+tail shown). "
                         f"Full output ({spill_total_chars:,} chars) saved to "
-                        f"{spill_file_path} — search it with search_files or page it "
+                        f"{visible_spill_path} — search it with search_files or page it "
                         "with read_file instead of re-running the command."
                     )
                 except Exception:

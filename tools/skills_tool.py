@@ -1762,6 +1762,24 @@ def skill_view(
                     exc_info=True,
                 )
 
+        visible_skill_dir = str(skill_dir) if skill_dir else None
+        if skill_dir and backend in ("docker", "modal", "ssh", "daytona", "vercel_sandbox"):
+            container_base = (
+                "/root/.hermes" if backend in ("docker", "modal") else "~/.hermes"
+            )
+            skill_roots = [(active_skills_dir, f"{container_base}/skills")]
+            skill_roots.extend(
+                (root, f"{container_base}/external_skills/{idx}")
+                for idx, root in enumerate(get_external_skills_dirs())
+            )
+            for root, mounted_path in skill_roots:
+                try:
+                    relative = skill_dir.relative_to(root)
+                except ValueError:
+                    continue
+                visible_skill_dir = str(PurePosixPath(mounted_path) / relative.as_posix())
+                break
+
         result = {
             "success": True,
             "name": skill_name,
@@ -1770,7 +1788,7 @@ def skill_view(
             "related_skills": related_skills,
             "content": rendered_content,
             "path": rel_path,
-            "skill_dir": str(skill_dir) if skill_dir else None,
+            "skill_dir": visible_skill_dir,
             "org_provenance": org_provenance,
             "linked_files": linked_files if linked_files else None,
             "usage_hint": "To view linked files, call skill_view(name, file_path) where file_path is e.g. 'references/api.md' or 'assets/config.yaml'"

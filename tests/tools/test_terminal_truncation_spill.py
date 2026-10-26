@@ -65,3 +65,35 @@ class TestTruncationSpill:
             task_id="t-spill-5"))
         assert r["exit_code"] == 3
         assert Path(r["full_output_path"]).exists()
+
+
+def test_sandbox_terminal_spill_handle(tmp_path, monkeypatch):
+    from unittest.mock import MagicMock
+    import tools.terminal_tool as tt
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    spill = tmp_path / "cache/terminal-output/output.log"
+    spill.parent.mkdir(parents=True)
+    spill.write_text("complete output")
+    env = MagicMock()
+    env.cwd = "/root"
+    env.execute.return_value = {
+        "output": "head...tail", "returncode": 0,
+        "full_output_path": str(spill), "output_total_chars": 10000,
+    }
+    monkeypatch.setattr(tt, "_start_cleanup_thread", lambda: None)
+    monkeypatch.setattr(tt, "_check_all_guards", lambda *a, **kw: {"approved": True})
+    monkeypatch.setitem(tt._active_environments, "default", env)
+    for backend in ("local", "singularity", "docker"):
+        monkeypatch.setenv("TERMINAL_ENV", backend)
+        config = {
+            "env_type": backend, "timeout": 30, "cwd": "/root", "host_cwd": None,
+            "modal_mode": "auto", "docker_image": "", "singularity_image": "",
+            "modal_image": "", "daytona_image": "",
+        }
+        monkeypatch.setattr(tt, "_get_env_config", lambda: config)
+        result = json.loads(tt.terminal_tool("echo hello"))
+        expected = ("/root/.hermes/cache/terminal-output/output.log"
+                    if backend == "docker" else str(spill))
+        assert result.get("full_output_path") == expected, result
+        assert expected in result["truncation_note"]
+        assert spill.read_text() == "complete output"

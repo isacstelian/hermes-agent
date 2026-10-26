@@ -109,3 +109,17 @@ class _AsyncTrue:
     """Async callable that always returns True (re-awaitable per call)."""
     async def __call__(self, *a, **k):
         return True
+
+
+def test_sandbox_web_footer_preserves_full_text(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    body = "\n".join(f"row {i}" for i in range(1000))
+    for backend in ("local", "singularity", "docker"):
+        monkeypatch.setenv("TERMINAL_ENV", backend)
+        out, truncated = wt._truncate_with_footer(body, "https://example.com/doc", 300)
+        host_path = next((tmp_path / "cache/web").iterdir())
+        expected = (f"/root/.hermes/cache/web/{host_path.name}"
+                    if backend == "docker" else str(host_path))
+        assert truncated
+        assert f"Full text saved to: {expected}" in out
+        assert host_path.read_text() == body

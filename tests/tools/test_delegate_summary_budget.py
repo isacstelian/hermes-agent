@@ -9,6 +9,7 @@ full summaries verbatim into the parent.
 
 import os
 import tempfile
+from pathlib import Path
 
 import pytest
 
@@ -76,3 +77,18 @@ def test_empty_results_is_noop():
         [{"task_index": 0, "status": "failed", "summary": None}],
         _FakeParent(131_000, 1_000, 8_000),
     )
+
+
+def test_sandbox_summary_footer(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    body = "head\n" + "x" * 2000 + "\ntail"
+    for backend in ("local", "singularity", "docker"):
+        monkeypatch.setenv("TERMINAL_ENV", backend)
+        out, spill_path = dt._trim_summary_with_footer(body, 300, 0)
+        if backend == "docker":
+            assert spill_path.startswith("/root/.hermes/cache/delegation/")
+            host_path = tmp_path / "cache/delegation" / spill_path.rsplit("/", 1)[-1]
+        else:
+            host_path = Path(spill_path)
+        assert host_path.read_text() == body
+        assert f'read_file path="{spill_path}"' in out

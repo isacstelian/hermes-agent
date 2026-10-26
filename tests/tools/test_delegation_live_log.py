@@ -300,3 +300,39 @@ def test_benign_transcript_content_is_untouched():
     assert "src/parser.py" in body
     assert "def parse(x)" in body
     assert "refactor the parser" in body
+
+
+def test_sandbox_dispatch_transcripts(tmp_path, monkeypatch):
+    import tools.delegate_tool as dt
+    import tools.async_delegation as ad
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(dt, "_build_child_agent", lambda **kw: MagicMock())
+    monkeypatch.setattr(dt, "_run_single_child", _fake_run)
+    monkeypatch.setattr(dt, "_resolve_delegation_credentials", lambda *a, **kw: _CREDS)
+    monkeypatch.setattr(ad, "dispatch_async_delegation_batch", lambda **kw: {
+        "status": "dispatched", "delegation_id": "deleg_test",
+    })
+    from gateway.session_context import set_session_vars
+    set_session_vars(platform="telegram", session_key="test-session", async_delivery=True)
+    try:
+        for backend in ("local", "docker"):
+            monkeypatch.setenv("TERMINAL_ENV", backend)
+            for background in (False, True):
+                result = json.loads(dt.delegate_task(
+                    goal="Inspect the test fixture", background=background,
+                    parent_agent=_make_parent(),
+                ))
+                paths = result["live_transcripts"]
+                assert paths
+                for path in paths:
+                    if backend == "docker":
+                        assert path.startswith("/root/.hermes/cache/delegation/live/")
+                    else:
+                        assert Path(path).is_file()
+                if not background:
+                    assert result["results"][0]["live_transcript"] == paths[0]
+    finally:
+        import gateway.session_context as sc
+        for var in sc._VAR_MAP.values():
+            var.set(sc._UNSET)
+        sc._SESSION_ASYNC_DELIVERY.set(sc._UNSET)

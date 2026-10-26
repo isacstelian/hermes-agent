@@ -300,3 +300,22 @@ class TestCamofoxEvalFix:
         assert "json_data=" not in src, \
             "_camofox_eval should use body= kwarg for _post, not json_data="
         assert "body=" in src
+
+
+def test_sandbox_snapshot_footers(tmp_path, monkeypatch):
+    import tools.browser_tool as bt
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    body = "\n".join(f"button {i}" for i in range(1000))
+    monkeypatch.setattr(bt, "_get_extraction_model", lambda: None)
+    response = MagicMock()
+    response.choices[0].message.content = "Summary"
+    monkeypatch.setattr(bt, "_lazy_call_llm", lambda **kw: response)
+    for backend in ("local", "singularity", "docker"):
+        monkeypatch.setenv("TERMINAL_ENV", backend)
+        out = bt._truncate_snapshot(body, max_chars=300)
+        host_path = next((tmp_path / "cache/web").glob("browser-snapshot-*.txt"))
+        expected = (f"/root/.hermes/cache/web/{host_path.name}"
+                    if backend == "docker" else str(host_path))
+        assert f'read_file path="{expected}"' in out
+        assert f"saved to: {expected}" in bt._extract_relevant_content(body)
+        assert host_path.read_text() == body
