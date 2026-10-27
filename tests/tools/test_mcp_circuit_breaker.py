@@ -12,7 +12,7 @@ half-open / cooldown / reconnect-resets-breaker behavior that fixes
 that.
 """
 import json
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -99,6 +99,101 @@ def _cleanup(mcp_tool_module, name: str) -> None:
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
+
+def test_tool_errors_do_not_open_circuit_breaker(monkeypatch, tmp_path):
+    """Application refusals prove the server is reachable and preserve its error."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from mcp.types import CallToolResult, TextContent
+    from tools import mcp_tool
+
+    error_text = "Cerere invalidă: identity_required"
+    call_tool = AsyncMock(return_value=CallToolResult(
+        isError=True, content=[TextContent(type="text", text=error_text)],
+    ))
+    _install_stub_server(mcp_tool, "srv", call_tool)
+    mcp_tool._ensure_mcp_loop()
+
+    try:
+        handler = mcp_tool._make_tool_handler("srv", "tool1", 10.0)
+        results = [json.loads(handler({})) for _ in range(5)]
+
+        assert call_tool.await_count == 5
+        assert results == [{"error": error_text}] * 5
+        assert mcp_tool._server_error_counts.get("srv", 0) == 0
+        assert "srv" not in mcp_tool._server_breaker_opened_at
+    finally:
+        _cleanup(mcp_tool, "srv")
+
+
+def test_transport_errors_open_circuit_breaker(monkeypatch, tmp_path):
+    """Three transport failures still block the next call during cooldown."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from tools import mcp_tool
+
+    call_tool = AsyncMock(side_effect=RuntimeError("transport unavailable"))
+    _install_stub_server(mcp_tool, "srv", call_tool)
+    mcp_tool._ensure_mcp_loop()
+
+    try:
+        handler = mcp_tool._make_tool_handler("srv", "tool1", 10.0)
+        for _ in range(3):
+            parsed = json.loads(handler({}))
+            assert parsed == {
+                "error": "MCP call failed: RuntimeError: transport unavailable",
+            }
+
+        assert mcp_tool._server_error_counts["srv"] == 3
+        assert "srv" in mcp_tool._server_breaker_opened_at
+        parsed = json.loads(handler({}))
+        assert "unreachable" in parsed["error"].lower()
+        assert call_tool.await_count == 3
+    finally:
+        _cleanup(mcp_tool, "srv")
+
+
+def test_tool_error_resets_consecutive_transport_errors(monkeypatch, tmp_path):
+    """A server refusal breaks a sequence of transport failures."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from mcp.types import CallToolResult, TextContent
+    from tools import mcp_tool
+
+    error_text = "identity_required"
+    call_tool = AsyncMock(side_effect=[
+        RuntimeError("transport unavailable"),
+        RuntimeError("transport unavailable"),
+        CallToolResult(
+            isError=True, content=[TextContent(type="text", text=error_text)],
+        ),
+        RuntimeError("transport unavailable"),
+    ])
+    _install_stub_server(mcp_tool, "srv", call_tool)
+    mcp_tool._ensure_mcp_loop()
+
+    try:
+        handler = mcp_tool._make_tool_handler("srv", "tool1", 10.0)
+        for _ in range(2):
+            parsed = json.loads(handler({}))
+            assert parsed == {
+                "error": "MCP call failed: RuntimeError: transport unavailable",
+            }
+        assert mcp_tool._server_error_counts["srv"] == 2
+
+        assert json.loads(handler({})) == {"error": error_text}
+        assert mcp_tool._server_error_counts.get("srv", 0) == 0
+
+        parsed = json.loads(handler({}))
+        assert parsed == {
+            "error": "MCP call failed: RuntimeError: transport unavailable",
+        }
+        assert call_tool.await_count == 4
+        assert mcp_tool._server_error_counts["srv"] == 1
+        assert "srv" not in mcp_tool._server_breaker_opened_at
+    finally:
+        _cleanup(mcp_tool, "srv")
 
 
 def test_circuit_breaker_half_opens_after_cooldown(monkeypatch, tmp_path):

@@ -4630,7 +4630,10 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                     "error": f"MCP server '{server_name}' is not connected"
                 }, ensure_ascii=False)
 
+        tool_returned_error = False
+
         async def _call():
+            nonlocal tool_returned_error
             _mark_server_call_started(server)
             async with server._rpc_lock:
                 # Snapshot the agent's context so an elicitation callback
@@ -4671,6 +4674,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 _mark_proven()
             # MCP CallToolResult has .content (list of content blocks) and .isError
             if result.isError:
+                tool_returned_error = True
                 error_text = ""
                 for block in (result.content or []):
                     if getattr(block, "text", None):
@@ -4756,10 +4760,10 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
 
         try:
             result = _call_once()
-            # Check if the MCP tool itself returned an error
+            # Server refusals prove reachability; only Hermes errors count.
             try:
                 parsed = json.loads(result)
-                if "error" in parsed:
+                if not tool_returned_error and "error" in parsed:
                     _bump_server_error(server_name)
                 else:
                     _reset_server_error(server_name)  # success — reset
