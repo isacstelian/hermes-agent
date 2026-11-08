@@ -349,6 +349,8 @@ class MediaRetryMixin:
         return manager
 
     def _adopt_media_retries(self):
+        if not _owners:
+            return
         # Some unit callers mark connected without an event loop.
         try:
             manager = _owners.get(self._media_retry_key())
