@@ -120,6 +120,7 @@ class VoiceRetry:
     metadata: object
     arrived: float
     error: Exception
+    caption: object = None
     gave_up: bool = False
     task: object = None
 
@@ -240,7 +241,7 @@ class MediaRetries:
         finally:
             self.incoming.pop(key, None)
 
-    def schedule_voice(self, chat_id, audio_path, reply_to, metadata, arrived, error):
+    def schedule_voice(self, chat_id, audio_path, reply_to, metadata, arrived, error, caption=None):
         # Auto-TTS callers unlink their output in finally after send_voice returns.
         # Own a separate copy until delivery/give-up, keeping the original suffix
         # so sendVoice vs sendAudio routing is unchanged.
@@ -254,7 +255,9 @@ class MediaRetries:
         except Exception:
             self.remove_voice_file(path)
             raise
-        state = VoiceRetry(chat_id, path, reply_to, dict(metadata) if metadata else None, arrived, error)
+        state = VoiceRetry(
+            chat_id, path, reply_to, dict(metadata) if metadata else None, arrived, error, caption=caption,
+        )
         self.voices[path] = state
         _owners[self.adapter._media_retry_key()] = self
         state.task = asyncio.create_task(self.run_voice(state))
@@ -289,7 +292,7 @@ class MediaRetries:
                     break
                 try:
                     result = await adapter.send_voice(
-                        state.chat_id, str(state.path), reply_to=state.reply_to,
+                        state.chat_id, str(state.path), caption=state.caption, reply_to=state.reply_to,
                         metadata=state.metadata, _media_retry=True,
                     )
                     if result.success:

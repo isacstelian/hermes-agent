@@ -7762,17 +7762,20 @@ class TelegramAdapter(MediaRetryMixin, BasePlatformAdapter):
                     os.path.splitext(audio_path)[1].lower() in {".ogg", ".opus", ".mp3", ".m4a"}):
                 # A TimedOut upload may already have reached Telegram. A duplicate
                 # voice bubble is preferable to silently losing the reply.
-                self._media_retry_manager().schedule_voice(
-                    chat_id, audio_path, reply_to, metadata, arrived, e,
-                )
+                retry_caption = caption
                 if caption:
                     try:
-                        await self.send(chat_id, caption, reply_to=reply_to, metadata=metadata)
+                        caption_result = await self.send(chat_id, caption, reply_to=reply_to, metadata=metadata)
+                        if caption_result.success:
+                            retry_caption = None
                     except Exception as caption_error:
                         logger.warning(
                             "[Telegram] voice-retry caption send failed: %s",
                             _redact_telegram_error_text(caption_error),
                         )
+                self._media_retry_manager().schedule_voice(
+                    chat_id, audio_path, reply_to, metadata, arrived, e, caption=retry_caption,
+                )
                 return SendResult(
                     success=True, message_id=None,
                     raw_response={"voice_retry_scheduled": True},
