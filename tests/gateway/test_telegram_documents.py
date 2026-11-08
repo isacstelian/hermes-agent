@@ -112,8 +112,17 @@ def _make_message(document=None, caption=None, media_group_id=None, photo=None):
     return msg
 
 
+_file_sources = {}
+
+
 def _make_update(msg):
     """Wrap a message in a mock Update."""
+    media = msg.photo[-1] if msg.photo else next(
+        (item for item in (msg.voice, msg.audio, msg.video, msg.document) if item), None
+    )
+    if media is not None:
+        media.file_id = f"file-{id(media)}"
+        _file_sources[media.file_id] = media
     update = MagicMock()
     update.message = msg
     return update
@@ -133,6 +142,10 @@ def _make_video(file_obj=None):
 def adapter():
     config = PlatformConfig(enabled=True, token="fake-token")
     a = TelegramAdapter(config)
+    _file_sources.clear()
+    async def get_file(file_id):
+        return await _file_sources[file_id].get_file()
+    a._bot = SimpleNamespace(get_file=AsyncMock(side_effect=get_file))
     # Capture events instead of processing them
     a.handle_message = AsyncMock()
     # After PR #28494 made the empty-allowlist callback auth fail-closed

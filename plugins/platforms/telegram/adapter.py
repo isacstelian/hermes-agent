@@ -35,6 +35,8 @@ def _redact_telegram_error_text(error: object) -> str:
     try:
         from agent.redact import redact_sensitive_text
 
+        # Telegram file URLs contain both the credential and a private path.
+        text = re.sub(r"https?://[^\s<>\"']+/file/[^\s<>\"']+", "<telegram file URL redacted>", text)
         return redact_sensitive_text(text, force=True)
     except Exception:
         return "<telegram error redacted>"
@@ -312,6 +314,7 @@ from plugins.platforms.telegram.telegram_network import (
     discover_fallback_ips,
     parse_fallback_ip_env,
 )
+from plugins.platforms.telegram.media_retry import MediaRetryMixin
 from utils import env_float, env_int
 
 _TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
@@ -639,7 +642,7 @@ class _PollingLifecycleAbort(RuntimeError):
     """Internal control flow for polling startup fenced by teardown."""
 
 
-class TelegramAdapter(BasePlatformAdapter):
+class TelegramAdapter(MediaRetryMixin, BasePlatformAdapter):
     """
     Telegram bot adapter.
 
@@ -935,6 +938,7 @@ class TelegramAdapter(BasePlatformAdapter):
         self._post_connect_task: Optional[asyncio.Task] = None
 
     def _mark_connected(self) -> None:
+        self._adopt_media_retries()
         self._drop_delayed_deliveries = False
         super()._mark_connected()
         # Drain anything held while we were down. PTB will not redeliver —
@@ -4975,6 +4979,13 @@ class TelegramAdapter(BasePlatformAdapter):
         # Mark disconnected first so the drop guard short-circuits any flush
         # that wins the race against teardown and prevents new delayed tasks
         # from being scheduled by late update handlers.
+        # Retryable-fatal teardown feeds GatewayRunner's reconnect watcher.
+        # Media retries live outside polling/batch tasks and transfer to the
+        # next connected adapter. Normal disconnect is gateway shutdown.
+        manager = getattr(self, "_media_retries", None)
+        if manager is not None and manager.adapter is self:
+            if not (self.has_fatal_error and self.fatal_error_retryable):
+                await manager.shutdown()
         self._mark_disconnected()
         self._polling_teardown_started = True
         self._polling_progress_accepting = False
@@ -7604,7 +7615,11 @@ class TelegramAdapter(BasePlatformAdapter):
         **kwargs,
     ) -> SendResult:
         """Send audio as a native Telegram voice message or audio file."""
+        retrying = kwargs.pop("_media_retry", False)
+        arrived = self._media_retry_now()
         if not self._bot:
+            if retrying:
+                raise ConnectionError("Telegram reconnecting")
             return SendResult(success=False, error="Not connected")
         
         try:
@@ -7737,6 +7752,34 @@ class TelegramAdapter(BasePlatformAdapter):
                     )
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
+            # The background loop owns give-up and must never recursively
+            # schedule work or emit the base adapter's failure notice.
+            if retrying:
+                raise
+            from plugins.platforms.telegram.media_retry import is_transient
+
+            if (is_transient(self, e) and
+                    os.path.splitext(audio_path)[1].lower() in {".ogg", ".opus", ".mp3", ".m4a"}):
+                # A TimedOut upload may already have reached Telegram. A duplicate
+                # voice bubble is preferable to silently losing the reply.
+                retry_caption = caption
+                if caption:
+                    try:
+                        caption_result = await self.send(chat_id, caption, reply_to=reply_to, metadata=metadata)
+                        if caption_result.success:
+                            retry_caption = None
+                    except Exception as caption_error:
+                        logger.warning(
+                            "[Telegram] voice-retry caption send failed: %s",
+                            _redact_telegram_error_text(caption_error),
+                        )
+                self._media_retry_manager().schedule_voice(
+                    chat_id, audio_path, reply_to, metadata, arrived, e, caption=retry_caption,
+                )
+                return SendResult(
+                    success=True, message_id=None,
+                    raw_response={"voice_retry_scheduled": True},
+                )
             logger.error(
                 "[%s] Failed to send Telegram voice/audio, falling back to base adapter: %s",
                 self.name,
@@ -10384,13 +10427,20 @@ class TelegramAdapter(BasePlatformAdapter):
         # because _handle_sticker overwrites event.text with its vision description.
         event = self._apply_telegram_group_observe_attribution(event)
 
+        # Deduplicate repeated updates while the original file is pending.
+        manager = getattr(self, "_media_retries", None)
+        if manager is not None and (event.source.chat_id, event.message_id) in manager.incoming:
+            return
+        await self._cache_and_dispatch_media(msg, event, arrived=self._media_retry_now())
+
+    async def _cache_and_dispatch_media(self, msg, event, *, arrived=None, retry=None):
         # Download photo to local image cache so the vision tool can access it
         # even after Telegram's ephemeral file URLs expire (~1 hour).
         if msg.photo:
             try:
                 # msg.photo is a list of PhotoSize sorted by size; take the largest
                 photo = msg.photo[-1]
-                file_obj = await photo.get_file()
+                file_obj = await self._get_current_media_file(photo)
                 # Download the image bytes directly into memory
                 image_bytes = await file_obj.download_as_bytearray()
                 # Determine extension from the file path if available
@@ -10404,6 +10454,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 cached_path = cache_image_from_bytes(bytes(image_bytes), ext=ext)
                 event.media_urls = [cached_path]
                 event.media_types = [f"image/{ext.lstrip('.')}" ]
+                self._note_media_retry_delivery(event, retry)
                 logger.info("[Telegram] Cached user photo at %s", cached_path)
                 media_group_id = getattr(msg, "media_group_id", None)
                 if media_group_id:
@@ -10414,6 +10465,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 return
 
             except Exception as e:
+                if self._defer_media_failure(msg, event, "photo", e, arrived, retry):
+                    return
                 logger.warning("[Telegram] Failed to cache photo: %s", _redact_telegram_error_text(e), exc_info=True)
                 await self._surface_media_cache_failure(msg, event, "photo", e)
 
@@ -10426,13 +10479,15 @@ class TelegramAdapter(BasePlatformAdapter):
                     logger.info("[Telegram] Skipped oversized user voice (size=%s)", getattr(msg.voice, "file_size", None))
                     await self.handle_message(event)
                     return
-                file_obj = await msg.voice.get_file()
+                file_obj = await self._get_current_media_file(msg.voice)
                 audio_bytes = await file_obj.download_as_bytearray()
                 cached_path = cache_audio_from_bytes(bytes(audio_bytes), ext=".ogg")
                 event.media_urls = [cached_path]
                 event.media_types = ["audio/ogg"]
                 logger.info("[Telegram] Cached user voice at %s", cached_path)
             except Exception as e:
+                if self._defer_media_failure(msg, event, "voice", e, arrived, retry):
+                    return
                 logger.warning("[Telegram] Failed to cache voice: %s", _redact_telegram_error_text(e), exc_info=True)
                 await self._surface_media_cache_failure(msg, event, "voice message", e)
         elif msg.audio:
@@ -10443,13 +10498,15 @@ class TelegramAdapter(BasePlatformAdapter):
                     logger.info("[Telegram] Skipped oversized user audio (size=%s)", getattr(msg.audio, "file_size", None))
                     await self.handle_message(event)
                     return
-                file_obj = await msg.audio.get_file()
+                file_obj = await self._get_current_media_file(msg.audio)
                 audio_bytes = await file_obj.download_as_bytearray()
                 cached_path = cache_audio_from_bytes(bytes(audio_bytes), ext=".mp3")
                 event.media_urls = [cached_path]
                 event.media_types = ["audio/mp3"]
                 logger.info("[Telegram] Cached user audio at %s", cached_path)
             except Exception as e:
+                if self._defer_media_failure(msg, event, "audio", e, arrived, retry):
+                    return
                 logger.warning("[Telegram] Failed to cache audio: %s", _redact_telegram_error_text(e), exc_info=True)
                 await self._surface_media_cache_failure(msg, event, "audio file", e)
 
@@ -10461,7 +10518,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     logger.info("[Telegram] Skipped oversized user video (size=%s)", getattr(msg.video, "file_size", None))
                     await self.handle_message(event)
                     return
-                file_obj = await msg.video.get_file()
+                file_obj = await self._get_current_media_file(msg.video)
                 video_bytes = await file_obj.download_as_bytearray()
                 ext = ".mp4"
                 if getattr(file_obj, "file_path", None):
@@ -10474,6 +10531,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 event.media_types = [SUPPORTED_VIDEO_TYPES.get(ext, "video/mp4")]
                 logger.info("[Telegram] Cached user video at %s", cached_path)
             except Exception as e:
+                if self._defer_media_failure(msg, event, "video", e, arrived, retry):
+                    return
                 logger.warning("[Telegram] Failed to cache video: %s", _redact_telegram_error_text(e), exc_info=True)
                 await self._surface_media_cache_failure(msg, event, "video file", e)
 
@@ -10515,7 +10574,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 # payload is actually an image, route it through the image cache
                 # and batching path instead of rejecting it as a document.
                 if ext in _TELEGRAM_IMAGE_EXTENSIONS or doc_mime.startswith("image/"):
-                    file_obj = await doc.get_file()
+                    file_obj = await self._get_current_media_file(doc)
                     image_bytes = await file_obj.download_as_bytearray()
                     image_ext = ext if ext in _TELEGRAM_IMAGE_EXTENSIONS else _TELEGRAM_IMAGE_MIME_TO_EXT.get(doc_mime, ".jpg")
                     try:
@@ -10532,6 +10591,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     event.message_type = MessageType.PHOTO
                     event.media_urls = [cached_path]
                     event.media_types = [doc_mime if doc_mime.startswith("image/") else _TELEGRAM_IMAGE_EXT_TO_MIME.get(image_ext, "image/jpeg")]
+                    self._note_media_retry_delivery(event, retry)
                     logger.info("[Telegram] Cached user image-document at %s", cached_path)
 
                     media_group_id = getattr(msg, "media_group_id", None)
@@ -10555,12 +10615,13 @@ class TelegramAdapter(BasePlatformAdapter):
                     ext = image_mime_to_ext.get(doc.mime_type, "")
 
                 if ext in SUPPORTED_VIDEO_TYPES:
-                    file_obj = await doc.get_file()
+                    file_obj = await self._get_current_media_file(doc)
                     video_bytes = await file_obj.download_as_bytearray()
                     cached_path = cache_video_from_bytes(bytes(video_bytes), ext=ext)
                     event.media_urls = [cached_path]
                     event.media_types = [SUPPORTED_VIDEO_TYPES[ext]]
                     event.message_type = MessageType.VIDEO
+                    self._note_media_retry_delivery(event, retry)
                     logger.info("[Telegram] Cached user video document at %s", cached_path)
                     await self.handle_message(event)
                     return
@@ -10575,7 +10636,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 # to message the agent is the gate, not the file extension.
                 # Known types keep their precise MIME; unknown types are tagged
                 # application/octet-stream so the agent reaches for terminal tools.
-                file_obj = await doc.get_file()
+                file_obj = await self._get_current_media_file(doc)
                 doc_bytes = await file_obj.download_as_bytearray()
                 raw_bytes = bytes(doc_bytes)
                 from gateway.platforms.base import cache_media_bytes
@@ -10626,12 +10687,15 @@ class TelegramAdapter(BasePlatformAdapter):
                         pass
 
             except Exception as e:
+                if self._defer_media_failure(msg, event, "document", e, arrived, retry):
+                    return
                 logger.warning("[Telegram] Failed to cache document: %s", _redact_telegram_error_text(e), exc_info=True)
                 await self._surface_media_cache_failure(
                     msg, event, "attachment", e,
                     display_name=getattr(doc, "file_name", None) or None,
                 )
 
+        self._note_media_retry_delivery(event, retry)
         media_group_id = getattr(msg, "media_group_id", None)
         if media_group_id:
             await self._queue_media_group_event(str(media_group_id), event)
