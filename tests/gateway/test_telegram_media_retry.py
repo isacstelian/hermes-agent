@@ -231,3 +231,123 @@ async def test_bad_request_keeps_immediate_failure_behavior(rig):
     adapter._bot.send_message.assert_awaited_once()
     assert "Couldn't download your voice message" in adapter._bot.send_message.await_args.kwargs["text"]
     adapter.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_marks_each_pending_message_lost_once_without_notice(rig, caplog):
+    adapter, clock = rig
+    adapter._bot.get_file.side_effect = TimedOut()
+    await receive(adapter, message(adapter._bot, message_id=42))
+    await receive(adapter, message(adapter._bot, message_id=43))
+    await receive(adapter, message(adapter._bot, message_id=42))
+    await clock.advance(5)
+    await adapter.disconnect()
+    await adapter.disconnect()
+    assert len(lost_lines(caplog)) == 2
+    assert all(line.endswith("reason=shutdown") for line in lost_lines(caplog))
+    adapter.send.assert_not_awaited()
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_pending_download_transfers_to_new_connected_adapter(rig):
+    adapter, clock = rig
+    adapter._bot.get_file.side_effect = TimedOut()
+    await receive(adapter, message(adapter._bot))
+    adapter._set_fatal_error("network", "Timed out", retryable=True)
+    await adapter.disconnect()
+    replacement = TelegramAdapter(adapter.config)
+    replacement._bot = make_bot()
+    replacement._media_retry_now = lambda: clock.now
+    replacement._media_retry_sleep = clock.sleep
+    replacement.handle_message = AsyncMock()
+    replacement._mark_connected()
+    try:
+        await clock.advance(30)
+        assert_voice(replacement)
+        adapter.handle_message.assert_not_awaited()
+        replacement._bot.get_file.assert_awaited_with("file-42")
+    finally:
+        await replacement.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_t2_stops_after_four_failed_sends(rig, caplog):
+    adapter, clock = rig
+    adapter._bot.get_file.side_effect = TimedOut()
+    adapter.send.return_value = SendResult(success=False, error="Timed out")
+    await receive(adapter, message(adapter._bot))
+    await clock.advance(45 * 60)
+    count = adapter.send.await_count
+    assert sum("Nu reușesc" in c.args[1] for c in adapter.send.await_args_list) == 4
+    await clock.advance(60 * 60)
+    assert adapter.send.await_count == count
+    assert len(lost_lines(caplog)) == 1
+
+
+@pytest.mark.asyncio
+async def test_retry_after_respects_server_delay(rig):
+    adapter, clock = rig
+    adapter._bot.get_file.side_effect = [RetryAfter(40), adapter._bot.get_file.return_value]
+    await receive(adapter, message(adapter._bot))
+    await clock.advance(39)
+    assert adapter._bot.get_file.await_count == 1
+    adapter.handle_message.assert_not_awaited()
+    await clock.advance(1)
+    assert_voice(adapter)
+    adapter.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["audio", "video", "document", "photo", "image_document"])
+@pytest.mark.parametrize("album", [False, True])
+async def test_all_media_kinds_recover_through_original_dispatch(rig, kind, album):
+    import io
+    from PIL import Image
+
+    adapter, clock = rig
+    image = io.BytesIO()
+    Image.new("RGB", (2, 2), "red").save(image, format="PNG")
+    data = image.getvalue() if kind in {"photo", "image_document"} else b"media-data"
+    adapter._bot.get_file.return_value.file_path = "file.png" if kind == "photo" else "file.mp4"
+    adapter._bot.get_file.return_value.download_as_bytearray.side_effect = [TimedOut(), bytearray(data)]
+    msg = message(adapter._bot, "document" if kind == "image_document" else kind,
+                  caption="Caption", **({"media_group_id": "album-1"} if album else {}))
+    if kind == "image_document":
+        msg = Message.de_json({**msg.to_dict(), "document": {
+            "file_id": "file-42", "file_unique_id": "unique-42", "file_size": len(data),
+            "file_name": "photo.png", "mime_type": "image/png",
+        }}, adapter._bot)
+    adapter._media_batch_delay_seconds = 0
+    adapter.MEDIA_GROUP_WAIT_SECONDS = 0
+    await receive(adapter, msg)
+    await clock.advance(30)
+    for _ in range(10):
+        await asyncio.sleep(0)
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == "Caption"
+    assert len(event.media_urls) == 1
+    assert Path(event.media_urls[0]).exists()
+    assert event.media_types[0].startswith({
+        "audio": "audio/", "video": "video/", "document": "application/",
+        "photo": "image/", "image_document": "image/",
+    }[kind])
+    adapter.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_notices_keep_original_reply_and_dm_topic_metadata(rig):
+    adapter, clock = rig
+    adapter._bot.get_file.side_effect = TimedOut()
+    msg = message(adapter._bot, message_thread_id=77, is_topic_message=True)
+    await receive(adapter, msg)
+    await clock.advance(35 * 60)
+    assert adapter.send.await_count == 2
+    for call in adapter.send.await_args_list:
+        assert call.args[0] == "100"
+        assert call.kwargs["reply_to"] == "42"
+        metadata = call.kwargs["metadata"]
+        assert metadata["thread_id"] == "77"
+        assert metadata["telegram_reply_to_message_id"] == "42"
+        assert metadata["direct_messages_topic_id"] == "77"
