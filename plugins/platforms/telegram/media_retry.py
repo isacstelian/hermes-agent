@@ -69,6 +69,9 @@ def is_transient(adapter, error):
         return True
     if error.__class__.__name__ == "RetryAfter":
         return True
+    # PTB can close its request pool before the adapter clears/replaces _bot.
+    if isinstance(error, RuntimeError) and "not initialized" in str(error).lower():
+        return True
     # BadRequest inherits NetworkError in PTB; exclude semantic errors before
     # inspecting transport messages/statuses, even if they mention a 5xx.
     if adapter._is_bad_request_error(error) or error.__class__.__name__ in {
@@ -200,6 +203,8 @@ class MediaRetries:
                     await adapter._cache_and_dispatch_media(state.message, state.event, retry=state)
                 except Exception as error:
                     if not is_transient(adapter, error):
+                        if state.t1_sent:
+                            break
                         raise
                     state.error = error
                     if (not state.t1_sent and
@@ -369,6 +374,9 @@ class MediaRetryMixin:
         return await self._bot.get_file(media.file_id)
 
     def _defer_media_failure(self, msg, event, kind, error, arrived, retry):
+        # After T1's automatic-recovery promise, only T2 may ask for a resend.
+        if retry is not None and retry.t1_sent:
+            raise error
         if not is_transient(self, error):
             return False
         if retry is not None:
