@@ -3,7 +3,6 @@
 import asyncio
 import logging
 import sys
-from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -37,6 +36,11 @@ class Clock:
         end = self.now + seconds
         for _ in range(2000):
             # Let I/O-free handler tasks reach their next clock boundary.
+            for _ in range(10):
+                await asyncio.sleep(0)
+            # Flush the real executor used by duration probing before moving
+            # virtual time; no wall-clock timing assumption under gate load.
+            await asyncio.to_thread(lambda: None)
             for _ in range(10):
                 await asyncio.sleep(0)
             waiting = [(at, f) for at, f in self.waiters if not f.done()]
@@ -148,17 +152,21 @@ async def test_outgoing_timeout_then_delivers_without_failure_notice(rig, tmp_pa
 async def test_outage_35_minutes_notices_once_and_one_lost_marker(rig, caplog):
     adapter, clock = rig
     adapter._bot.get_file.side_effect = TimedOut()
+    delivered = []
     async def send(*args, **kwargs):
         if clock.now < 180:
             return SendResult(success=False, error="Timed out")
+        delivered.append(args[1])
         return SendResult(success=True, message_id="notice")
     adapter.send.side_effect = send
     with caplog.at_level(logging.INFO):
         await receive(adapter, message(adapter._bot))
         await clock.advance(35 * 60)
-    sent = [c for c in adapter.send.await_args_list if c.args[1].startswith("Telegram are") and c]
+    sent = [c for c in adapter.send.await_args_list if c.args[1].startswith("Telegram are")]
     # The first T1 attempt fails; only its later successful delivery counts.
     assert len(sent) == 2
+    assert sum(text.startswith("Telegram are") for text in delivered) == 1
+    assert sum(text.startswith("Nu reușesc") for text in delivered) == 1
     texts = [c.args[1] for c in adapter.send.await_args_list]
     assert sum("Nu reușesc" in text for text in texts) == 1
     assert all("Couldn't" not in text for text in texts)
@@ -351,3 +359,136 @@ async def test_notices_keep_original_reply_and_dm_topic_metadata(rig):
         assert metadata["thread_id"] == "77"
         assert metadata["telegram_reply_to_message_id"] == "42"
         assert metadata["direct_messages_topic_id"] == "77"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("suffix,method", [(".ogg", "send_voice"), (".opus", "send_voice"),
+                                           (".mp3", "send_audio"), (".m4a", "send_audio")])
+async def test_outgoing_caption_arrives_now_and_retry_owns_file(rig, tmp_path, suffix, method):
+    adapter, clock = rig
+    audio = tmp_path / ("speech" + suffix)
+    audio.write_bytes(b"ogg-data")
+    uploads = getattr(adapter._bot, method)
+    contents = []
+    async def upload(**kwargs):
+        stream = kwargs["voice" if method == "send_voice" else "audio"]
+        contents.append(stream.read())
+        if len(contents) == 1:
+            raise TimedOut()
+        assert kwargs["caption"] is None
+        assert kwargs["message_thread_id"] == 77
+        return SimpleNamespace(message_id=103)
+    uploads.side_effect = upload
+    metadata = {"thread_id": "77"}
+    result = await adapter.send_voice("100", str(audio), caption="Răspuns", reply_to="42", metadata=metadata)
+    assert result.success
+    adapter.send.assert_awaited_once_with("100", "Răspuns", reply_to="42", metadata=metadata)
+    copies = list((adapter._hermes_home / "cache" / "voice-retry").iterdir())
+    assert len(copies) == 1
+    assert copies[0].read_bytes() == b"ogg-data"
+    audio.unlink()
+    await clock.advance(30)
+    assert contents == [b"ogg-data", b"ogg-data"]
+    assert not copies[0].exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shutdown", [False, True])
+async def test_outgoing_give_up_removes_copy_without_human_notice(rig, tmp_path, caplog, shutdown):
+    adapter, clock = rig
+    audio = tmp_path / "speech.ogg"
+    audio.write_bytes(b"ogg-data")
+    adapter._bot.send_voice.side_effect = TimedOut()
+    result = await adapter.send_voice("100", str(audio))
+    assert result.success
+    copies = list((adapter._hermes_home / "cache" / "voice-retry").iterdir())
+    if shutdown:
+        await adapter.disconnect()
+    else:
+        await clock.advance(35 * 60)
+    assert all(not path.exists() for path in copies)
+    assert sum("voice-retry gave up" in r.getMessage() for r in caplog.records) == 1
+    assert not lost_lines(caplog)
+    adapter.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_outgoing_bad_request_still_uses_base_notice(rig, tmp_path):
+    adapter, clock = rig
+    audio = tmp_path / "speech.ogg"
+    audio.write_bytes(b"ogg-data")
+    adapter._bot.send_voice.side_effect = BadRequest("Unsupported audio")
+    await adapter.send_voice("100", str(audio))
+    await clock.advance(30)
+    assert adapter._bot.send_voice.await_count == 1
+    assert "Couldn't deliver the audio attachment" in adapter.send.await_args.kwargs["content"]
+
+
+@pytest.mark.asyncio
+async def test_outgoing_pending_upload_uses_new_bot(rig, tmp_path):
+    adapter, clock = rig
+    audio = tmp_path / "speech.ogg"
+    audio.write_bytes(b"ogg-data")
+    old = adapter._bot
+    old.send_voice.side_effect = TimedOut()
+    await adapter.send_voice("100", str(audio))
+    adapter._bot = None
+    await clock.advance(6)
+    adapter._bot = make_bot()
+    await clock.advance(30)
+    adapter._bot.send_voice.assert_awaited_once()
+    old.send_voice.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_gateway_shutdown_cancels_even_retryable_fatal_adapter(rig, caplog):
+    adapter, clock = rig
+    adapter._bot.get_file.side_effect = TimedOut()
+    await receive(adapter, message(adapter._bot))
+    adapter._set_fatal_error("network", "Timed out", retryable=True)
+    await adapter.cancel_background_tasks()
+    await adapter.disconnect()
+    await clock.advance(3600)
+    assert len(lost_lines(caplog)) == 1
+    assert lost_lines(caplog)[0].endswith("reason=shutdown")
+    adapter.send.assert_not_awaited()
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_kind", ["connect", "read", "protocol", "os", "502"])
+async def test_transport_errors_recover_without_notices(rig, error_kind):
+    import httpx
+
+    adapter, clock = rig
+    error = {
+        "connect": httpx.ConnectError("connection lost"),
+        "read": httpx.ReadTimeout("read failed"),
+        "protocol": httpx.RemoteProtocolError("connection closed"),
+        "os": OSError("network unavailable"),
+        "502": RuntimeError("Bad Gateway (502)"),
+    }[error_kind]
+    adapter._bot.get_file.side_effect = [error, adapter._bot.get_file.return_value]
+    await receive(adapter, message(adapter._bot))
+    await clock.advance(30)
+    assert_voice(adapter)
+    adapter.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_notice_after_slow_initial_failure_and_log_redaction(rig, caplog):
+    adapter, clock = rig
+    secret = "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi"
+    original = adapter._bot.get_file.return_value
+    async def first_failure(*args, **kwargs):
+        clock.now = 125
+        raise TimedOut(f"https://api.telegram.org/file/bot{secret}/voice/file.ogg")
+    adapter._bot.get_file.side_effect = first_failure
+    await receive(adapter, message(adapter._bot))
+    adapter._bot.get_file.side_effect = None
+    adapter._bot.get_file.return_value = original
+    await clock.advance(30)
+    assert_voice(adapter)
+    adapter.send.assert_awaited_once()
+    assert secret not in caplog.text
+    assert "api.telegram.org/file/" not in caplog.text

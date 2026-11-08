@@ -35,6 +35,8 @@ def _redact_telegram_error_text(error: object) -> str:
     try:
         from agent.redact import redact_sensitive_text
 
+        # Telegram file URLs contain both the credential and a private path.
+        text = re.sub(r"https?://[^\s<>\"']+/file/[^\s<>\"']+", "<telegram file URL redacted>", text)
         return redact_sensitive_text(text, force=True)
     except Exception:
         return "<telegram error redacted>"
@@ -7613,7 +7615,11 @@ class TelegramAdapter(MediaRetryMixin, BasePlatformAdapter):
         **kwargs,
     ) -> SendResult:
         """Send audio as a native Telegram voice message or audio file."""
+        retrying = kwargs.pop("_media_retry", False)
+        arrived = self._media_retry_now()
         if not self._bot:
+            if retrying:
+                raise ConnectionError("Telegram reconnecting")
             return SendResult(success=False, error="Not connected")
         
         try:
@@ -7746,6 +7752,31 @@ class TelegramAdapter(MediaRetryMixin, BasePlatformAdapter):
                     )
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
+            # The background loop owns give-up and must never recursively
+            # schedule work or emit the base adapter's failure notice.
+            if retrying:
+                raise
+            from plugins.platforms.telegram.media_retry import is_transient
+
+            if (is_transient(self, e) and
+                    os.path.splitext(audio_path)[1].lower() in {".ogg", ".opus", ".mp3", ".m4a"}):
+                # A TimedOut upload may already have reached Telegram. A duplicate
+                # voice bubble is preferable to silently losing the reply.
+                self._media_retry_manager().schedule_voice(
+                    chat_id, audio_path, reply_to, metadata, arrived, e,
+                )
+                if caption:
+                    try:
+                        await self.send(chat_id, caption, reply_to=reply_to, metadata=metadata)
+                    except Exception as caption_error:
+                        logger.warning(
+                            "[Telegram] voice-retry caption send failed: %s",
+                            _redact_telegram_error_text(caption_error),
+                        )
+                return SendResult(
+                    success=True, message_id=None,
+                    raw_response={"voice_retry_scheduled": True},
+                )
             logger.error(
                 "[%s] Failed to send Telegram voice/audio, falling back to base adapter: %s",
                 self.name,

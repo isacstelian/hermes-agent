@@ -2,11 +2,15 @@
 
 import asyncio
 import logging
+import os
 import re
+import shutil
+import tempfile
 import time
 import weakref
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from gateway.platforms.base import _thread_metadata_for_source
@@ -108,10 +112,23 @@ class IncomingRetry:
     task: object = None
 
 
+@dataclass
+class VoiceRetry:
+    chat_id: str
+    path: Path
+    reply_to: object
+    metadata: object
+    arrived: float
+    error: Exception
+    gave_up: bool = False
+    task: object = None
+
+
 class MediaRetries:
     def __init__(self, adapter):
         self.adapter = adapter
         self.incoming = {}
+        self.voices = {}
 
     @property
     def logger(self):
@@ -223,19 +240,103 @@ class MediaRetries:
         finally:
             self.incoming.pop(key, None)
 
+    def schedule_voice(self, chat_id, audio_path, reply_to, metadata, arrived, error):
+        # Auto-TTS callers unlink their output in finally after send_voice returns.
+        # Own a separate copy until delivery/give-up, keeping the original suffix
+        # so sendVoice vs sendAudio routing is unchanged.
+        directory = self.adapter._hermes_home / "cache" / "voice-retry"
+        directory.mkdir(parents=True, exist_ok=True)
+        fd, filename = tempfile.mkstemp(suffix=Path(audio_path).suffix, dir=directory)
+        os.close(fd)
+        path = Path(filename)
+        try:
+            shutil.copyfile(audio_path, path)
+        except Exception:
+            self.remove_voice_file(path)
+            raise
+        state = VoiceRetry(chat_id, path, reply_to, dict(metadata) if metadata else None, arrived, error)
+        self.voices[path] = state
+        _owners[self.adapter._media_retry_key()] = self
+        state.task = asyncio.create_task(self.run_voice(state))
+
+    def remove_voice_file(self, path):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as error:
+            from .adapter import _redact_telegram_error_text
+
+            self.logger.warning("[Telegram] voice-retry cleanup failed: %s", _redact_telegram_error_text(error))
+
+    def log_voice_give_up(self, state):
+        if not state.gave_up:
+            state.gave_up = True
+            self.logger.warning(
+                "[Telegram] voice-retry gave up chat=%s after=%.0fs",
+                state.chat_id, self.adapter._media_retry_now() - state.arrived,
+            )
+
+    async def run_voice(self, state):
+        delay = MEDIA_RETRY_INITIAL_DELAY
+        deadline = state.arrived + MEDIA_RETRY_WINDOW
+        try:
+            while True:
+                remaining = deadline - self.adapter._media_retry_now()
+                if remaining <= 0:
+                    break
+                await self.adapter._media_retry_sleep(min(max(delay, retry_after(state.error)), remaining))
+                adapter = self.adapter
+                if adapter._media_retry_now() >= deadline:
+                    break
+                try:
+                    result = await adapter.send_voice(
+                        state.chat_id, str(state.path), reply_to=state.reply_to,
+                        metadata=state.metadata, _media_retry=True,
+                    )
+                    if result.success:
+                        return
+                    break
+                except Exception as error:
+                    if not is_transient(adapter, error):
+                        break
+                    state.error = error
+                delay = min(delay * 2, MEDIA_RETRY_MAX_DELAY)
+            self.log_voice_give_up(state)
+        except asyncio.CancelledError:
+            self.log_voice_give_up(state)
+            raise
+        finally:
+            self.remove_voice_file(state.path)
+            self.voices.pop(state.path, None)
+
     async def shutdown(self):
         tasks = []
         for state in list(self.incoming.values()):
             self.log_lost(state, "shutdown")
             state.task.cancel()
             tasks.append(state.task)
+        for state in list(self.voices.values()):
+            self.log_voice_give_up(state)
+            state.task.cancel()
+            tasks.append(state.task)
+            # Cancellation before the coroutine's first step skips its finally.
+            self.remove_voice_file(state.path)
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        self.incoming.clear()
+        self.voices.clear()
 
 
 class MediaRetryMixin:
     _media_retry_now = staticmethod(time.monotonic)
     _media_retry_sleep = staticmethod(asyncio.sleep)
+
+    async def cancel_background_tasks(self):
+        # GatewayRunner._bounded_adapter_teardown calls this on shutdown,
+        # unlike its retryable-fatal _safe_adapter_disconnect recovery path.
+        manager = getattr(self, "_media_retries", None)
+        if manager is not None and manager.adapter is self:
+            await manager.shutdown()
+        await super().cancel_background_tasks()
 
     def _media_retry_key(self):
         return (asyncio.get_running_loop(), self._hermes_home, self.config.token)
