@@ -48,8 +48,8 @@ MEDIA_RETRY_T2_DELAY = 200.0
 MEDIA_RETRY_T2_RETRIES = 3
 
 # A retryable-fatal disconnect removes the adapter from GatewayRunner; its
-# watcher creates a NEW adapter. Reattach pending work only when that adapter
-# becomes connected, scoped by event loop, profile home and bot credential.
+# watcher creates a NEW adapter. Reattach pending work when that adapter
+# retries or becomes connected, scoped by event loop, profile home and bot credential.
 # Weak values avoid retaining idle adapters or completed test loops.
 _owners = weakref.WeakValueDictionary()
 
@@ -350,10 +350,13 @@ class MediaRetryMixin:
         return (asyncio.get_running_loop(), self._hermes_home, self.config.token)
 
     def _media_retry_manager(self):
-        manager = getattr(self, "_media_retries", None)
+        manager = _owners.get(self._media_retry_key())
+        if manager is None:
+            manager = getattr(self, "_media_retries", None)
         if manager is None:
             manager = MediaRetries(self)
-            self._media_retries = manager
+        manager.adapter = self
+        self._media_retries = manager
         return manager
 
     def _adopt_media_retries(self):
