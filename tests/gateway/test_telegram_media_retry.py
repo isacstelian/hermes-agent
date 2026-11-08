@@ -676,3 +676,150 @@ async def test_replacement_failure_before_connected_keeps_both_pending_messages(
         assert not lost_lines(caplog)
     finally:
         await replacement.disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["upload", "download", "shutdown"])
+@pytest.mark.parametrize("error_kind", ["timeout", "closed_pool"])
+async def test_late_failure_on_old_adapter_keeps_replacement_owner(
+    rig, tmp_path, caplog, operation, error_kind,
+):
+    adapter, clock = rig
+    old_bot = adapter._bot
+    old_bot.get_file.side_effect = TimedOut()
+    await receive(adapter, message(old_bot, message_id=42))
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fail_after_reconnect(*args, **kwargs):
+        started.set()
+        await release.wait()
+        if error_kind == "closed_pool":
+            raise RuntimeError("This HTTPXRequest is not initialized!")
+        raise TimedOut()
+
+    if operation == "upload":
+        audio = tmp_path / "speech.ogg"
+        audio.write_bytes(b"ogg-data")
+        old_bot.send_voice.side_effect = fail_after_reconnect
+        adapter.send.return_value = SendResult(success=False, error="Not connected")
+        late = asyncio.create_task(adapter.send_voice("100", str(audio), caption="Răspuns"))
+    else:
+        old_bot.get_file.side_effect = fail_after_reconnect
+        late = asyncio.create_task(receive(adapter, message(old_bot, message_id=43)))
+    await started.wait()
+
+    adapter._set_fatal_error("network", "Timed out", retryable=True)
+    assert not adapter._running
+    await adapter.disconnect()
+    replacement = TelegramAdapter(adapter.config)
+    replacement._bot = make_bot()
+    replacement._is_user_authorized_from_message = lambda _: True
+    replacement._should_process_message = lambda _: True
+    replacement._media_retry_now = lambda: clock.now
+    replacement._media_retry_sleep = clock.sleep
+    replacement.handle_message = AsyncMock()
+    replacement.send = AsyncMock(return_value=SendResult(success=True, message_id="notice"))
+    replacement._mark_connected()
+    assert replacement._running
+    try:
+        release.set()
+        result = await late
+        if operation == "upload":
+            assert result.success
+            audio.unlink()
+        if operation == "shutdown":
+            # Teardown of A must not cancel work that B now owns.
+            await adapter.cancel_background_tasks()
+            assert not lost_lines(caplog)
+            await replacement.cancel_background_tasks()
+            await replacement.disconnect()
+            await clock.advance(35 * 60)
+            assert sorted(lost_lines(caplog)) == [
+                f"[Telegram] media-retry LOST kind=voice chat=100 message={message_id} "
+                "sent_at=2026-11-08T09:20:57Z reason=shutdown"
+                for message_id in (42, 43)
+            ]
+            replacement.handle_message.assert_not_awaited()
+        else:
+            await clock.advance(35 * 60)
+            events = [c.args[0] for c in replacement.handle_message.await_args_list]
+            assert sorted(e.message_id for e in events) == (
+                ["42"] if operation == "upload" else ["42", "43"]
+            )
+            assert all(e.media_types == ["audio/ogg"] for e in events)
+            assert all(Path(e.media_urls[0]).read_bytes() == b"ogg-data" for e in events)
+            if operation == "upload":
+                replacement._bot.send_voice.assert_awaited_once()
+                assert replacement._bot.send_voice.await_args.kwargs["caption"] == "Răspuns"
+            assert not lost_lines(caplog)
+        assert adapter._media_retries is replacement._media_retries
+        assert replacement._media_retries.adapter is replacement
+        adapter.handle_message.assert_not_awaited()
+        replacement.send.assert_not_awaited()
+    finally:
+        release.set()
+        await late
+        await replacement.disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("give_up", ["window", "non_transient", "failed_result", "shutdown"])
+async def test_kept_caption_sent_once_as_text_when_voice_gives_up(rig, tmp_path, caplog, give_up):
+    adapter, clock = rig
+    audio = tmp_path / "speech.ogg"
+    audio.write_bytes(b"ogg-data")
+    adapter._bot.send_voice.side_effect = TimedOut()
+    adapter.send.return_value = SendResult(success=False, error="Timed out")
+    metadata = {"thread_id": "77"}
+    result = await adapter.send_voice(
+        "100", str(audio), caption="Răspuns", reply_to="42", metadata=metadata,
+    )
+    assert result.success
+    adapter.send.assert_awaited_once()
+    adapter.send.reset_mock()
+    adapter.send.return_value = SendResult(success=True, message_id="caption")
+    if give_up == "non_transient":
+        adapter._bot.send_voice.side_effect = BadRequest("Unsupported audio")
+    elif give_up == "failed_result":
+        # A missing retry copy makes the real send_voice return success=False.
+        next(iter(adapter._media_retries.voices)).unlink()
+    await clock.advance(1)
+    if give_up == "shutdown":
+        await adapter.cancel_background_tasks()
+    await clock.advance(35 * 60)
+
+    if give_up == "shutdown":
+        adapter.send.assert_not_awaited()
+    else:
+        adapter.send.assert_awaited_once_with(
+            "100", "Răspuns", reply_to="42", metadata=metadata,
+        )
+    assert sum("voice-retry gave up" in r.getMessage() for r in caplog.records) == 1
+    assert not adapter._media_retries.voices
+    assert not lost_lines(caplog)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["exception", "result"])
+async def test_kept_caption_give_up_send_failure_warns_and_cleans_up(rig, tmp_path, caplog, failure):
+    adapter, clock = rig
+    audio = tmp_path / "speech.ogg"
+    audio.write_bytes(b"ogg-data")
+    adapter._bot.send_voice.side_effect = TimedOut()
+    adapter.send.return_value = SendResult(success=False, error="Timed out")
+    await adapter.send_voice("100", str(audio), caption="Răspuns")
+    copies = list(adapter._media_retries.voices)
+    adapter.send.reset_mock()
+    if failure == "exception":
+        adapter.send.side_effect = TimedOut()
+    await clock.advance(35 * 60)
+
+    adapter.send.assert_awaited_once_with("100", "Răspuns", reply_to=None, metadata=None)
+    assert any(
+        r.levelno == logging.WARNING and "voice-retry caption send failed" in r.getMessage()
+        for r in caplog.records
+    )
+    assert sum("voice-retry gave up" in r.getMessage() for r in caplog.records) == 1
+    assert not adapter._media_retries.voices
+    assert all(not path.exists() for path in copies)
