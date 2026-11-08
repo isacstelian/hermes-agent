@@ -308,6 +308,23 @@ class MediaRetries:
                         break
                     state.error = error
                 delay = min(delay * 2, MEDIA_RETRY_MAX_DELAY)
+            if state.caption:
+                from .adapter import _redact_telegram_error_text
+
+                try:
+                    result = await self.adapter.send(
+                        state.chat_id, state.caption, reply_to=state.reply_to, metadata=state.metadata,
+                    )
+                    if not result.success:
+                        self.logger.warning(
+                            "[Telegram] voice-retry caption send failed: %s",
+                            _redact_telegram_error_text(result.error),
+                        )
+                except Exception as error:
+                    self.logger.warning(
+                        "[Telegram] voice-retry caption send failed: %s",
+                        _redact_telegram_error_text(error),
+                    )
             self.log_voice_give_up(state)
         except asyncio.CancelledError:
             self.log_voice_give_up(state)
