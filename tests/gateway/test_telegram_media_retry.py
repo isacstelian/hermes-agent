@@ -9,17 +9,35 @@ from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
-# Gateway conftest installs SDK stubs; this file exercises real SDK messages.
-for _name in list(sys.modules):
-    if _name == "telegram" or _name.startswith("telegram."):
-        del sys.modules[_name]
-
 from telegram import Message
 from telegram.error import BadRequest, RetryAfter, TimedOut
 
 from gateway.config import PlatformConfig
 from gateway.platforms.base import SendResult
 from plugins.platforms.telegram.adapter import TelegramAdapter
+
+
+@pytest.fixture(autouse=True)
+def real_telegram_sdk(monkeypatch):
+    # Real SDK messages are needed here; restore the gateway stubs afterward
+    # so other files retain the exception classes they imported at collection.
+    saved = {name: module for name, module in sys.modules.items()
+             if name == "telegram" or name.startswith("telegram.")}
+    for name in saved:
+        del sys.modules[name]
+    try:
+        import telegram
+        from telegram import error
+
+        monkeypatch.setitem(globals(), "Message", telegram.Message)
+        for name in ("BadRequest", "RetryAfter", "TimedOut"):
+            monkeypatch.setitem(globals(), name, getattr(error, name))
+        yield
+    finally:
+        for name in list(sys.modules):
+            if name == "telegram" or name.startswith("telegram."):
+                del sys.modules[name]
+        sys.modules.update(saved)
 
 
 class Clock:
