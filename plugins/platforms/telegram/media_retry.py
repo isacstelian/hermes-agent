@@ -355,7 +355,9 @@ class MediaRetryMixin:
             manager = getattr(self, "_media_retries", None)
         if manager is None:
             manager = MediaRetries(self)
-        manager.adapter = self
+        # A late failure on a retired adapter must not steal a live owner's work.
+        if manager.adapter is self or not getattr(manager.adapter, "_running", False):
+            manager.adapter = self
         self._media_retries = manager
         return manager
 
