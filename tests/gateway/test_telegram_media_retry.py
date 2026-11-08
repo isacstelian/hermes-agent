@@ -492,3 +492,169 @@ async def test_notice_after_slow_initial_failure_and_log_redaction(rig, caplog):
     adapter.send.assert_awaited_once()
     assert secret not in caplog.text
     assert "api.telegram.org/file/" not in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("caption_failure", ["result", "exception"])
+@pytest.mark.parametrize("suffix,method", [(".ogg", "send_voice"), (".opus", "send_voice"),
+                                           (".mp3", "send_audio"), (".m4a", "send_audio")])
+async def test_failed_caption_is_delivered_once_with_retried_voice(
+    rig, tmp_path, caption_failure, suffix, method,
+):
+    adapter, clock = rig
+    audio = tmp_path / ("speech" + suffix)
+    audio.write_bytes(b"ogg-data")
+    caption = "Răspuns"
+    delivered_captions = []
+    uploads = getattr(adapter._bot, method)
+
+    async def upload(**kwargs):
+        if uploads.await_count == 1:
+            raise TimedOut()
+        delivered_captions.append(kwargs["caption"])
+        assert kwargs["reply_to_message_id"] == 42
+        assert kwargs["message_thread_id"] == 77
+        return SimpleNamespace(message_id=103)
+
+    uploads.side_effect = upload
+    adapter.send.side_effect = (
+        TimedOut() if caption_failure == "exception"
+        else [SendResult(success=False, error="Timed out")]
+    )
+    result = await adapter.send_voice(
+        "100", str(audio), caption=caption, reply_to="42", metadata={"thread_id": "77"},
+    )
+    assert result.success
+    audio.unlink()
+    await clock.advance(30)
+
+    assert uploads.await_count == 2
+    assert delivered_captions == [caption]
+    adapter.send.assert_awaited_once_with(
+        "100", caption, reply_to="42", metadata={"thread_id": "77"},
+    )
+    adapter._bot.send_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_failed_caption_retry_keeps_plain_caption_fallback_and_limit(rig, tmp_path):
+    adapter, clock = rig
+    audio = tmp_path / "speech.ogg"
+    audio.write_bytes(b"ogg-data")
+    # Escaping the asterisks still fits the formatted cap; entity rejection
+    # must fall through to the original plain caption on the retry too.
+    caption = "*Răspuns*"
+    adapter.send.return_value = SendResult(success=False, error="Timed out")
+    adapter._bot.send_voice.side_effect = [
+        TimedOut(), BadRequest("Can't parse entities"), SimpleNamespace(message_id=103),
+    ]
+    result = await adapter.send_voice("100", str(audio), caption=caption)
+    assert result.success
+    await clock.advance(30)
+
+    assert adapter._bot.send_voice.await_count == 3
+    calls = adapter._bot.send_voice.await_args_list
+    assert calls[1].kwargs["parse_mode"] is not None
+    assert calls[2].kwargs["parse_mode"] is None
+    assert calls[2].kwargs["caption"] == caption
+    adapter.send.assert_awaited_once()
+
+    adapter._bot.send_voice.reset_mock(side_effect=True)
+    adapter._bot.send_voice.side_effect = [TimedOut(), SimpleNamespace(message_id=104)]
+    long_caption = "R" * 1100
+    await adapter.send_voice("100", str(audio), caption=long_caption)
+    await clock.advance(30)
+    assert adapter._bot.send_voice.await_count == 2
+    assert adapter._bot.send_voice.await_args.kwargs["caption"] == long_caption[:1024]
+
+
+@pytest.mark.asyncio
+async def test_closed_request_after_t1_keeps_retrying_then_delivers(rig, caplog):
+    adapter, clock = rig
+    original = adapter._bot.get_file.return_value
+
+    async def get_file(*args, **kwargs):
+        if clock.now < 200:
+            raise TimedOut()
+        if clock.now < 300:
+            raise RuntimeError("This HTTPXRequest is not initialized!")
+        return original
+
+    adapter._bot.get_file.side_effect = get_file
+    await receive(adapter, message(adapter._bot))
+    await clock.advance(700)
+
+    event = assert_voice(adapter)
+    assert "does not need to resend" in event.text
+    adapter.send.assert_awaited_once()
+    assert adapter.send.await_args.args[1].startswith("Telegram are")
+    adapter._bot.send_message.assert_not_awaited()
+    assert not lost_lines(caplog)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind,caption", [("voice", None), ("document", "Please read this")])
+async def test_non_transient_after_t1_sends_t2_and_lost_without_english_notice(rig, caplog, kind, caption):
+    adapter, clock = rig
+
+    async def get_file(*args, **kwargs):
+        if clock.now < 200:
+            raise TimedOut()
+        raise BadRequest("File unavailable")
+
+    adapter._bot.get_file.side_effect = get_file
+    await receive(adapter, message(adapter._bot, kind=kind, caption=caption))
+    await clock.advance(35 * 60)
+
+    texts = [c.args[1] for c in adapter.send.await_args_list]
+    assert len(texts) == 2
+    assert texts[0].startswith("Telegram are")
+    assert texts[1].startswith("Nu reușesc")
+    adapter._bot.send_message.assert_not_awaited()
+    assert lost_lines(caplog) == [
+        f"[Telegram] media-retry LOST kind={kind} chat=100 message=42 "
+        "sent_at=2026-11-08T09:20:57Z reason=window"
+    ]
+    if caption:
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        assert caption in event.text
+        assert "Do not ask again." in event.text
+    else:
+        adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_replacement_failure_before_connected_keeps_both_pending_messages(rig, caplog):
+    adapter, clock = rig
+    adapter._bot.get_file.side_effect = TimedOut()
+    await receive(adapter, message(adapter._bot, message_id=42))
+    adapter._set_fatal_error("network", "Timed out", retryable=True)
+    await adapter.disconnect()
+
+    replacement = TelegramAdapter(adapter.config)
+    replacement._bot = make_bot()
+    replacement._running = True
+    replacement._is_user_authorized_from_message = lambda _: True
+    replacement._should_process_message = lambda _: True
+    replacement._media_retry_now = lambda: clock.now
+    replacement._media_retry_sleep = clock.sleep
+    replacement.handle_message = AsyncMock()
+    replacement.send = AsyncMock(return_value=SendResult(success=True, message_id="notice"))
+    replacement._bot.get_file.side_effect = TimedOut()
+    try:
+        await receive(replacement, message(replacement._bot, message_id=43))
+        replacement._mark_connected()
+        replacement._bot.get_file.side_effect = None
+        await clock.advance(35 * 60)
+
+        events = [c.args[0] for c in replacement.handle_message.await_args_list]
+        assert sorted(e.message_id for e in events) == ["42", "43"]
+        assert all(e.media_types == ["audio/ogg"] for e in events)
+        assert all(Path(e.media_urls[0]).read_bytes() == b"ogg-data" for e in events)
+        adapter.handle_message.assert_not_awaited()
+        adapter.send.assert_not_awaited()
+        replacement.send.assert_not_awaited()
+        assert not lost_lines(caplog)
+    finally:
+        await replacement.disconnect()
