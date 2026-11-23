@@ -193,6 +193,33 @@ async def test_notices_off_preserves_caption_and_lost_marker_without_sending(rig
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("kind,caption", [("voice", None), ("document", "Please read this")])
+async def test_notices_off_keeps_permanent_retry_failure_quiet(rig, caplog, kind, caption):
+    adapter, clock = rig
+
+    async def get_file(*args, **kwargs):
+        if clock.now < 200:
+            raise TimedOut()
+        raise BadRequest("File unavailable")
+
+    adapter._bot.get_file.side_effect = get_file
+    await receive(adapter, message(adapter._bot, kind=kind, caption=caption))
+    await clock.advance(300)
+
+    adapter.send.assert_not_awaited()
+    adapter._bot.send_message.assert_not_awaited()
+    assert len(lost_lines(caplog)) == 1
+    if caption:
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        assert caption in event.text
+        assert "could not be downloaded after retries" in event.text
+        assert "after 30 minutes" not in event.text
+    else:
+        adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_outgoing_timeout_then_delivers_without_failure_notice(rig, tmp_path):
     adapter, clock = rig
     audio = tmp_path / "speech.ogg"

@@ -204,7 +204,7 @@ class MediaRetries:
                     await adapter._cache_and_dispatch_media(state.message, state.event, retry=state)
                 except Exception as error:
                     if not is_transient(adapter, error):
-                        if state.t1_sent:
+                        if state.t1_sent or not adapter._media_retry_notices_enabled:
                             break
                         raise
                     state.error = error
@@ -224,15 +224,17 @@ class MediaRetries:
             self.log_lost(state, "window")
             # Caption dispatch must not wait another ten minutes for T2 retries.
             notices_enabled = self.adapter._media_retry_notices_enabled
+            expired = self.adapter._media_retry_now() >= deadline
             sent = notices_enabled and await self.notice(state, "T2")
             if state.message.caption or state.message.text:
                 instruction = (
                     "The gateway already asked them to resend it. Do not ask again."
                     if sent else "Do not send a separate download notice or ask for a resend."
                 )
+                timing = "after 30 minutes" if expired else "after retries"
                 state.event.text = self.adapter._append_observed_note(
                     state.event.text,
-                    f"[The user's {state.kind} could not be downloaded after 30 minutes. {instruction}]",
+                    f"[The user's {state.kind} could not be downloaded {timing}. {instruction}]",
                 )
                 await self.adapter.handle_message(state.event)
             if not notices_enabled:
@@ -403,8 +405,9 @@ class MediaRetryMixin:
         return await self._bot.get_file(media.file_id)
 
     def _defer_media_failure(self, msg, event, kind, error, arrived, retry):
-        # After T1's automatic-recovery promise, only T2 may ask for a resend.
-        if retry is not None and retry.t1_sent:
+        # A deferred download reports through its retry manager when notices
+        # are off or T1 has already promised automatic recovery.
+        if retry is not None and (retry.t1_sent or not self._media_retry_notices_enabled):
             raise error
         if not is_transient(self, error):
             return False
