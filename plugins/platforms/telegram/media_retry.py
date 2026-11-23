@@ -185,7 +185,8 @@ class MediaRetries:
         delay = MEDIA_RETRY_INITIAL_DELAY
         deadline = state.arrived + MEDIA_RETRY_WINDOW
         try:
-            if (self.adapter._media_retry_now() < deadline and
+            if (self.adapter._media_retry_notices_enabled and
+                    self.adapter._media_retry_now() < deadline and
                     self.adapter._media_retry_now() - state.arrived >= MEDIA_RETRY_T1_AFTER):
                 state.t1_sent = await self.notice(state, "T1")
             while True:
@@ -207,7 +208,7 @@ class MediaRetries:
                             break
                         raise
                     state.error = error
-                    if (not state.t1_sent and
+                    if (adapter._media_retry_notices_enabled and not state.t1_sent and
                             adapter._media_retry_now() - state.arrived >= MEDIA_RETRY_T1_AFTER):
                         state.t1_sent = await self.notice(state, "T1")
                     delay = min(delay * 2, MEDIA_RETRY_MAX_DELAY)
@@ -222,14 +223,20 @@ class MediaRetries:
 
             self.log_lost(state, "window")
             # Caption dispatch must not wait another ten minutes for T2 retries.
-            sent = await self.notice(state, "T2")
+            notices_enabled = self.adapter._media_retry_notices_enabled
+            sent = notices_enabled and await self.notice(state, "T2")
             if state.message.caption or state.message.text:
+                instruction = (
+                    "The gateway already asked them to resend it. Do not ask again."
+                    if sent else "Do not send a separate download notice or ask for a resend."
+                )
                 state.event.text = self.adapter._append_observed_note(
                     state.event.text,
-                    f"[The user's {state.kind} could not be downloaded after 30 minutes; "
-                    "the gateway already asked them to resend it. Do not ask again.]",
+                    f"[The user's {state.kind} could not be downloaded after 30 minutes. {instruction}]",
                 )
                 await self.adapter.handle_message(state.event)
+            if not notices_enabled:
+                return
             for _ in range(MEDIA_RETRY_T2_RETRIES):
                 if sent:
                     break

@@ -749,6 +749,8 @@ class TelegramAdapter(MediaRetryMixin, BasePlatformAdapter):
         self._mention_patterns = self._compile_mention_patterns()
         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
         self._disable_link_previews: bool = self._coerce_bool_extra("disable_link_previews", False)
+        # File download retries work independently of the user-facing notices.
+        self._media_retry_notices_enabled = self._coerce_bool_extra("media_retry_notices")
         # Bot API 10.1 Rich Messages: render constructs the legacy MarkdownV2
         # path degrades (tables → bullet lists, task lists, <details>, block
         # math) via sendRichMessage / editMessageText's rich_message param using

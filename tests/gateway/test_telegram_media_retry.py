@@ -102,9 +102,10 @@ def message(bot, kind="voice", caption=None, message_id=42, **extra):
 
 
 @pytest_asyncio.fixture
-async def rig(monkeypatch, tmp_path):
+async def rig(monkeypatch, tmp_path, request):
     clock = Clock()
-    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="test-token"))
+    extra = getattr(request, "param", {})
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="test-token", extra=extra))
     adapter._bot = make_bot()
     adapter._running = True
     adapter._is_user_authorized_from_message = lambda _: True
@@ -151,6 +152,47 @@ async def test_download_two_timeouts_then_delivers_without_human_notice(rig):
 
 
 @pytest.mark.asyncio
+async def test_default_off_recovers_after_notice_threshold_without_sending(rig):
+    adapter, clock = rig
+    media_file = adapter._bot.get_file.return_value
+
+    async def get_file(*args, **kwargs):
+        if clock.now < 600:
+            raise TimedOut()
+        return media_file
+
+    adapter._bot.get_file.side_effect = get_file
+    await receive(adapter, message(adapter._bot))
+    await clock.advance(700)
+
+    event = assert_voice(adapter)
+    adapter.send.assert_not_awaited()
+    adapter._bot.send_message.assert_not_awaited()
+    assert "arrived late because Telegram was unavailable" in event.text
+    assert "The user was told" not in event.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rig", [{}, {"media_retry_notices": False}], indirect=True)
+async def test_notices_off_preserves_caption_and_lost_marker_without_sending(rig, caplog):
+    adapter, clock = rig
+    adapter._bot.get_file.side_effect = TimedOut()
+    await receive(adapter, message(adapter._bot, "document", caption="Please read this"))
+    await clock.advance(45 * 60)
+
+    adapter.send.assert_not_awaited()
+    adapter._bot.send_message.assert_not_awaited()
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert "Please read this" in event.text
+    assert "could not be downloaded after 30 minutes" in event.text
+    assert "already asked" not in event.text
+    assert len(lost_lines(caplog)) == 1
+    assert lost_lines(caplog)[0].endswith("reason=window")
+    assert not adapter._media_retry_manager().incoming
+
+
+@pytest.mark.asyncio
 async def test_outgoing_timeout_then_delivers_without_failure_notice(rig, tmp_path):
     adapter, clock = rig
     audio = tmp_path / "speech.ogg"
@@ -167,6 +209,7 @@ async def test_outgoing_timeout_then_delivers_without_failure_notice(rig, tmp_pa
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("rig", [{"media_retry_notices": True}], indirect=True)
 async def test_outage_35_minutes_notices_once_and_one_lost_marker(rig, caplog):
     adapter, clock = rig
     adapter._bot.get_file.side_effect = TimedOut()
@@ -197,6 +240,7 @@ async def test_outage_35_minutes_notices_once_and_one_lost_marker(rig, caplog):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("rig", [{"media_retry_notices": True}], indirect=True)
 async def test_minute_ten_recovery_has_late_note_and_no_t2(rig, caplog):
     adapter, clock = rig
     original = adapter._bot.get_file.return_value
@@ -232,6 +276,7 @@ async def test_retry_uses_replacement_bot_after_disconnect(rig):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("rig", [{"media_retry_notices": True}], indirect=True)
 async def test_lost_document_dispatches_caption_and_give_up_note(rig, caplog):
     adapter, clock = rig
     adapter._bot.get_file.side_effect = TimedOut()
@@ -298,6 +343,7 @@ async def test_pending_download_transfers_to_new_connected_adapter(rig):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("rig", [{"media_retry_notices": True}], indirect=True)
 async def test_t2_stops_after_four_failed_sends(rig, caplog):
     adapter, clock = rig
     adapter._bot.get_file.side_effect = TimedOut()
@@ -363,6 +409,7 @@ async def test_all_media_kinds_recover_through_original_dispatch(rig, kind, albu
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("rig", [{"media_retry_notices": True}], indirect=True)
 async def test_notices_keep_original_reply_and_dm_topic_metadata(rig):
     adapter, clock = rig
     adapter._bot.get_file.side_effect = TimedOut()
@@ -494,6 +541,7 @@ async def test_transport_errors_recover_without_notices(rig, error_kind):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("rig", [{"media_retry_notices": True}], indirect=True)
 async def test_notice_after_slow_initial_failure_and_log_redaction(rig, caplog):
     adapter, clock = rig
     secret = "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi"
@@ -587,6 +635,7 @@ async def test_failed_caption_retry_keeps_plain_caption_fallback_and_limit(rig, 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("rig", [{"media_retry_notices": True}], indirect=True)
 async def test_closed_request_after_t1_keeps_retrying_then_delivers(rig, caplog):
     adapter, clock = rig
     original = adapter._bot.get_file.return_value
@@ -612,6 +661,7 @@ async def test_closed_request_after_t1_keeps_retrying_then_delivers(rig, caplog)
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind,caption", [("voice", None), ("document", "Please read this")])
+@pytest.mark.parametrize("rig", [{"media_retry_notices": True}], indirect=True)
 async def test_non_transient_after_t1_sends_t2_and_lost_without_english_notice(rig, caplog, kind, caption):
     adapter, clock = rig
 
