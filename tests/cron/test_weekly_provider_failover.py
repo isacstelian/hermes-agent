@@ -10,7 +10,8 @@ from cron.jobs import create_job, get_job
 
 
 def test_weekly_policy_is_scoped(monkeypatch):
-    from cron.weekly import WEEKLY_SCRIPT_ENV, cli_fallback_chain, weekly_policy
+    from cron.weekly import weekly_policy
+    from hermes_cli.fallback_config import WEEKLY_SCRIPT_ENV, cli_fallback_chain
 
     fallback = [{"provider": "custom", "model": "sol"}]
     global_fallback = [{"provider": "custom", "model": "other"}]

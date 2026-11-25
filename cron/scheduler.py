@@ -52,14 +52,12 @@ from hermes_cli.config import (
     load_config,
     resolve_cron_model_drift_defaults,
 )
-from hermes_cli.fallback_config import get_fallback_chain
-from cron.weekly import (
+from hermes_cli.fallback_config import (
     WEEKLY_SCRIPT_ENV,
-    alert_command,
-    dispatch_failure,
+    get_fallback_chain,
     weekly_fallback_chain,
-    weekly_policy,
 )
+from cron.weekly import alert_command, dispatch_failure, weekly_policy
 from hermes_time import now as _hermes_now
 from agent.interrupt_compat import request_hard_interrupt
 from agent.delegation_context import (

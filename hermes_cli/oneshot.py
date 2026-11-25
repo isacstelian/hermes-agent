@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Optional
 
 from gateway.session_context import declare_stateless_channel
-from cron.weekly import cli_fallback_chain
+from hermes_cli.fallback_config import cli_fallback_chain
 
 
 def _normalize_toolsets(toolsets: object = None) -> list[str] | None:
