@@ -83,6 +83,12 @@ class TestProducerHook:
         assert len(rows) == 1
         assert rows[0][1] == "delivered"
         assert rows[0][2] == "final answer"
+        with dl._connect() as conn:
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(delivery_obligations)")}
+            assert {"request_message_id", "delivered_message_id"} <= columns
+            assert conn.execute(
+                "SELECT request_message_id, delivered_message_id FROM delivery_obligations"
+            ).fetchone() == ("msg-42", "m1")
 
     @pytest.mark.asyncio
     async def test_send_failure_leaves_failed_row(self):
@@ -95,6 +101,10 @@ class TestProducerHook:
         rows = _rows()
         assert len(rows) == 1
         assert rows[0][1] == "failed"
+        with dl._connect() as conn:
+            assert conn.execute(
+                "SELECT request_message_id, delivered_message_id FROM delivery_obligations"
+            ).fetchone() == ("msg-42", None)
 
     @pytest.mark.asyncio
     async def test_slash_command_not_recorded(self):

@@ -107,9 +107,20 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             updated_at REAL NOT NULL,
             owner_pid INTEGER,
             owner_started_at INTEGER,
-            last_error TEXT
+            last_error TEXT,
+            request_message_id TEXT,
+            delivered_message_id TEXT
         )"""
     )
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(delivery_obligations)")}
+    for name in ("request_message_id", "delivered_message_id"):
+        if name not in columns:
+            try:
+                conn.execute(f"ALTER TABLE delivery_obligations ADD COLUMN {name} TEXT")
+            except sqlite3.OperationalError:
+                # Another process can migrate the same profile after the PRAGMA.
+                if name not in {row[1] for row in conn.execute("PRAGMA table_info(delivery_obligations)")}:
+                    raise
 
 
 @contextmanager
@@ -193,6 +204,7 @@ def record_obligation(
     chat_id: str,
     thread_id: Optional[str],
     content: str,
+    request_message_id: Optional[str] = None,
 ) -> None:
     """Record a final response as owed to the platform (state='pending')."""
     now = time.time()
@@ -202,11 +214,11 @@ def record_obligation(
             """INSERT OR REPLACE INTO delivery_obligations
                (obligation_id, session_key, platform, chat_id, thread_id,
                 content, state, attempts, created_at, updated_at,
-                owner_pid, owner_started_at)
-               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?)""",
+                owner_pid, owner_started_at, request_message_id)
+               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?)""",
             (obligation_id, session_key, platform, str(chat_id),
              str(thread_id) if thread_id else None, content, now, now,
-             pid, started),
+             pid, started, request_message_id),
         )
     _prune()
 
@@ -215,21 +227,29 @@ def mark_attempting(obligation_id: str) -> None:
     _update_state(obligation_id, "attempting")
 
 
-def mark_delivered(obligation_id: str) -> None:
-    _update_state(obligation_id, "delivered")
+def mark_delivered(obligation_id: str, *, delivered_message_id: Optional[str] = None) -> None:
+    message_id = str(delivered_message_id) if isinstance(delivered_message_id, (str, int)) else None
+    _update_state(obligation_id, "delivered", delivered_message_id=message_id)
 
 
 def mark_failed(obligation_id: str, error: str = "") -> None:
     _update_state(obligation_id, "failed", error=error)
 
 
-def _update_state(obligation_id: str, state: str, error: str = "") -> None:
+def _update_state(
+    obligation_id: str,
+    state: str,
+    error: str = "",
+    *,
+    delivered_message_id: Optional[str] = None,
+) -> None:
     with _DB_LOCK, _transaction() as conn:
         conn.execute(
             """UPDATE delivery_obligations
-               SET state=?, updated_at=?, last_error=?
+               SET state=?, updated_at=?, last_error=?,
+                   delivered_message_id=COALESCE(?, delivered_message_id)
                WHERE obligation_id=?""",
-            (state, time.time(), error[:500] if error else None, obligation_id),
+            (state, time.time(), error[:500] if error else None, delivered_message_id, obligation_id),
         )
 
 
