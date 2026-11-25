@@ -9,6 +9,8 @@ id stability, and the startup redelivery sweep's contract:
 - poison rows abandon at the attempts cap / stale cutoff
 """
 
+from contextlib import closing
+import sqlite3
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -83,6 +85,34 @@ class TestStateMachine:
         dl.mark_attempting("ob-1")
         _record()  # INSERT OR REPLACE resets to pending — same turn re-record
         assert _row("ob-1")["state"] == "pending"
+
+    def test_existing_ledger_keeps_its_pending_rows_on_schema_upgrade(self):
+        with closing(sqlite3.connect(dl._db_path())) as conn, conn:
+            conn.execute("""
+                CREATE TABLE delivery_obligations (
+                    obligation_id TEXT PRIMARY KEY, session_key TEXT NOT NULL,
+                    platform TEXT NOT NULL, chat_id TEXT NOT NULL, thread_id TEXT,
+                    content TEXT NOT NULL, state TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    created_at REAL NOT NULL, updated_at REAL NOT NULL,
+                    owner_pid INTEGER, owner_started_at INTEGER, last_error TEXT
+                )
+            """)
+            conn.execute("""
+                INSERT INTO delivery_obligations (
+                    obligation_id, session_key, platform, chat_id, content,
+                    state, created_at, updated_at
+                ) VALUES ('old', 'old-session', 'telegram', '123', 'saved answer', 'pending', 1, 1)
+            """)
+
+        assert _row("old")["content"] == "saved answer"
+        dl.mark_delivered("old", delivered_message_id="101")
+        dl.mark_delivered("old")
+        with closing(dl._connect()) as conn:
+            assert conn.execute("""
+                SELECT state, request_message_id, delivered_message_id
+                FROM delivery_obligations WHERE obligation_id='old'
+            """).fetchone() == ("delivered", None, "101")
 
 
 class TestObligationId:

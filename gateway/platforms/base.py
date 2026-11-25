@@ -5594,9 +5594,10 @@ class BasePlatformAdapter(ABC):
                             )
 
                             if ledger_enabled():
+                                _request_message_id = str(getattr(event, "message_id", "") or "")
                                 _obligation_id = compute_obligation_id(
                                     session_key,
-                                    str(getattr(event, "message_id", "") or ""),
+                                    _request_message_id,
                                     text_content,
                                 )
                                 record_obligation(
@@ -5609,6 +5610,7 @@ class BasePlatformAdapter(ABC):
                                     chat_id=event.source.chat_id,
                                     thread_id=getattr(event.source, "thread_id", None),
                                     content=text_content,
+                                    request_message_id=_request_message_id or None,
                                 )
                                 mark_attempting(_obligation_id)
                         except Exception:
@@ -5629,7 +5631,9 @@ class BasePlatformAdapter(ABC):
                             )
 
                             if getattr(result, "success", False):
-                                mark_delivered(_obligation_id)
+                                mark_delivered(
+                                    _obligation_id, delivered_message_id=getattr(result, "message_id", None)
+                                )
                             else:
                                 mark_failed(
                                     _obligation_id,
