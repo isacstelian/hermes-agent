@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Optional
 
 from gateway.session_context import declare_stateless_channel
-from hermes_cli.fallback_config import get_fallback_chain
+from cron.weekly import cli_fallback_chain
 
 
 def _normalize_toolsets(toolsets: object = None) -> list[str] | None:
@@ -433,7 +433,7 @@ def _run_agent(
         # Read the effective fallback chain from profile config so oneshot
         # workers honour the same merge semantics as interactive CLI and
         # gateway sessions.
-        _fb = get_fallback_chain(cfg)
+        _fb = cli_fallback_chain(cfg)
 
         agent = AIAgent(
             api_key=runtime.get("api_key"),

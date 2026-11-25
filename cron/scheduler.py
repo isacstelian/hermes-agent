@@ -53,6 +53,13 @@ from hermes_cli.config import (
     resolve_cron_model_drift_defaults,
 )
 from hermes_cli.fallback_config import get_fallback_chain
+from cron.weekly import (
+    WEEKLY_SCRIPT_ENV,
+    alert_command,
+    dispatch_failure,
+    weekly_fallback_chain,
+    weekly_policy,
+)
 from hermes_time import now as _hermes_now
 from agent.interrupt_compat import request_hard_interrupt
 from agent.delegation_context import (
@@ -3173,6 +3180,8 @@ def _run_job_script(
     script_path: str,
     workdir: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None,
+    *,
+    weekly_chat: bool = False,
 ) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
 
@@ -3285,6 +3294,9 @@ def _run_job_script(
             }
         env = build_subprocess_env()
         env.update(env_overlay)
+        env.pop(WEEKLY_SCRIPT_ENV, None)
+        if weekly_chat:
+            env[WEEKLY_SCRIPT_ENV] = "1"
         # Use the job's workdir as the subprocess cwd when configured,
         # otherwise default to the scripts-dir parent (back-compat).
         # NEVER mutate the Python process cwd — that would leak into
@@ -3361,6 +3373,10 @@ def _run_job_script_with_claim_heartbeat(
     storage.  ``heartbeat_run_claim`` compares that stable owner before every
     refresh, so a stale runner cannot extend a replacement owner's claim.
     """
+    script_kwargs = {"workdir": workdir, "cancel_event": cancel_event}
+    if job.get("no_agent") and weekly_policy(job, load_config()):
+        script_kwargs["weekly_chat"] = True
+
     schedule = job.get("schedule")
     claim = job.get("run_claim")
     owner = str(claim.get("by") or "") if isinstance(claim, dict) else ""
@@ -3369,7 +3385,7 @@ def _run_job_script_with_claim_heartbeat(
         and schedule.get("kind") == "once"
         and owner
     ):
-        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event)
+        return _run_job_script(script_path, **script_kwargs)
 
     job_id = str(job.get("id") or "")
     stop = threading.Event()
@@ -3400,10 +3416,10 @@ def _run_job_script_with_claim_heartbeat(
             job_id,
             exc_info=True,
         )
-        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event)
+        return _run_job_script(script_path, **script_kwargs)
 
     try:
-        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event)
+        return _run_job_script(script_path, **script_kwargs)
     finally:
         stop.set()
         # Event.wait() wakes immediately.  Keep completion bounded if the
@@ -3929,7 +3945,7 @@ def _preflight_check_provider_key(job: dict, cfg: dict) -> Optional[str]:
     already guaranteed by the fallback resolution being config-local).
     """
     try:
-        if get_fallback_chain(cfg):
+        if weekly_fallback_chain(cfg, weekly_policy(job, cfg)):
             return None
     except Exception:
         return None  # fail-open: never block on a preflight-internal error
@@ -5026,7 +5042,7 @@ def run_job(
                 reason,
                 resolve_exc,
             )
-            fb_list = get_fallback_chain(_cfg)
+            fb_list = weekly_fallback_chain(_cfg, weekly_policy(job, _cfg))
             runtime = None
             for entry in fb_list:
                 if not isinstance(entry, dict):
@@ -5160,7 +5176,7 @@ def run_job(
                     f"config is pinned or restored. See #44585."
                 )
 
-        fallback_model = get_fallback_chain(_cfg) or None
+        fallback_model = weekly_fallback_chain(_cfg, weekly_policy(job, _cfg)) or None
         credential_pool = None
         runtime_provider = str(runtime.get("provider") or "").strip().lower()
         if runtime_provider:
@@ -5892,9 +5908,11 @@ def _run_one_job_body(
         execution_id = create_execution(job["id"], source="direct")["id"]
     delivery_job = dict(job, execution_id=execution_id)
     delivery_job.pop("_gateway_message_delivered_hook", None)
+    failure_command = []
     delivery_attempted = False
     delivery_error = None
     try:
+        failure_command = alert_command(weekly_policy(job, load_config()))
         # Pre-run dispatch claim (issue #38758): atomically commit a finite
         # one-shot's dispatch BEFORE its side effect runs, so a tick that dies
         # mid-execution (gateway kill, OOM, segfault, hard-timeout) cannot
@@ -6106,6 +6124,20 @@ def _run_one_job_body(
                     job["id"],
                 )
 
+            # Preserve empty-response handling for existing deliveries, but
+            # send the internal failure notice for an empty weekly report.
+            if success and failure_command and not final_response.strip():
+                success = False
+                error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
+
+            if not success and failure_command:
+                with _side_effect_fence() as owns_delivery:
+                    if not owns_delivery:
+                        raise _FireClaimLostDuringSideEffect
+                    delivery_attempted = True
+                    delivery_error = dispatch_failure(failure_command, job["id"], execution_id)
+                should_deliver = False
+
             if should_deliver:
                 unresolved_origin = (
                     _normalize_deliver_value(job.get("deliver", "local")) == "origin"
@@ -6219,7 +6251,9 @@ def _run_one_job_body(
             delivery_outcome = "failed"
         elif should_deliver and unresolved_origin:
             delivery_outcome = "not_configured"
-        elif should_deliver and normalized_deliver != "local":
+        elif (not success and failure_command and delivery_attempted) or (
+            should_deliver and normalized_deliver != "local"
+        ):
             delivery_outcome = "delivered"
         else:
             delivery_outcome = "suppressed"
@@ -6260,25 +6294,31 @@ def _run_one_job_body(
             )
             unresolved_origin = False
             try:
-                delivery_attempted = True
-                delivery_error = _deliver_result(
-                    job,
-                    _summarize_cron_failure_for_delivery(job, _err_text),
-                    adapters=adapters,
-                    loop=loop,
-                )
+                if failure_command:
+                    with _side_effect_fence() as owns_delivery:
+                        if owns_delivery:
+                            delivery_attempted = True
+                            delivery_error = dispatch_failure(failure_command, job["id"], execution_id)
+                else:
+                    delivery_attempted = True
+                    delivery_error = _deliver_result(
+                        job,
+                        _summarize_cron_failure_for_delivery(job, _err_text),
+                        adapters=adapters,
+                        loop=loop,
+                    )
             except Exception as delivery_exc:
                 delivery_error = str(delivery_exc)
                 logger.error(
                     "Delivery failed for job %s: %s", job["id"], delivery_exc
                 )
-            if not delivery_error and normalized_deliver == "origin":
+            if not failure_command and not delivery_error and normalized_deliver == "origin":
                 unresolved_origin = not _resolve_delivery_targets(job)
             if delivery_error:
                 delivery_outcome = "failed"
             elif unresolved_origin:
                 delivery_outcome = "not_configured"
-            elif normalized_deliver != "local":
+            elif delivery_attempted and (failure_command or normalized_deliver != "local"):
                 delivery_outcome = "delivered"
         try:
             if not _consume_interrupted_flag(job["id"], execution_token):
