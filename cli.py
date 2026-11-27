@@ -50,7 +50,7 @@ logger = logging.getLogger(__name__)
 # Suppress startup messages for clean CLI experience
 os.environ["HERMES_QUIET"] = "1"  # Our own modules
 
-from hermes_cli.fallback_config import get_fallback_chain
+from hermes_cli.fallback_config import cli_fallback_chain
 from hermes_cli.cli_agent_setup_mixin import CLIAgentSetupMixin
 from hermes_cli.cli_commands_mixin import CLICommandsMixin
 from hermes_cli.cli_billing_mixin import CLIBillingMixin
@@ -5027,7 +5027,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # Fallback provider chain — tried in order when primary fails after retries.
         # Merge new ``fallback_providers`` entries with any legacy
         # ``fallback_model`` entries so old configs still participate.
-        self._fallback_model = get_fallback_chain(CLI_CONFIG)
+        self._fallback_model = cli_fallback_chain(CLI_CONFIG)
 
         # Signature of the currently-initialised agent's runtime.  Used to
         # rebuild the agent when provider / model / base_url changes across

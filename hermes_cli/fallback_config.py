@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any
+
+WEEKLY_SCRIPT_ENV = "_HERMES_WEEKLY_CRON_CHAT"
 
 
 def _normalized_base_url(value: Any) -> str:
@@ -99,3 +102,22 @@ def get_fallback_chain(config: dict[str, Any] | None) -> list[dict[str, Any]]:
             chain.append(entry)
 
     return chain
+
+
+
+def get_weekly_provider_policy(config: dict) -> dict:
+    cron_config = config.get("cron") or {}
+    policy = cron_config.get("weekly_provider_failover") if isinstance(cron_config, dict) else None
+    return policy if isinstance(policy, dict) else {}
+
+
+def weekly_fallback_chain(config: dict, policy: dict) -> list[dict]:
+    if "providers" in policy:
+        return get_fallback_chain({"fallback_providers": policy["providers"]})
+    return get_fallback_chain(config)
+
+
+def cli_fallback_chain(config: dict) -> list[dict]:
+    # Set by the scheduler on the selected script's child process only.
+    policy = get_weekly_provider_policy(config) if os.environ.get(WEEKLY_SCRIPT_ENV) == "1" else {}
+    return weekly_fallback_chain(config, policy)
